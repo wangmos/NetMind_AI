@@ -39,7 +39,11 @@ public sealed class SqliteMetadataStore : IDisposable
     // 架构版本：1 = traffic_transactions 五个扩展列；2 = page_hooks 目标 URL 与调用栈；
     // 3 = 为会话内 Hook 检索与时间序列查询补充组合索引。
     private const int SchemaVersion = 3;
+    /// <summary>sqlite3_bind_text 的 SQLITE_TRANSIENT 析构器：要求 SQLite 在调用返回前复制缓冲区。</summary>
+    private static readonly IntPtr SqliteTransient = new(-1);
     private readonly object _gate = new();
+    /// <summary>热路径写语句的预编译缓存（SQL 文本恒定，条目数固定为下面三条常量）。</summary>
+    private readonly Dictionary<string, IntPtr> _statements = new(StringComparer.Ordinal);
     private IntPtr _database;
 
     public SqliteMetadataStore(string databasePath)
@@ -56,37 +60,44 @@ public sealed class SqliteMetadataStore : IDisposable
         EnsureTrafficMetadataColumns();
     }
 
-    public void SaveSession(CaptureSessionRecord session)
-    {
-        Execute($"""
-            INSERT INTO capture_sessions(id, started_at, ended_at, mode, target, state)
-            VALUES('{Esc(session.Id.ToString())}', '{Esc(session.StartedAt.ToString("O"))}', {Sql(session.EndedAt?.ToString("O"))}, '{Esc(session.Mode)}', '{Esc(session.Target)}', '{Esc(session.State)}')
-            ON CONFLICT(id) DO UPDATE SET
-                ended_at=excluded.ended_at,
-                mode=excluded.mode,
-                target=excluded.target,
-                state=excluded.state;
-            """);
-    }
+    private const string SaveSessionSql = """
+        INSERT INTO capture_sessions(id, started_at, ended_at, mode, target, state)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            ended_at=excluded.ended_at,
+            mode=excluded.mode,
+            target=excluded.target,
+            state=excluded.state;
+        """;
 
+    private const string SaveTrafficSql = """
+        INSERT OR REPLACE INTO traffic_transactions(
+            id, session_id, captured_at, method, endpoint, status_code, latency_ms,
+            size_bytes, process_name, protocol, request_blob_hash, response_blob_hash,
+            request_summary, response_summary, request_url, query_parameters,
+            request_headers, cookies, response_headers)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """;
+
+    public void SaveSession(CaptureSessionRecord session) =>
+        WriteCached(SaveSessionSql, "无法保存捕获会话",
+            session.Id, session.StartedAt, session.EndedAt?.ToString("O"), session.Mode, session.Target, session.State);
+
+    /// <summary>
+    /// 写入一条事务元数据。URL、Header、Cookie 等字段直接来自被抓取的网络流量，
+    /// 完全由被访问站点控制，因此全部经参数绑定写入，绝不进入 SQL 文本。
+    /// </summary>
     public void SaveTraffic(StoredTrafficRecord stored)
     {
         var item = stored.Traffic;
-        Execute($"""
-            INSERT OR REPLACE INTO traffic_transactions(
-                id, session_id, captured_at, method, endpoint, status_code, latency_ms,
-                size_bytes, process_name, protocol, request_blob_hash, response_blob_hash,
-                request_summary, response_summary, request_url, query_parameters,
-                request_headers, cookies, response_headers)
-            VALUES(
-                '{Esc(item.Id.ToString())}', '{Esc(stored.SessionId.ToString())}', '{Esc(item.Timestamp.ToString("O"))}',
-                '{Esc(item.Method)}', '{Esc(item.Endpoint)}', {item.StatusCode}, {item.LatencyMs},
-                {item.SizeBytes}, '{Esc(item.Process)}', '{Esc(item.Protocol)}',
-                '{Esc(stored.RequestBlobHash)}', '{Esc(stored.ResponseBlobHash)}',
-                '{Esc(item.RequestSummary)}', '{Esc(item.ResponseSummary)}', '{Esc(item.Url)}',
-                '{Esc(item.QueryParameters)}', '{Esc(item.RequestHeaders)}', '{Esc(item.Cookies)}',
-                '{Esc(item.ResponseHeaders)}');
-            """);
+        WriteCached(SaveTrafficSql, "无法保存流量元数据",
+            item.Id, stored.SessionId, item.Timestamp,
+            item.Method, item.Endpoint, item.StatusCode, item.LatencyMs,
+            item.SizeBytes, item.Process, item.Protocol,
+            stored.RequestBlobHash, stored.ResponseBlobHash,
+            item.RequestSummary, item.ResponseSummary, item.Url,
+            item.QueryParameters, item.RequestHeaders, item.Cookies,
+            item.ResponseHeaders);
     }
 
     public IReadOnlyList<StoredTrafficRecord> GetRecentTraffic(int limit = NetMindDefaults.DefaultTrafficWindowCount)
@@ -96,10 +107,12 @@ public sealed class SqliteMetadataStore : IDisposable
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8($"SELECT {columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id ORDER BY t.captured_at DESC LIMIT {limit};"), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取流量元数据", result);
+            var statement = Prepare(
+                $"SELECT {columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id ORDER BY t.captured_at DESC LIMIT ?;",
+                "无法读取流量元数据", limit);
             try
             {
+                int result;
                 var rows = new List<StoredTrafficRecord>();
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow)
                 {
@@ -138,8 +151,7 @@ public sealed class SqliteMetadataStore : IDisposable
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8("SELECT COALESCE(MAX(rowid), 0) FROM traffic_transactions;"), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取流量刷新游标", result);
+            var statement = Prepare("SELECT COALESCE(MAX(rowid), 0) FROM traffic_transactions;", "无法读取流量刷新游标");
             try
             {
                 return Native.sqlite3_step(statement) == SqliteRow ? Native.sqlite3_column_int64(statement, 0) : 0;
@@ -157,11 +169,11 @@ public sealed class SqliteMetadataStore : IDisposable
         lock (_gate)
         {
             EnsureOpen();
-            var sql = $"SELECT t.rowid,{columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id WHERE t.rowid>{cursor} ORDER BY t.rowid ASC LIMIT {limit};";
-            var result = Native.sqlite3_prepare_v2(_database, Utf8(sql), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法增量读取流量元数据", result);
+            var sql = $"SELECT t.rowid,{columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id WHERE t.rowid>? ORDER BY t.rowid ASC LIMIT ?;";
+            var statement = Prepare(sql, "无法增量读取流量元数据", cursor, limit);
             try
             {
+                int result;
                 var rows = new List<StoredTrafficChange>();
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow)
                 {
@@ -186,14 +198,16 @@ public sealed class SqliteMetadataStore : IDisposable
         if (snapshot.Length > 1000) throw new InvalidOperationException("单次最多读取 1,000 条记录组事务。");
         if (snapshot.Length == 0) return [];
         const string columns = "t.id,t.session_id,t.captured_at,t.method,t.endpoint,t.status_code,t.latency_ms,t.size_bytes,t.process_name,t.protocol,t.request_blob_hash,t.response_blob_hash,t.request_summary,t.response_summary,COALESCE(s.mode,'未知'),t.request_url,t.query_parameters,t.request_headers,t.cookies,t.response_headers";
-        var idList = string.Join(',', snapshot.Select(id => $"'{Esc(id.ToString())}'"));
+        var parameters = Array.ConvertAll(snapshot, id => (Parameter)id);
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8($"SELECT {columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id WHERE t.id IN ({idList}) ORDER BY t.captured_at ASC;"), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取记录组事务", result);
+            var statement = Prepare(
+                $"SELECT {columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id WHERE t.id IN ({Placeholders(snapshot.Length)}) ORDER BY t.captured_at ASC;",
+                "无法读取记录组事务", parameters);
             try
             {
+                int result;
                 var rows = new List<StoredTrafficRecord>();
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow)
                 {
@@ -216,8 +230,7 @@ public sealed class SqliteMetadataStore : IDisposable
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8("SELECT COUNT(*) FROM traffic_transactions;"), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取流量数量", result);
+            var statement = Prepare("SELECT COUNT(*) FROM traffic_transactions;", "无法读取流量数量");
             try
             {
                 return Native.sqlite3_step(statement) == SqliteRow ? Native.sqlite3_column_int64(statement, 0) : 0;
@@ -237,11 +250,11 @@ public sealed class SqliteMetadataStore : IDisposable
         lock (_gate)
         {
             EnsureOpen();
-            var sql = $"SELECT s.id,s.started_at,s.ended_at,s.mode,s.target,s.state,COUNT(t.id) FROM capture_sessions s LEFT JOIN traffic_transactions t ON t.session_id=s.id GROUP BY s.id,s.started_at,s.ended_at,s.mode,s.target,s.state ORDER BY s.started_at DESC LIMIT {limit};";
-            var result = Native.sqlite3_prepare_v2(_database, Utf8(sql), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取捕获会话", result);
+            const string sql = "SELECT s.id,s.started_at,s.ended_at,s.mode,s.target,s.state,COUNT(t.id) FROM capture_sessions s LEFT JOIN traffic_transactions t ON t.session_id=s.id GROUP BY s.id,s.started_at,s.ended_at,s.mode,s.target,s.state ORDER BY s.started_at DESC LIMIT ?;";
+            var statement = Prepare(sql, "无法读取捕获会话", limit);
             try
             {
+                int result;
                 var sessions = new List<CaptureSessionSummary>();
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow)
                 {
@@ -265,9 +278,14 @@ public sealed class SqliteMetadataStore : IDisposable
     public long ClearCaptureData()
     {
         var count = GetTrafficCount();
-        // 保留“运行中”的会话行：采集中清空时采集进程仍持有该会话并继续写入事务，
-        // 会话行被删会导致事务外键失败；会话结束时采集进程会把它更新为已完成。
-        Execute($"BEGIN IMMEDIATE; DELETE FROM traffic_transactions; DELETE FROM capture_sessions WHERE state <> '{Esc(NetMindDefaults.SessionStateRunning)}'; COMMIT;");
+        InTransaction(() =>
+        {
+            Execute("DELETE FROM traffic_transactions;");
+            // 保留“运行中”的会话行：采集中清空时采集进程仍持有该会话并继续写入事务，
+            // 会话行被删会导致事务外键失败；会话结束时采集进程会把它更新为已完成。
+            Write("DELETE FROM capture_sessions WHERE state <> ?;", "无法清理已结束的捕获会话",
+                NetMindDefaults.SessionStateRunning);
+        });
         return count;
     }
 
@@ -280,30 +298,40 @@ public sealed class SqliteMetadataStore : IDisposable
         var snapshot = ids.Where(id => id != Guid.Empty).Distinct().Take(1001).ToArray();
         if (snapshot.Length > 1000) throw new InvalidOperationException("单次最多删除 1,000 条流量记录。");
         if (snapshot.Length == 0) return 0;
-        var idList = string.Join(",", snapshot.Select(id => $"'{Esc(id.ToString())}'"));
-        var existing = Scalar($"SELECT COUNT(*) FROM traffic_transactions WHERE id IN ({idList});");
-        Execute($"BEGIN IMMEDIATE; DELETE FROM traffic_transactions WHERE id IN ({idList}); COMMIT;");
+        var parameters = Array.ConvertAll(snapshot, id => (Parameter)id);
+        var placeholders = Placeholders(snapshot.Length);
+        long existing;
+        lock (_gate)
+        {
+            existing = Scalar($"SELECT COUNT(*) FROM traffic_transactions WHERE id IN ({placeholders});", parameters);
+            InTransaction(() => Write($"DELETE FROM traffic_transactions WHERE id IN ({placeholders});",
+                "无法删除流量记录", parameters));
+        }
         return existing;
     }
 
     /// <summary>按采集时间升序读取早于截止时间的事务 ID，供保留策略分批删除。</summary>
     public IReadOnlyList<Guid> GetTrafficIdsOlderThan(DateTimeOffset cutoff, int limit = 500) =>
-        GetTrafficIds($"WHERE julianday(captured_at) < julianday('{Esc(cutoff.UtcDateTime.ToString("O"))}')", limit);
+        GetTrafficIds("WHERE julianday(captured_at) < julianday(?)", limit, cutoff);
 
     /// <summary>按采集时间升序读取最旧事务 ID，供工作区容量上限治理。</summary>
     public IReadOnlyList<Guid> GetOldestTrafficIds(int limit = 500) => GetTrafficIds(string.Empty, limit);
 
-    private IReadOnlyList<Guid> GetTrafficIds(string whereClause, int limit)
+    private IReadOnlyList<Guid> GetTrafficIds(string whereClause, int limit, params ReadOnlySpan<Parameter> filters)
     {
         limit = Math.Clamp(limit, 1, 1000);
+        // 过滤参数（若有）在 SQL 中先于 LIMIT 出现，绑定顺序必须一致。
+        var parameters = new Parameter[filters.Length + 1];
+        filters.CopyTo(parameters);
+        parameters[^1] = limit;
         lock (_gate)
         {
             EnsureOpen();
-            var sql = $"SELECT id FROM traffic_transactions {whereClause} ORDER BY captured_at ASC, id ASC LIMIT {limit};";
-            var result = Native.sqlite3_prepare_v2(_database, Utf8(sql), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取最旧事务", result);
+            var sql = $"SELECT id FROM traffic_transactions {whereClause} ORDER BY captured_at ASC, id ASC LIMIT ?;";
+            var statement = Prepare(sql, "无法读取最旧事务", parameters);
             try
             {
+                int result;
                 var ids = new List<Guid>();
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow)
                     if (Guid.TryParse(Text(statement, 0), out var id)) ids.Add(id);
@@ -320,16 +348,16 @@ public sealed class SqliteMetadataStore : IDisposable
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8("""
+            var statement = Prepare("""
                 SELECT DISTINCT hash FROM (
                     SELECT request_blob_hash AS hash FROM traffic_transactions
                     UNION ALL
                     SELECT response_blob_hash AS hash FROM traffic_transactions
                 ) WHERE hash <> '';
-                """), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取正文引用哈希", result);
+                """, "无法读取正文引用哈希");
             try
             {
+                int result;
                 var hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow) hashes.Add(Text(statement, 0));
                 if (result != SqliteDone) throw CreateException("读取正文引用哈希时发生错误", result);
@@ -349,36 +377,38 @@ public sealed class SqliteMetadataStore : IDisposable
     public void SavePageHooks(IReadOnlyList<PageHookEvent> events, int maximumRows = NetMindDefaults.PageHookMaximumRows)
     {
         if (events.Count == 0) return;
-        var builder = new StringBuilder("BEGIN IMMEDIATE;");
-        foreach (var item in events.Take(NetMindDefaults.PageHookMaximumEventsPerBatch))
+        InTransaction(() =>
         {
-            builder.Append("INSERT INTO page_hooks(session_id,ts,type,fn,page_url,args_json,target_url,stack) VALUES(")
-                .Append('\'').Append(Esc(item.SessionId.ToString())).Append("',")
-                .Append('\'').Append(Esc(item.Timestamp.ToString("O"))).Append("',")
-                .Append('\'').Append(Esc(item.Type)).Append("',")
-                .Append('\'').Append(Esc(item.Function)).Append("',")
-                .Append('\'').Append(Esc(item.PageUrl)).Append("',")
-                .Append('\'').Append(Esc(item.ArgsJson)).Append("',")
-                .Append('\'').Append(Esc(item.TargetUrl)).Append("',")
-                .Append('\'').Append(Esc(item.Stack)).Append("');");
-        }
-        builder.Append($"DELETE FROM page_hooks WHERE id NOT IN (SELECT id FROM page_hooks ORDER BY id DESC LIMIT {maximumRows});");
-        builder.Append("COMMIT;");
-        Execute(builder.ToString());
+            foreach (var item in events.Take(NetMindDefaults.PageHookMaximumEventsPerBatch))
+            {
+                WriteCached(SavePageHookSql, "无法写入页内 Hook 事件",
+                    item.SessionId, item.Timestamp, item.Type, item.Function,
+                    item.PageUrl, item.ArgsJson, item.TargetUrl, item.Stack);
+            }
+            Write("DELETE FROM page_hooks WHERE id NOT IN (SELECT id FROM page_hooks ORDER BY id DESC LIMIT ?);",
+                "无法淘汰超量页内 Hook 事件", maximumRows);
+        });
     }
+
+    private const string SavePageHookSql =
+        "INSERT INTO page_hooks(session_id,ts,type,fn,page_url,args_json,target_url,stack) VALUES(?, ?, ?, ?, ?, ?, ?, ?);";
 
     /// <summary>按类型过滤读取页内 Hook 事件（最新在前）；type 为空返回全部。</summary>
     public IReadOnlyList<PageHookEvent> GetPageHooks(string? type, int limit = 200)
     {
         limit = Math.Clamp(limit, 1, 1000);
-        var filter = string.IsNullOrWhiteSpace(type) ? string.Empty : $" WHERE type='{Esc(type)}'";
+        var hasType = !string.IsNullOrWhiteSpace(type);
+        var filter = hasType ? " WHERE type=?" : string.Empty;
+        Parameter[] parameters = hasType ? [type, limit] : [limit];
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8($"SELECT id,session_id,ts,type,fn,page_url,args_json,target_url,stack FROM page_hooks{filter} ORDER BY id DESC LIMIT {limit};"), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取页内 Hook 事件", result);
+            var statement = Prepare(
+                $"SELECT id,session_id,ts,type,fn,page_url,args_json,target_url,stack FROM page_hooks{filter} ORDER BY id DESC LIMIT ?;",
+                "无法读取页内 Hook 事件", parameters);
             try
             {
+                int result;
                 var rows = new List<PageHookEvent>();
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow)
                 {
@@ -410,16 +440,21 @@ public sealed class SqliteMetadataStore : IDisposable
         if (sessions.Length > 1000) throw new InvalidOperationException("单次最多检索 1,000 个捕获会话的 Hook 事件。");
         if (sessions.Length == 0) return [];
         limit = Math.Clamp(limit, 1, 1000);
-        var sessionList = string.Join(',', sessions.Select(id => $"'{Esc(id.ToString())}'"));
-        var typeFilter = string.IsNullOrWhiteSpace(type) ? string.Empty : $" AND type='{Esc(type)}'";
+        var hasType = !string.IsNullOrWhiteSpace(type);
+        var typeFilter = hasType ? " AND type=?" : string.Empty;
+        // 绑定顺序与 SQL 中 `?` 的出现顺序一致：会话 ID 集合、可选类型、LIMIT。
+        var parameters = new List<Parameter>(sessions.Length + 2);
+        parameters.AddRange(sessions.Select(id => (Parameter)id));
+        if (hasType) parameters.Add(type);
+        parameters.Add(limit);
         lock (_gate)
         {
             EnsureOpen();
-            var sql = $"SELECT id,session_id,ts,type,fn,page_url,args_json,target_url,stack FROM page_hooks WHERE session_id IN ({sessionList}){typeFilter} ORDER BY id DESC LIMIT {limit};";
-            var result = Native.sqlite3_prepare_v2(_database, Utf8(sql), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取指定会话的页内 Hook 事件", result);
+            var sql = $"SELECT id,session_id,ts,type,fn,page_url,args_json,target_url,stack FROM page_hooks WHERE session_id IN ({Placeholders(sessions.Length)}){typeFilter} ORDER BY id DESC LIMIT ?;";
+            var statement = Prepare(sql, "无法读取指定会话的页内 Hook 事件", CollectionsMarshal.AsSpan(parameters));
             try
             {
+                int result;
                 var rows = new List<PageHookEvent>();
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow)
                 {
@@ -448,21 +483,33 @@ public sealed class SqliteMetadataStore : IDisposable
     /// <summary>删除早于截止时间的页内 Hook 事件，并返回实际删除条数。</summary>
     public long DeletePageHooksOlderThan(DateTimeOffset cutoff)
     {
-        var condition = $"julianday(ts) < julianday('{Esc(cutoff.UtcDateTime.ToString("O"))}')";
-        var count = Scalar($"SELECT COUNT(*) FROM page_hooks WHERE {condition};");
-        if (count > 0) Execute($"DELETE FROM page_hooks WHERE {condition};");
-        return count;
+        const string condition = "julianday(ts) < julianday(?)";
+        var utcCutoff = new DateTimeOffset(cutoff.UtcDateTime, TimeSpan.Zero);
+        lock (_gate)
+        {
+            var count = Scalar($"SELECT COUNT(*) FROM page_hooks WHERE {condition};", utcCutoff);
+            if (count > 0) Write($"DELETE FROM page_hooks WHERE {condition};", "无法删除到期页内 Hook 事件", utcCutoff);
+            return count;
+        }
     }
 
     /// <summary>删除没有事务引用且已结束的旧捕获会话。</summary>
     public long DeleteUnusedCompletedSessionsOlderThan(DateTimeOffset cutoff)
     {
-        var condition = $"state <> '{Esc(NetMindDefaults.SessionStateRunning)}' " +
-                        $"AND julianday(COALESCE(ended_at, started_at)) < julianday('{Esc(cutoff.UtcDateTime.ToString("O"))}') " +
-                        "AND NOT EXISTS (SELECT 1 FROM traffic_transactions t WHERE t.session_id = capture_sessions.id)";
-        var count = Scalar($"SELECT COUNT(*) FROM capture_sessions WHERE {condition};");
-        if (count > 0) Execute($"DELETE FROM capture_sessions WHERE {condition};");
-        return count;
+        const string condition =
+            "state <> ? " +
+            "AND julianday(COALESCE(ended_at, started_at)) < julianday(?) " +
+            "AND NOT EXISTS (SELECT 1 FROM traffic_transactions t WHERE t.session_id = capture_sessions.id)";
+        var utcCutoff = new DateTimeOffset(cutoff.UtcDateTime, TimeSpan.Zero);
+        lock (_gate)
+        {
+            var count = Scalar($"SELECT COUNT(*) FROM capture_sessions WHERE {condition};",
+                NetMindDefaults.SessionStateRunning, utcCutoff);
+            if (count > 0)
+                Write($"DELETE FROM capture_sessions WHERE {condition};", "无法删除无引用的旧捕获会话",
+                    NetMindDefaults.SessionStateRunning, utcCutoff);
+            return count;
+        }
     }
 
     /// <summary>截断 WAL 并压缩 SQLite 主文件；只应在采集停止且无并发写入时调用。</summary>
@@ -471,13 +518,12 @@ public sealed class SqliteMetadataStore : IDisposable
     /// <summary>把 WAL 内容合并进主数据库并截断 WAL，供一致性工作区备份使用。</summary>
     public void Checkpoint() => Execute("PRAGMA wal_checkpoint(TRUNCATE);");
 
-    private long Scalar(string sql)
+    private long Scalar(string sql, params ReadOnlySpan<Parameter> parameters)
     {
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8(sql), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法执行统计查询", result);
+            var statement = Prepare(sql, "无法执行统计查询", parameters);
             try
             {
                 return Native.sqlite3_step(statement) == SqliteRow ? Native.sqlite3_column_int64(statement, 0) : 0;
@@ -556,8 +602,7 @@ public sealed class SqliteMetadataStore : IDisposable
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8("PRAGMA user_version;"), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException("无法读取数据库架构版本", result);
+            var statement = Prepare("PRAGMA user_version;", "无法读取数据库架构版本");
             try
             {
                 return Native.sqlite3_step(statement) == SqliteRow ? Native.sqlite3_column_int(statement, 0) : 0;
@@ -566,15 +611,30 @@ public sealed class SqliteMetadataStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// 表名与列名是 SQL 标识符，无法用参数绑定，只能拼进语句文本。
+    /// 因此这里强制它们只能是 ASCII 标识符字面量——本类的全部调用点都传编译期常量，
+    /// 该检查用于把这个前提固化下来，防止后续有人把外部数据接到这条路径上。
+    /// </summary>
+    private static string Identifier(string value)
+    {
+        foreach (var character in value)
+            if (!char.IsAsciiLetterOrDigit(character) && character != '_')
+                throw new ArgumentException($"SQL 标识符只允许 ASCII 字母、数字和下划线：{value}", nameof(value));
+        return value.Length == 0 ? throw new ArgumentException("SQL 标识符不能为空。", nameof(value)) : value;
+    }
+
     private void EnsureColumn(string table, string column, string definition)
     {
+        table = Identifier(table);
+        column = Identifier(column);
         lock (_gate)
         {
             EnsureOpen();
-            var result = Native.sqlite3_prepare_v2(_database, Utf8($"PRAGMA table_info({table});"), -1, out var statement, IntPtr.Zero);
-            if (result != SqliteOk) throw CreateException($"无法检查字段 {column}", result);
+            var statement = Prepare($"PRAGMA table_info({table});", $"无法检查字段 {column}");
             try
             {
+                int result;
                 while ((result = Native.sqlite3_step(statement)) == SqliteRow)
                     if (Text(statement, 1).Equals(column, StringComparison.OrdinalIgnoreCase)) return;
                 if (result != SqliteDone) throw CreateException($"检查字段 {column} 时发生错误", result);
@@ -584,6 +644,146 @@ public sealed class SqliteMetadataStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// 绑定到预编译语句的参数值。只有文本、整数和 NULL 三种存储类；文本按显式字节长度绑定，
+    /// 因此可以原样携带 NUL、单引号等任何字节，无需也不允许再做 SQL 文本转义。
+    /// Guid 与 DateTimeOffset 的文本形式在此统一（分别为 <c>ToString()</c> 与 ISO 8601 <c>"O"</c>），
+    /// 避免各调用点各写各的格式。
+    /// </summary>
+    private readonly struct Parameter
+    {
+        private readonly byte[]? _text;
+        private readonly long _number;
+        private readonly bool _isNumber;
+
+        private Parameter(byte[]? text, long number, bool isNumber)
+        {
+            _text = text;
+            _number = number;
+            _isNumber = isNumber;
+        }
+
+        public void Bind(IntPtr statement, int index)
+        {
+            var result = _isNumber
+                ? Native.sqlite3_bind_int64(statement, index, _number)
+                : _text is null
+                    ? Native.sqlite3_bind_null(statement, index)
+                    : Native.sqlite3_bind_text(statement, index, _text, _text.Length, SqliteTransient);
+            if (result != SqliteOk)
+                throw new InvalidOperationException($"无法绑定第 {index} 个查询参数（SQLite {result}）。");
+        }
+
+        public static implicit operator Parameter(string? value) =>
+            new(value is null ? null : Encoding.UTF8.GetBytes(value), 0, isNumber: false);
+        public static implicit operator Parameter(long value) => new(null, value, isNumber: true);
+        public static implicit operator Parameter(int value) => new(null, value, isNumber: true);
+        public static implicit operator Parameter(Guid value) => value.ToString();
+        public static implicit operator Parameter(DateTimeOffset value) => value.ToString("O");
+    }
+
+    /// <summary>生成 <paramref name="count"/> 个 <c>?</c> 占位符，供 IN 子句按参数绑定标识集合。</summary>
+    private static string Placeholders(int count) => string.Join(',', Enumerable.Repeat("?", count));
+
+    /// <summary>
+    /// 预编译并绑定参数，返回语句句柄；调用方负责在 finally 中 finalize。
+    /// 用于返回结果集的查询，语句用完即弃。
+    /// </summary>
+    private IntPtr Prepare(string sql, string failureMessage, params ReadOnlySpan<Parameter> parameters)
+    {
+        var result = Native.sqlite3_prepare_v2(_database, Utf8(sql), -1, out var statement, IntPtr.Zero);
+        if (result != SqliteOk) throw CreateException(failureMessage, result);
+        try
+        {
+            for (var i = 0; i < parameters.Length; i++) parameters[i].Bind(statement, i + 1);
+        }
+        catch
+        {
+            Native.sqlite3_finalize(statement);
+            throw;
+        }
+        return statement;
+    }
+
+    /// <summary>执行一条带参数的写语句，语句用完即弃。适用于低频的删除与治理操作。</summary>
+    private void Write(string sql, string failureMessage, params ReadOnlySpan<Parameter> parameters)
+    {
+        lock (_gate)
+        {
+            EnsureOpen();
+            var statement = Prepare(sql, failureMessage, parameters);
+            try
+            {
+                var result = Native.sqlite3_step(statement);
+                if (result != SqliteDone) throw CreateException(failureMessage, result);
+            }
+            finally { Native.sqlite3_finalize(statement); }
+        }
+    }
+
+    /// <summary>
+    /// 用缓存的预编译语句执行一条写语句。只允许传入 SQL 文本恒定的热路径写入
+    /// （事务入库、会话 upsert、Hook 批量插入），缓存因此有固定上界。
+    /// </summary>
+    private void WriteCached(string sql, string failureMessage, params ReadOnlySpan<Parameter> parameters)
+    {
+        lock (_gate)
+        {
+            EnsureOpen();
+            var statement = GetCachedStatement(sql);
+            try
+            {
+                for (var i = 0; i < parameters.Length; i++) parameters[i].Bind(statement, i + 1);
+                var result = Native.sqlite3_step(statement);
+                if (result != SqliteDone) throw CreateException(failureMessage, result);
+            }
+            finally
+            {
+                // reset 释放语句持有的锁与游标，clear_bindings 避免上一轮的值残留到下一轮。
+                Native.sqlite3_reset(statement);
+                Native.sqlite3_clear_bindings(statement);
+            }
+        }
+    }
+
+    /// <summary>取得（并缓存）预编译语句；调用方必须持有 <see cref="_gate"/>。</summary>
+    private IntPtr GetCachedStatement(string sql)
+    {
+        if (_statements.TryGetValue(sql, out var cached)) return cached;
+        var result = Native.sqlite3_prepare_v2(_database, Utf8(sql), -1, out var statement, IntPtr.Zero);
+        if (result != SqliteOk) throw CreateException("无法预编译语句", result);
+        _statements[sql] = statement;
+        return statement;
+    }
+
+    /// <summary>在 BEGIN IMMEDIATE / COMMIT 之间执行 <paramref name="body"/>，异常时回滚。</summary>
+    private void InTransaction(Action body)
+    {
+        // _gate 是可重入的：整段事务必须在同一把锁内完成，否则其他线程可能在
+        // BEGIN 与 COMMIT 之间插入语句，破坏原本单条 exec 提供的原子性。
+        lock (_gate)
+        {
+            EnsureOpen();
+            Execute("BEGIN IMMEDIATE;");
+            try
+            {
+                body();
+            }
+            catch
+            {
+                try { Execute("ROLLBACK;"); }
+                catch { /* 回滚失败时保留原始异常，避免掩盖真正的错误 */ }
+                throw;
+            }
+            Execute("COMMIT;");
+        }
+    }
+
+    /// <summary>
+    /// 执行不带参数的 DDL、PRAGMA 与事务控制语句。
+    /// 严禁把任何外部数据拼进 <paramref name="sql"/>——带值的语句一律走 <see cref="Write"/>／
+    /// <see cref="WriteCached"/>／<see cref="Prepare"/> 的参数绑定路径。
+    /// </summary>
     private void Execute(string sql)
     {
         lock (_gate)
@@ -603,14 +803,26 @@ public sealed class SqliteMetadataStore : IDisposable
         return new InvalidOperationException($"{message}（SQLite {result}：{nativeMessage ?? "未知错误"}）");
     }
 
+    /// <summary>
+    /// 按列的实际字节长度读取文本。不能用 <c>Marshal.PtrToStringUTF8</c>：它在首个 NUL 处截断，
+    /// 而抓包证据（URL、Header、Cookie、正文摘要）可能合法地携带 NUL 等控制字符。
+    /// 必须先取指针再取长度，这是 SQLite 文档要求的调用顺序。
+    /// </summary>
     private static string Text(IntPtr statement, int column)
     {
         var pointer = Native.sqlite3_column_text(statement, column);
-        return pointer == IntPtr.Zero ? string.Empty : Marshal.PtrToStringUTF8(pointer) ?? string.Empty;
+        if (pointer == IntPtr.Zero) return string.Empty;
+        var length = Native.sqlite3_column_bytes(statement, column);
+        if (length <= 0) return string.Empty;
+        var buffer = new byte[length];
+        Marshal.Copy(pointer, buffer, 0, length);
+        return Encoding.UTF8.GetString(buffer);
     }
 
-    private static string Esc(string value) => value.Replace("'", "''", StringComparison.Ordinal);
-    private static string Sql(string? value) => value is null ? "NULL" : $"'{Esc(value)}'";
+    /// <summary>
+    /// 仅用于 SQL 文本与文件名的 NUL 结尾 UTF-8 编码。参数值一律经 <see cref="Parameter"/> 绑定，
+    /// 绝不拼进 SQL 文本，因此这里的输入永远是本仓库自己生成的常量或占位符串。
+    /// </summary>
     private static byte[] Utf8(string value) => Encoding.UTF8.GetBytes(value + '\0');
 
     private void EnsureOpen()
@@ -623,6 +835,10 @@ public sealed class SqliteMetadataStore : IDisposable
         lock (_gate)
         {
             if (_database == IntPtr.Zero) return;
+            // 必须先 finalize 全部缓存语句：仍有未释放语句时 sqlite3_close_v2 只会把连接标记为
+            // 僵尸连接并延迟关闭，数据库文件与 WAL 不会立即释放。
+            foreach (var statement in _statements.Values) Native.sqlite3_finalize(statement);
+            _statements.Clear();
             Native.sqlite3_close_v2(_database);
             _database = IntPtr.Zero;
         }
@@ -650,6 +866,24 @@ public sealed class SqliteMetadataStore : IDisposable
         internal static extern int sqlite3_finalize(IntPtr statement);
 
         [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int sqlite3_reset(IntPtr statement);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int sqlite3_clear_bindings(IntPtr statement);
+
+        // 第 4 参数是字节数而非字符数，传入 -1 会让 SQLite 在首个 NUL 处截断；本仓库一律传显式长度。
+        // 第 5 参数为析构器：SQLITE_TRANSIENT((void*)-1) 要求 SQLite 在返回前自行复制缓冲区，
+        // 因为托管 byte[] 只在本次 P/Invoke 期间被固定。
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int sqlite3_bind_text(IntPtr statement, int index, byte[] value, int bytes, IntPtr destructor);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int sqlite3_bind_int64(IntPtr statement, int index, long value);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int sqlite3_bind_null(IntPtr statement, int index);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int sqlite3_column_int(IntPtr statement, int column);
 
         [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -657,6 +891,9 @@ public sealed class SqliteMetadataStore : IDisposable
 
         [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr sqlite3_column_text(IntPtr statement, int column);
+
+        [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int sqlite3_column_bytes(IntPtr statement, int column);
 
         [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr sqlite3_errmsg(IntPtr database);

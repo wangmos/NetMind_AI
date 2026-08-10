@@ -29,15 +29,42 @@ public sealed partial class WorkspaceStore
         await AppendAuditAsync("workspace.initialized", new { name }, cancellationToken);
     }
 
+    /// <summary>
+    /// 按 SHA-256 内容寻址写入正文 Blob，返回哈希。
+    /// 写入必须原子：先写同目录唯一临时文件再重命名。直接写目标路径的话，
+    /// 中途崩溃会留下一个「文件名是正确哈希、内容却被截断」的 Blob，
+    /// 而后续的存在性检查永远命中，这份损坏证据再也不会被修复。
+    /// </summary>
     public async Task<string> StoreBlobAsync(ReadOnlyMemory<byte> content, CancellationToken cancellationToken = default)
     {
         var hash = Convert.ToHexString(SHA256.HashData(content.Span)).ToLowerInvariant();
         var directory = Path.Combine(RootPath, NetMindDefaults.BlobsDirectoryName, hash[..2]);
         Directory.CreateDirectory(directory);
         var path = Path.Combine(directory, hash);
-        if (!File.Exists(path))
+        if (File.Exists(path)) return hash;
+
+        // 临时文件名带随机后缀：并发采集连接可能同时落盘不同正文，不能共用固定临时名。
+        var temporaryPath = Path.Combine(directory, $"{hash}.{Guid.NewGuid():N}.tmp");
+        try
         {
-            await File.WriteAllBytesAsync(path, content.ToArray(), cancellationToken);
+            await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                             64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                await stream.WriteAsync(content, cancellationToken);
+            }
+
+            try
+            {
+                File.Move(temporaryPath, path, overwrite: false);
+            }
+            catch (IOException) when (File.Exists(path))
+            {
+                // 另一个并发写者已经落盘同一哈希。内容寻址保证两者逐字节相同，丢弃本次临时文件即可。
+            }
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
         }
         return hash;
     }
@@ -127,6 +154,8 @@ public sealed partial class WorkspaceStore
 
     /// <summary>
     /// 删除未被 SQLite 事务引用的合法内容寻址 Blob；非 64 位十六进制文件不擅自删除，避免误伤用户放入的文件。
+    /// 例外是 <see cref="StoreBlobAsync"/> 留下的 <c>&lt;哈希&gt;.&lt;随机&gt;.tmp</c> 残留：
+    /// 进程在重命名前崩溃才会产生，永远不会被引用，一并回收。
     /// </summary>
     public Task<(int Files, long Bytes)> CleanupOrphanBlobsAsync(IReadOnlySet<string> referencedHashes,
         CancellationToken cancellationToken = default)
@@ -141,12 +170,14 @@ public sealed partial class WorkspaceStore
         {
             cancellationToken.ThrowIfCancellationRequested();
             var name = Path.GetFileName(path);
-            if (name.Length != NetMindDefaults.Sha256HexLength || name.Any(character => !Uri.IsHexDigit(character)) ||
-                referencedHashes.Contains(name)) continue;
+            if (!IsAbandonedBlobTemporary(name) &&
+                (name.Length != NetMindDefaults.Sha256HexLength || name.Any(character => !Uri.IsHexDigit(character)) ||
+                 referencedHashes.Contains(name))) continue;
             long length;
             try { length = new FileInfo(path).Length; }
             catch (FileNotFoundException) { continue; }
-            File.Delete(path);
+            try { File.Delete(path); }
+            catch (IOException) { continue; }   // 另一进程正在写这个临时文件，本轮跳过
             files++;
             bytes += length;
         }
@@ -157,6 +188,21 @@ public sealed partial class WorkspaceStore
             if (!Directory.EnumerateFileSystemEntries(directory).Any()) Directory.Delete(directory);
         }
         return Task.FromResult((files, bytes));
+    }
+
+    /// <summary>
+    /// 判断是否为 <see cref="StoreBlobAsync"/> 的遗留临时文件：
+    /// 严格匹配 <c>&lt;64 位哈希&gt;.&lt;32 位 Guid&gt;.tmp</c>，避免误删用户放入 blobs 目录的其他文件。
+    /// </summary>
+    private static bool IsAbandonedBlobTemporary(string name)
+    {
+        if (!name.EndsWith(".tmp", StringComparison.Ordinal)) return false;
+        var parts = name.Split('.');
+        return parts.Length == 3
+               && parts[0].Length == NetMindDefaults.Sha256HexLength
+               && parts[0].All(Uri.IsHexDigit)
+               && parts[1].Length == 32
+               && parts[1].All(Uri.IsHexDigit);
     }
 
     public static string Redact(string value) => SecretPattern().Replace(value, "$1=" + NetMindDefaults.RedactedPlaceholder);

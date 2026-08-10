@@ -56,6 +56,13 @@ if (args.Contains("--delete-only", StringComparer.OrdinalIgnoreCase))
     return 0;
 }
 
+if (args.Contains("--hostile-only", StringComparer.OrdinalIgnoreCase))
+{
+    await VerifyHostileEvidenceRoundTripAsync();
+    Console.WriteLine("站点可控证据（引号、NUL、注入片段、中文与 emoji）参数绑定往返定向测试通过。");
+    return 0;
+}
+
 if (args.Contains("--copy-only", StringComparer.OrdinalIgnoreCase))
 {
     VerifyTrafficCopyFormatting();
@@ -1097,6 +1104,7 @@ try
     VerifyProtocolParsers();
     VerifyTrafficAnalysis();
     await VerifySilentCapture();
+    await VerifyHostileEvidenceRoundTripAsync();
 
     using (var archive = new TrafficArchive(testRoot))
     {
@@ -1136,6 +1144,76 @@ finally
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+/// <summary>
+/// 被抓取的流量完全由被访问站点控制。URL、Header、Cookie 与查询参数中的单引号、NUL、
+/// SQL 注入片段、中文与 4 字节 emoji 都必须作为数据逐字符往返，既不能改变数据库结构，
+/// 也不能在写入或读取时被截断。Blob 落盘必须原子，不留临时文件。
+/// </summary>
+static async Task VerifyHostileEvidenceRoundTripAsync()
+{
+    const string hostileUrl = "https://evil.test/a'b\"c--d/\u0000/中文/\U0001F510?x=1";
+    const string hostileHeaders = "X-Odd: v'1\u0000v2\nX-中文: 值\U0001F510";
+    const string hostileCookies = "sid=a'b\u0000c; 名字=值'; emoji=\U0001F510";
+    const string hostileQuery = "q=' OR 1=1 --&名=值\u0000&e=\U0001F510";
+    const string hostileTarget = "全部进程'; DROP TABLE capture_sessions; --";
+
+    var testRoot = Path.Combine(Path.GetTempPath(), "netmind-hostile-test-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        using var archive = new TrafficArchive(testRoot);
+        await archive.InitializeAsync("恶意证据往返测试工作区");
+        var sessionId = Guid.NewGuid();
+        await archive.StartSessionAsync(new CaptureSessionRecord(sessionId, DateTimeOffset.UtcNow, null,
+            NetMindDefaults.SourceSimulated, hostileTarget, NetMindDefaults.SessionStateRunning));
+
+        var item = DemoData.CreateTraffic()[0] with
+        {
+            Id = Guid.NewGuid(),
+            Url = hostileUrl,
+            RequestHeaders = hostileHeaders,
+            ResponseHeaders = hostileHeaders,
+            Cookies = hostileCookies,
+            QueryParameters = hostileQuery,
+            RequestSummary = "摘要'; DELETE FROM traffic_transactions; --",
+        };
+        await archive.RecordAsync(sessionId, item, "请求\u0000正文"u8.ToArray(), "响应正文"u8.ToArray());
+
+        Require(archive.GetTrafficCount() == 1, "注入片段必须作为数据写入，不得改变事务表内容");
+
+        var restored = archive.GetRecentTraffic(10).Single().Traffic;
+        Require(restored.Url == hostileUrl, "URL 中的单引号、NUL、中文与 emoji 必须逐字符往返");
+        Require(restored.RequestHeaders == hostileHeaders, "请求头必须逐字符往返");
+        Require(restored.ResponseHeaders == hostileHeaders, "响应头必须逐字符往返");
+        Require(restored.Cookies == hostileCookies, "Cookie 必须逐字符往返");
+        Require(restored.QueryParameters == hostileQuery, "查询参数必须逐字符往返");
+        Require(restored.RequestSummary == item.RequestSummary, "摘要中的注入片段必须原样保留");
+        Require(restored.Url.Contains('\u0000') && restored.Cookies.Contains('\u0000'),
+            "NUL 必须作为数据保留，而不是截断 SQL 文本或读取结果");
+
+        // 记录组精确查询与增量游标走不同 SQL，必须给出同样完整的证据。
+        var byId = archive.GetTrafficByIds([item.Id]).Single().Traffic;
+        Require(byId.Url == hostileUrl && byId.Cookies == hostileCookies, "按 ID 精确查询必须返回同样完整的证据");
+        var changes = archive.GetTrafficChangesAfter(0);
+        Require(changes.Count == 1 && changes[0].Stored.Traffic.Url == hostileUrl,
+            "增量读取必须返回同样完整的证据");
+
+        // 会话表的 target 同样承载外部可控文本。
+        var session = archive.GetRecentSessions(10).Single().Session;
+        Require(session.Target == hostileTarget, "会话目标中的注入片段必须原样保存为数据");
+
+        // 正文 Blob 必须原子落盘：目录内只应有内容寻址文件，不留 .tmp 残留。
+        var blobRoot = Path.Combine(testRoot, NetMindDefaults.BlobsDirectoryName);
+        var residue = Directory.EnumerateFiles(blobRoot, "*.tmp", SearchOption.AllDirectories).ToArray();
+        Require(residue.Length == 0, "Blob 写入完成后不得留下临时文件");
+        var blob = await archive.ReadBlobAsync(archive.GetRecentTraffic(1).Single().RequestBlobHash);
+        Require(blob.Content.AsSpan().SequenceEqual("请求\u0000正文"u8), "正文 Blob 必须逐字节往返，含 NUL");
+    }
+    finally
+    {
+        if (Directory.Exists(testRoot)) Directory.Delete(testRoot, recursive: true);
+    }
 }
 
 static async Task VerifyIncrementalTrafficCursorAsync()
