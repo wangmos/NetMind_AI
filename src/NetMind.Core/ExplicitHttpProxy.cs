@@ -178,6 +178,12 @@ public sealed class ExplicitHttpProxy : IAsyncDisposable
         var requestBody = await ReadRequestBodyAsync(stream, headers, _options.MaximumBodyBytes, cancellationToken);
         var hookTransactionId = Guid.NewGuid();
         var requestSnapshot = CreateHookSnapshot(hookTransactionId, method, uri, headers, requestBody);
+        // 拦截优先于观察：命中脚本 INTERCEPT 规则时阻塞等待裁决，改写后再走观察与转发，
+        // 这样脚本看到的和实际上线的是同一份字节。未命中或裁决失败时按原样继续（fail-open）。
+        IReadOnlyDictionary<string, string> forwardHeaders;
+        (method, uri, forwardHeaders, requestBody) =
+            await ApplyRequestInterceptAsync(requestSnapshot, method, uri, headers, requestBody, cancellationToken);
+        headers = forwardHeaders.ToDictionary(item => item.Key, item => item.Value, StringComparer.OrdinalIgnoreCase);
         _hookEngine?.Emit(HookEventNames.RequestBeforeSend, requestSnapshot);
         using var outbound = BuildRequest(method, uri, headers, requestBody);
 
@@ -205,9 +211,14 @@ public sealed class ExplicitHttpProxy : IAsyncDisposable
             var responseHeaders = response.Headers.Concat(response.Content.Headers)
                 .ToDictionary(item => item.Key, item => string.Join(", ", item.Value), StringComparer.OrdinalIgnoreCase);
             var responseSnapshot = CreateHookSnapshot(hookTransactionId, method, uri, responseHeaders, responseBody);
-            _hookEngine?.Emit(HookEventNames.ResponseBeforeWrite, responseSnapshot, (int)response.StatusCode);
-            await WriteResponseAsync(stream, response, responseBody, cancellationToken);
-            _hookEngine?.Emit(HookEventNames.ResponseAfterDeliver, responseSnapshot, (int)response.StatusCode);
+            int writtenStatus;
+            IReadOnlyList<KeyValuePair<string, string>> writtenLines;
+            (writtenStatus, writtenLines, responseBody) = await ApplyResponseInterceptAsync(
+                responseSnapshot, (int)response.StatusCode, BuildResponseHeaderLines(response), responseBody, cancellationToken);
+            responseHeaders = MergeHeaderLines(writtenLines);
+            _hookEngine?.Emit(HookEventNames.ResponseBeforeWrite, responseSnapshot, writtenStatus);
+            await WriteResponseAsync(stream, writtenStatus, response.ReasonPhrase ?? "响应", writtenLines, responseBody, cancellationToken);
+            _hookEngine?.Emit(HookEventNames.ResponseAfterDeliver, responseSnapshot, writtenStatus);
             // 回写给浏览器的字节保持原样；仅落库/分析正文按 Content-Encoding 解压。
             responseBody = ProtocolParsers.DecompressHttpBody(
                 responseHeaders.TryGetValue("Content-Encoding", out var coding) ? coding : null, responseBody);
@@ -329,6 +340,9 @@ public sealed class ExplicitHttpProxy : IAsyncDisposable
 
             var hookTransactionId = Guid.NewGuid();
             var requestSnapshot = CreateHookSnapshot(hookTransactionId, method, uri, headers, requestBody);
+            // 解密路径同样支持拦截改写：语义与明文路径完全一致，脚本不必区分。
+            (method, uri, headers, requestBody) =
+                await ApplyRequestInterceptAsync(requestSnapshot, method, uri, headers, requestBody, cancellationToken);
             _hookEngine?.Emit(HookEventNames.RequestBeforeSend, requestSnapshot);
             using var outbound = BuildRequest(method, uri, headers, requestBody);
             var stopwatch = Stopwatch.StartNew();
@@ -356,9 +370,14 @@ public sealed class ExplicitHttpProxy : IAsyncDisposable
                 var responseHeaders = response.Headers.Concat(response.Content.Headers)
                     .ToDictionary(item => item.Key, item => string.Join(", ", item.Value), StringComparer.OrdinalIgnoreCase);
                 var responseSnapshot = CreateHookSnapshot(hookTransactionId, method, uri, responseHeaders, responseBody);
-                _hookEngine?.Emit(HookEventNames.ResponseBeforeWrite, responseSnapshot, (int)response.StatusCode);
-                await WriteResponseAsync(tlsStream, response, responseBody, cancellationToken, closeConnection);
-                _hookEngine?.Emit(HookEventNames.ResponseAfterDeliver, responseSnapshot, (int)response.StatusCode);
+                int writtenStatus;
+                IReadOnlyList<KeyValuePair<string, string>> writtenLines;
+                (writtenStatus, writtenLines, responseBody) = await ApplyResponseInterceptAsync(
+                    responseSnapshot, (int)response.StatusCode, BuildResponseHeaderLines(response), responseBody, cancellationToken);
+                responseHeaders = MergeHeaderLines(writtenLines);
+                _hookEngine?.Emit(HookEventNames.ResponseBeforeWrite, responseSnapshot, writtenStatus);
+                await WriteResponseAsync(tlsStream, writtenStatus, response.ReasonPhrase ?? "响应", writtenLines, responseBody, cancellationToken, closeConnection);
+                _hookEngine?.Emit(HookEventNames.ResponseAfterDeliver, responseSnapshot, writtenStatus);
                 // 回写给浏览器的字节保持原样；仅落库/分析正文按 Content-Encoding 解压。
                 responseBody = ProtocolParsers.DecompressHttpBody(
                     responseHeaders.TryGetValue("Content-Encoding", out var coding) ? coding : null, responseBody);
@@ -401,6 +420,108 @@ public sealed class ExplicitHttpProxy : IAsyncDisposable
     }
 
     /// <summary>构建钩子事务快照；未注入钩子引擎时返回 null，保持零开销。</summary>
+    /// <summary>
+    /// 请求侧拦截：命中脚本规则时等待裁决并改写，随后把快照同步为改写后的内容——
+    /// 观察事件与落库证据都必须反映“实际发往上游的字节”，否则证据链会说谎。
+    /// 未命中、超时、工作进程不可用一律原样返回（fail-open）。
+    /// </summary>
+    private async Task<(string Method, Uri Uri, IReadOnlyDictionary<string, string> Headers, byte[] Body)>
+        ApplyRequestInterceptAsync(HookTransactionSnapshot? snapshot, string method, Uri uri,
+            IReadOnlyDictionary<string, string> headers, byte[] body, CancellationToken cancellationToken)
+    {
+        var engine = _hookEngine;
+        if (engine is null || snapshot is null ||
+            !engine.ShouldIntercept(HookEventNames.RequestBeforeSend, snapshot)) return (method, uri, headers, body);
+
+        var verdict = await engine.InterceptAsync(HookEventNames.RequestBeforeSend, snapshot,
+            cancellationToken: cancellationToken);
+        if (verdict is null || !verdict.HasChanges) return (method, uri, headers, body);
+
+        var mutatedMethod = string.IsNullOrWhiteSpace(verdict.Method) ? method : verdict.Method.Trim().ToUpperInvariant();
+        var mutatedUri = uri;
+        if (!string.IsNullOrWhiteSpace(verdict.Url) &&
+            Uri.TryCreate(verdict.Url, UriKind.Absolute, out var parsed) &&
+            (parsed.Scheme == Uri.UriSchemeHttp || parsed.Scheme == Uri.UriSchemeHttps))
+            mutatedUri = parsed; // 非法或非 http(s) 的改写 URL 直接忽略，绝不据此发起请求
+        var mutatedHeaders = ApplyRequestHeaderChanges(headers, verdict.Headers);
+        var mutatedBody = verdict.Body is null ? body : Encoding.UTF8.GetBytes(verdict.Body);
+
+        snapshot.ReplaceForMutation(mutatedMethod, mutatedUri.AbsoluteUri, mutatedUri.Host,
+            mutatedUri.PathAndQuery, mutatedHeaders, mutatedBody);
+        return (mutatedMethod, mutatedUri, mutatedHeaders, mutatedBody);
+    }
+
+    /// <summary>
+    /// 响应侧拦截：在写回浏览器之前改写状态码、响应头与正文。
+    /// 同样把快照同步为改写后的内容，使观察事件与落库证据等于浏览器真正收到的字节。
+    /// </summary>
+    private async Task<(int StatusCode, IReadOnlyList<KeyValuePair<string, string>> HeaderLines, byte[] Body)>
+        ApplyResponseInterceptAsync(HookTransactionSnapshot? snapshot, int statusCode,
+            IReadOnlyList<KeyValuePair<string, string>> headerLines, byte[] body, CancellationToken cancellationToken)
+    {
+        var engine = _hookEngine;
+        if (engine is null || snapshot is null ||
+            !engine.ShouldIntercept(HookEventNames.ResponseBeforeWrite, snapshot)) return (statusCode, headerLines, body);
+
+        var verdict = await engine.InterceptAsync(HookEventNames.ResponseBeforeWrite, snapshot, statusCode, cancellationToken);
+        if (verdict is null || !verdict.HasChanges) return (statusCode, headerLines, body);
+
+        var mutatedStatus = verdict.StatusCode is >= 100 and <= 599 ? verdict.StatusCode.Value : statusCode;
+        var mutatedLines = ApplyHeaderChanges(headerLines, verdict.Headers);
+        var mutatedBody = verdict.Body is null ? body : Encoding.UTF8.GetBytes(verdict.Body);
+
+        // 快照给脚本与落库用，按名合并即可；真正写回浏览器的仍是保留多值的 mutatedLines。
+        var snapshotHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, value) in mutatedLines)
+            snapshotHeaders[name] = snapshotHeaders.TryGetValue(name, out var existing) ? existing + ", " + value : value;
+        snapshot.ReplaceForMutation(snapshot.Method, snapshot.Url, snapshot.Host, snapshot.Endpoint, snapshotHeaders, mutatedBody);
+        snapshot.StatusCode = mutatedStatus;
+        return (mutatedStatus, mutatedLines, mutatedBody);
+    }
+
+    /// <summary>
+    /// 套用响应头改写：值为 null 表示删除该头名的全部行，其余为整体替换或新增。
+    /// 以「行」为单位处理才能保住 Set-Cookie 这类多值头；Content-Length 由写出路径按实际正文重算。
+    /// </summary>
+    private static IReadOnlyList<KeyValuePair<string, string>> ApplyHeaderChanges(
+        IReadOnlyList<KeyValuePair<string, string>> headerLines, IReadOnlyDictionary<string, string?>? changes)
+    {
+        if (changes is not { Count: > 0 }) return headerLines;
+        var result = headerLines
+            .Where(line => !changes.ContainsKey(line.Key))
+            .ToList();
+        foreach (var (name, value) in changes)
+        {
+            if (string.IsNullOrWhiteSpace(name) || value is null) continue;
+            result.Add(new KeyValuePair<string, string>(name, value));
+        }
+        return result;
+    }
+
+    /// <summary>把多值头行按名合并，供快照与落库证据使用；写回浏览器仍用未合并的行。</summary>
+    private static Dictionary<string, string> MergeHeaderLines(IReadOnlyList<KeyValuePair<string, string>> headerLines)
+    {
+        var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, value) in headerLines)
+            merged[name] = merged.TryGetValue(name, out var existing) ? existing + ", " + value : value;
+        return merged;
+    }
+
+    /// <summary>请求头改写：请求侧本就以字典表达（ParseHeaders 的既有语义），按名覆盖即可。</summary>
+    private static IReadOnlyDictionary<string, string> ApplyRequestHeaderChanges(
+        IReadOnlyDictionary<string, string> headers, IReadOnlyDictionary<string, string?>? changes)
+    {
+        if (changes is not { Count: > 0 }) return headers;
+        var merged = new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, value) in changes)
+        {
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            if (value is null) merged.Remove(name);
+            else merged[name] = value;
+        }
+        return merged;
+    }
+
     private HookTransactionSnapshot? CreateHookSnapshot(Guid transactionId, string method, Uri uri,
         IReadOnlyDictionary<string, string> headers, byte[] body)
         => _hookEngine is null
@@ -559,18 +680,35 @@ public sealed class ExplicitHttpProxy : IAsyncDisposable
         return request;
     }
 
-    private static async Task WriteResponseAsync(Stream stream, HttpResponseMessage response, byte[] body,
+    private static Task WriteResponseAsync(Stream stream, HttpResponseMessage response, byte[] body,
+        CancellationToken cancellationToken, bool closeConnection = true)
+        => WriteResponseAsync(stream, (int)response.StatusCode, response.ReasonPhrase ?? "响应",
+            BuildResponseHeaderLines(response), body, cancellationToken, closeConnection);
+
+    /// <summary>
+    /// 把响应头摊平成「一个值一行」。绝不能按名合并成逗号串：Set-Cookie 天然多值，
+    /// 合并后浏览器会把多个 Cookie 解析成一个，是实打实的行为破坏。
+    /// </summary>
+    private static List<KeyValuePair<string, string>> BuildResponseHeaderLines(HttpResponseMessage response) =>
+        [.. response.Headers.Concat(response.Content.Headers)
+            .SelectMany(header => header.Value.Select(value => new KeyValuePair<string, string>(header.Key, value)))];
+
+    /// <summary>
+    /// 按显式状态码/头/正文写回响应。脚本改写后不能再从 <see cref="HttpResponseMessage"/> 取值，
+    /// 必须以改写结果为准；Content-Length 始终按实际正文长度重算，改写正文才不会撕裂消息边界。
+    /// </summary>
+    private static async Task WriteResponseAsync(Stream stream, int statusCode, string reasonPhrase,
+        IReadOnlyList<KeyValuePair<string, string>> headerLines, byte[] body,
         CancellationToken cancellationToken, bool closeConnection = true)
     {
         var builder = new StringBuilder();
-        builder.Append("HTTP/1.1 ").Append((int)response.StatusCode).Append(' ').Append(response.ReasonPhrase ?? "响应").Append("\r\n");
-        foreach (var header in response.Headers.Concat(response.Content.Headers))
+        builder.Append("HTTP/1.1 ").Append(statusCode).Append(' ').Append(reasonPhrase).Append("\r\n");
+        foreach (var (name, value) in headerLines)
         {
-            if (header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) ||
-                header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
-                header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase)) continue;
-            foreach (var value in header.Value)
-                builder.Append(header.Key).Append(": ").Append(value).Append("\r\n");
+            if (name.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Connection", StringComparison.OrdinalIgnoreCase)) continue;
+            builder.Append(name).Append(": ").Append(value).Append("\r\n");
         }
         builder.Append("Content-Length: ").Append(body.Length)
             .Append(closeConnection ? "\r\nConnection: close\r\n\r\n" : "\r\nConnection: keep-alive\r\n\r\n");

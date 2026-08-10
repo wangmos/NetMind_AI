@@ -513,6 +513,35 @@ public static class NetMindDefaults
     /// <summary>单次周期消费写入审计的 finding 条数上限，防止异常爆量时单批审计过大。</summary>
     public const int HookFindingDrainBatchMaximum = 128;
 
+    // ── 阻塞式拦截（脚本改写请求/响应并向下传播） ────────────────────────────
+    // 与只读观察不同，拦截会让代理等待脚本裁决。因此每一项都是硬边界：
+    // 超时必须 fail-open（按原样发送），绝不能把浏览器挂住。
+
+    /// <summary>
+    /// 单次拦截等待裁决的上限。超时按放行处理。
+    /// 取 2 秒：够跑完一段常规改写逻辑，又不会让用户以为页面卡死；
+    /// 只有脚本 INTERCEPT 命中的请求会付这个代价，其余流量仍是即发即忘。
+    /// </summary>
+    public const int HookInterceptTimeoutMilliseconds = 2000;
+
+    /// <summary>脚本可声明的拦截规则条数上限，防止脚本声明出无边界的规则表拖慢热路径匹配。</summary>
+    public const int HookMaximumInterceptRules = 64;
+
+    /// <summary>
+    /// 退回普通正则引擎（模式用到反向引用/环视）时的单次匹配超时。
+    /// 线性引擎不需要它；这里只是给不得不回退的那部分模式兜底，超时按不命中处理。
+    /// </summary>
+    public const int HookInterceptRegexTimeoutMilliseconds = 50;
+
+    /// <summary>拦截规则按正文匹配时实际参与匹配的字节上限（64 KB）；每个请求都要跑，不能拿全量正文做正则。</summary>
+    public const int HookInterceptBodyMatchBytes = 64 * 1024;
+
+    /// <summary>单次改写可覆盖的请求/响应头条数上限。</summary>
+    public const int HookMaximumMutatedHeaders = 64;
+
+    /// <summary>单次改写正文的字节上限（1 MB）；超限整条改写作废并按原样放行，绝不发送半截正文。</summary>
+    public const int HookMaximumMutatedBodyBytes = 1024 * 1024;
+
     // ── 宿主布局（工作台设置目录与沙箱宿主相对布局） ─────────────────────────
 
     /// <summary>

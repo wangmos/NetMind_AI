@@ -201,6 +201,47 @@ def on_before_write(event):
 - 文件名规则：只允许字母、数字、下划线、连字符与点；拒绝空名、绝对路径和上级目录穿越。
 - 大小上限：单文件 1 MB，目录总量 64 MB；超限抛中文 `ValueError`，由看门狗记为错误后继续。
 
+### 拦截改写（INTERCEPT）
+
+默认情况下钩子只观察、不改写：事件即发即忘，代理不等待脚本。要让脚本**读取并修改数据、再向下传播**，
+需要在脚本模块级声明 `INTERCEPT`。只有被规则命中的请求才会阻塞等待裁决，其余流量仍是即发即忘——
+工作进程是单线程的，若所有请求都阻塞，一个页面的上百个资源会全部串行排队。
+
+```python
+INTERCEPT = [
+    # 条件全是正则，可同时约束 URL、方法、主机、路径、头、正文与状态码；给出的条件之间是 AND。
+    {'event': 'request.before_send', 'url': r'/v\d+/user/login', 'method': r'^POST$'},
+    {'event': 'response.before_write', 'status': r'^4\d\d$', 'headers': {'Content-Type': r'json'}},
+]
+
+def on_before_send(event):
+    # 拦截命中时，返回值就是改写内容；返回 None 表示原样放行。
+    body = event.get('bodyPreviewBase64')
+    return {
+        'url': 'https://api.test.local/v2/user/login?debug=1',  # 可选，仅请求侧
+        'method': 'POST',                                        # 可选，仅请求侧
+        'headers': {'X-Debug': '1', 'X-Sign': None},             # None 表示删除该头
+        'body': '{"password":"changed"}',
+        'finding': {'note': '已替换签名参数用于验证服务端是否校验'},  # 可选，顺带产出结论
+    }
+
+def on_before_write(event):
+    return {'status': 200, 'body': '{"ok":true}'}   # 响应侧可改状态码
+```
+
+- **可改写的挂载点只有两个**：`request.before_send`（发往上游前）与 `response.before_write`（回写浏览器前）。
+  另外两个点的数据已经离开，声明它们会被忽略。
+- **匹配位置**：`url`、`method`、`host`、`endpoint`、`body`、`status`，以及 `headers`（`{头名: 值正则}`，
+  值为空串表示只要求该头存在）。正文匹配只取前 64 KB——这条判断在每个请求上都要跑。
+- **正则安全**：模式优先用 .NET 线性引擎（`NonBacktracking`）编译，病态回溯模式也炸不掉代理热路径；
+  用到反向引用/环视时退回普通引擎并强制 50 毫秒匹配超时，超时按不命中处理。
+  任一模式非法则**整条规则作废**（不做部分生效，否则脚本会以为自己限定了范围，实际却在拦截别的流量）。
+- **一律 fail-open**：裁决超时（2 秒）、工作进程崩溃、协议错误、改写正文超过 1 MB，
+  一律按原样放行。拦截失败绝不能把浏览器挂住。
+- **证据语义**：落库记录的是**实际上线的字节**（即改写后的），同时保留改写前的 URL 与正文，
+  并标注该事务被脚本改写过——否则证据链会把脚本的改动说成客户端的原始意图。
+- `Content-Length` 始终按改写后的实际正文长度重算。改写 URL 只接受 http(s) 绝对地址，非法值忽略。
+
 ### 失败语义
 
 - 单个事件处理有 200 毫秒看门狗；工作进程内固定单个工作线程串行处理事件，超时后当前执行被置废弃标记（其后续输出丢弃），工作线程继续处理下一事件，任意时刻至多一个钩子函数触碰 store。

@@ -36,16 +36,48 @@ public sealed class HookTransactionSnapshot
     /// <summary>捕获会话标识。</summary>
     public Guid SessionId { get; }
 
-    public string Method { get; }
-    public string Url { get; }
-    public string Host { get; }
-    public string Endpoint { get; }
-    public IReadOnlyDictionary<string, string>? Headers { get; }
-    public byte[] Body { get; }
+    public string Method { get; private set; }
+    public string Url { get; private set; }
+    public string Host { get; private set; }
+    public string Endpoint { get; private set; }
+    public IReadOnlyDictionary<string, string>? Headers { get; private set; }
+    public byte[] Body { get; private set; }
     public long BodySize => Body.LongLength;
 
     /// <summary>响应状态码；请求发送前不可得，由代理自发送后观察点起补齐。</summary>
     public int? StatusCode { get; set; }
+
+    /// <summary>本次事务是否被脚本改写过。落库证据据此标注，避免把改写后的字节当成客户端原始意图。</summary>
+    public bool Mutated { get; private set; }
+
+    /// <summary>改写前的 URL；未被改写时为 null。</summary>
+    public string? OriginalUrl { get; private set; }
+
+    /// <summary>改写前的正文；未被改写时为 null。保留它才能同时说明「客户端本来要发什么」与「实际发了什么」。</summary>
+    public byte[]? OriginalBody { get; private set; }
+
+    /// <summary>
+    /// 用脚本裁决后的内容替换快照。
+    /// 之所以就地替换而不是新建快照：同一事务的多个挂载点共用一份快照，
+    /// 替换后观察事件与落库证据自然等于「实际上线的字节」。原始值单独留存供对照。
+    /// </summary>
+    internal void ReplaceForMutation(string method, string url, string host, string endpoint,
+        IReadOnlyDictionary<string, string>? headers, byte[] body)
+    {
+        if (!Mutated)
+        {
+            OriginalUrl = Url;
+            OriginalBody = Body;
+            Mutated = true;
+        }
+        Method = method;
+        Url = url;
+        Host = host;
+        Endpoint = endpoint;
+        Headers = headers;
+        Body = body;
+        _bodySha256 = null; // 正文已变，缓存哈希必须作废
+    }
 
     /// <summary>正文完整 SHA-256（十六进制小写），惰性计算并缓存。</summary>
     public string GetBodySha256() => _bodySha256 ??= Convert.ToHexString(SHA256.HashData(Body)).ToLowerInvariant();
@@ -100,6 +132,13 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     private readonly HashSet<string> _enabledEvents;
     private readonly Func<string, string, Task>? _audit;
     private readonly HookEventQueue _queue = new();
+    /// <summary>脚本在 ready 时上报的拦截规则；热路径只读，整体替换而不就地修改。</summary>
+    private IReadOnlyList<HookInterceptRule> _interceptRules = [];
+    /// <summary>在途拦截：correlationId → 等待裁决的调用方。</summary>
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<HookInterceptVerdict?>> _pendingIntercepts = new(StringComparer.Ordinal);
+    private long _interceptMutatedCount;
+    private long _interceptTimeoutCount;
+    private long _interceptRejectedCount;
     private readonly ConcurrentQueue<HookFinding> _findings = new();
     private readonly SemaphoreSlim _sessionGate = new(1, 1);
     private readonly LinkedList<DateTime> _restartTimestamps = new(); // 只在 _sessionGate 内访问
@@ -169,6 +208,18 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     /// <summary>待取回的观察结论条数。</summary>
     public int FindingCount => _findings.Count;
 
+    /// <summary>脚本声明的拦截规则条数（0 表示纯观察，不阻塞任何请求）。</summary>
+    public int InterceptRuleCount => Volatile.Read(ref _interceptRules).Count;
+
+    /// <summary>脚本实际改写的事务累计条数。</summary>
+    public long InterceptMutatedCount => Interlocked.Read(ref _interceptMutatedCount);
+
+    /// <summary>拦截超时或工作进程不可用而按原样放行的累计条数（fail-open 次数）。</summary>
+    public long InterceptFailOpenCount => Interlocked.Read(ref _interceptTimeoutCount);
+
+    /// <summary>因改写内容超限被拒绝的累计条数。</summary>
+    public long InterceptRejectedCount => Interlocked.Read(ref _interceptRejectedCount);
+
     /// <summary>
     /// 定向测试专用：直接取出待投递的事件信封。
     /// 代理挂载点是否真的按序触发、信封字段是否正确，只有绕开工作进程才能独立验证——
@@ -220,39 +271,45 @@ public sealed class ScriptHookEngine : IAsyncDisposable
                 return;
             }
 
-            var body = snapshot.Body;
-            string? preview = null;
-            var truncated = false;
-            if (body.Length > 0)
-            {
-                var previewLength = Math.Min(body.Length, NetMindDefaults.HookBodyPreviewBytes);
-                preview = Convert.ToBase64String(body, 0, previewLength);
-                truncated = body.Length > NetMindDefaults.HookBodyPreviewBytes;
-            }
-            var envelope = new HookEventEnvelope(
-                hookEvent,
-                snapshot.TxnId.ToString(),
-                snapshot.SessionId.ToString(),
-                hookName,
-                snapshot.Method,
-                snapshot.Url,
-                snapshot.Host,
-                snapshot.Endpoint,
-                snapshot.StatusCode,
-                snapshot.Headers,
-                preview,
-                truncated,
-                null, // 正文 SHA-256 推迟到泵线程序列化时惰性计算，不在关键路径同步哈希
-                snapshot.BodySize)
-            {
-                Snapshot = snapshot
-            };
-            _queue.TryEnqueue(envelope);
+            var envelope = BuildEnvelope(hookEvent, hookName, snapshot);
+            if (envelope is not null) _queue.TryEnqueue(envelope);
         }
         catch
         {
             // 观察路径绝不向代理关键路径抛出。
         }
+    }
+
+    /// <summary>构建事件信封。观察投递与阻塞拦截共用同一份构建逻辑，避免两条路径的字段语义漂移。</summary>
+    private static HookEventEnvelope? BuildEnvelope(string hookEvent, string hookName, HookTransactionSnapshot snapshot)
+    {
+        var body = snapshot.Body;
+        string? preview = null;
+        var truncated = false;
+        if (body.Length > 0)
+        {
+            var previewLength = Math.Min(body.Length, NetMindDefaults.HookBodyPreviewBytes);
+            preview = Convert.ToBase64String(body, 0, previewLength);
+            truncated = body.Length > NetMindDefaults.HookBodyPreviewBytes;
+        }
+        return new HookEventEnvelope(
+            hookEvent,
+            snapshot.TxnId.ToString(),
+            snapshot.SessionId.ToString(),
+            hookName,
+            snapshot.Method,
+            snapshot.Url,
+            snapshot.Host,
+            snapshot.Endpoint,
+            snapshot.StatusCode,
+            snapshot.Headers,
+            preview,
+            truncated,
+            null, // 正文 SHA-256 推迟到泵线程序列化时惰性计算，不在关键路径同步哈希
+            snapshot.BodySize)
+        {
+            Snapshot = snapshot
+        };
     }
 
     /// <summary>取回并清空当前全部观察结论（供 UI 轮询消费）。</summary>
@@ -692,7 +749,14 @@ public sealed class ScriptHookEngine : IAsyncDisposable
             switch (type)
             {
                 case HookWorkerMessageTypes.Ready:
+                    // 脚本用模块级 INTERCEPT 声明要拦截什么，随 ready 一次性上报；
+                    // 之后每个请求的匹配都在宿主进程内完成，热路径不再问工作进程。
+                    Volatile.Write(ref _interceptRules, ReadInterceptRules(document.RootElement));
                     session.ReadySignal.TrySetResult(true);
+                    break;
+                case HookWorkerMessageTypes.Pass:
+                case HookWorkerMessageTypes.Mutate:
+                    CompleteIntercept(document.RootElement, type);
                     break;
                 case HookWorkerMessageTypes.Finding:
                     HandleFinding(document.RootElement);
@@ -713,6 +777,141 @@ public sealed class ScriptHookEngine : IAsyncDisposable
         {
             // 非协议输出直接忽略。
         }
+    }
+
+    /// <summary>解析 ready 消息里脚本声明的拦截规则；缺失、格式错误或声明了不可改写的挂载点都按“不拦截”处理。</summary>
+    private static IReadOnlyList<HookInterceptRule> ReadInterceptRules(JsonElement element)
+    {
+        if (!element.TryGetProperty("intercept", out var array) || array.ValueKind != JsonValueKind.Array) return [];
+        var rules = new List<HookInterceptRule>();
+        foreach (var item in array.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) continue;
+            Dictionary<string, string>? headers = null;
+            if (item.TryGetProperty("headers", out var headerElement) && headerElement.ValueKind == JsonValueKind.Object)
+            {
+                headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var property in headerElement.EnumerateObject())
+                {
+                    if (headers.Count >= NetMindDefaults.HookMaximumMutatedHeaders) break;
+                    headers[property.Name] = property.Value.ValueKind == JsonValueKind.String
+                        ? property.Value.GetString() ?? string.Empty
+                        : string.Empty;
+                }
+            }
+            // 任一模式非法则整条规则作废：部分生效会让脚本以为自己限定了范围，实际却在拦截别的流量。
+            var rule = HookInterceptRule.TryCreate(
+                ReadString(item, "event"), ReadString(item, "url"), ReadString(item, "method"),
+                ReadString(item, "host"), ReadString(item, "endpoint"), ReadString(item, "body"),
+                ReadString(item, "status"), headers);
+            if (rule is null) continue;
+            rules.Add(rule);
+            if (rules.Count >= NetMindDefaults.HookMaximumInterceptRules) break;
+        }
+        return rules;
+    }
+
+    /// <summary>
+    /// 本次事务是否命中脚本声明的拦截规则。匹配在宿主进程内完成，代理热路径每个请求都会调用；
+    /// 未声明任何规则时立刻返回 false，纯观察脚本不付任何代价。
+    /// </summary>
+    public bool ShouldIntercept(string hookEvent, HookTransactionSnapshot? snapshot)
+    {
+        if (snapshot is null || _stopping || _disabled || !HookInterceptRule.IsMutable(hookEvent)) return false;
+        var rules = Volatile.Read(ref _interceptRules);
+        if (rules.Count == 0) return false;
+        for (var index = 0; index < rules.Count; index++)
+            if (rules[index].Matches(hookEvent, snapshot)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// 阻塞式拦截：把事务交给脚本，等待改写裁决。
+    /// 超时、工作进程不可用、协议错误一律返回 null（fail-open，代理照原样发送）——
+    /// 拦截失败绝不能把浏览器挂住，这是本方法唯一不可让步的约束。
+    /// </summary>
+    public async Task<HookInterceptVerdict?> InterceptAsync(string hookEvent, HookTransactionSnapshot? snapshot,
+        int? statusCode = null, CancellationToken cancellationToken = default)
+    {
+        if (snapshot is null || !IsEnabled) return null;
+        if (statusCode.HasValue) snapshot.StatusCode = statusCode;
+        if (!HookFunctionNames.TryGetValue(hookEvent, out var hookName)) return null;
+        var session = _session;
+        if (session is null) return null;
+
+        var correlationId = Guid.NewGuid().ToString("N");
+        var pending = new TaskCompletionSource<HookInterceptVerdict?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_pendingIntercepts.TryAdd(correlationId, pending)) return null;
+        try
+        {
+            var envelope = BuildEnvelope(hookEvent, hookName, snapshot);
+            if (envelope is null) return null;
+            var line = JsonSerializer.Serialize(new
+            {
+                type = HookWorkerMessageTypes.Intercept,
+                correlationId,
+                envelope
+            }, HookEventEnvelope.JsonOptions);
+            await WriteRawLineAsync(session, line, cancellationToken);
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(NetMindDefaults.HookInterceptTimeoutMilliseconds);
+            await using (timeout.Token.Register(() => pending.TrySetResult(null)))
+            {
+                var verdict = await pending.Task;
+                if (verdict is null) Interlocked.Increment(ref _interceptTimeoutCount);
+                return verdict;
+            }
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            // 工作进程写失败/已退出：按放行处理，绝不把异常抛回代理关键路径。
+            Interlocked.Increment(ref _interceptTimeoutCount);
+            return null;
+        }
+        finally
+        {
+            _pendingIntercepts.TryRemove(correlationId, out _);
+        }
+    }
+
+    /// <summary>工作进程回执：把裁决交回等待中的拦截调用。</summary>
+    private void CompleteIntercept(JsonElement element, string type)
+    {
+        var correlationId = ReadString(element, "correlationId");
+        if (correlationId is null || !_pendingIntercepts.TryRemove(correlationId, out var pending)) return;
+        if (type == HookWorkerMessageTypes.Pass)
+        {
+            pending.TrySetResult(null);
+            return;
+        }
+        IReadOnlyDictionary<string, string?>? headers = null;
+        if (element.TryGetProperty("headers", out var headerElement) && headerElement.ValueKind == JsonValueKind.Object)
+        {
+            var map = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var property in headerElement.EnumerateObject())
+            {
+                if (map.Count >= NetMindDefaults.HookMaximumMutatedHeaders) break;
+                map[property.Name] = property.Value.ValueKind == JsonValueKind.Null ? null : property.Value.GetString();
+            }
+            headers = map;
+        }
+        var body = ReadString(element, "body");
+        if (body is not null && Encoding.UTF8.GetByteCount(body) > NetMindDefaults.HookMaximumMutatedBodyBytes)
+        {
+            // 超限改写按放行处理：宁可不改，也不把半截正文发上去。
+            Interlocked.Increment(ref _interceptRejectedCount);
+            pending.TrySetResult(null);
+            return;
+        }
+        var verdict = new HookInterceptVerdict(
+            ReadString(element, "url"),
+            ReadString(element, "method"),
+            element.TryGetProperty("statusCode", out var status) && status.TryGetInt32(out var parsedStatus) ? parsedStatus : null,
+            headers,
+            body);
+        Interlocked.Increment(ref _interceptMutatedCount);
+        pending.TrySetResult(verdict.HasChanges ? verdict : null);
     }
 
     private void HandleFinding(JsonElement element)

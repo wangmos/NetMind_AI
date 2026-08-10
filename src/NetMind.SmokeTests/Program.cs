@@ -70,6 +70,7 @@ var suites = new SmokeSuite[]
         await VerifyPageHooksAsync();
     }),
     new("代理钩子挂载点端到端触发（顺序、txnId、正文、单点开关）", "mountpoint-only", VerifyProxyHookMountPointsAsync),
+    new("拦截规则正则匹配（URL/方法/主机/路径/头/正文/状态码）与 fail-open", "intercept-only", VerifyHookInterceptRulesAsync),
     new("采集链路一键自检", "capture-health-only", VerifyCaptureHealthAsync),
     new("HTTPS CONNECT、TLS 解密、正文持久化与 AI 脱敏", "tls-only", VerifyTlsInspectionAsync),
     new("Windows Job Object 沙箱资源限制与真实 Python", "sandbox-only", VerifyWindowsSandboxAsync),
@@ -1145,6 +1146,108 @@ static void VerifyCaptureBrowserPlan(string testRoot)
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+/// <summary>
+/// 拦截规则匹配与 fail-open 边界。
+///
+/// 规则由脚本声明、在宿主进程内匹配，代理热路径上每个请求都会跑一遍，
+/// 因此这里既要验证「能按 URL/方法/主机/路径/头/正文/状态码 精确命中」，
+/// 也要验证「病态正则炸不掉热路径」和「拿不到裁决时一定放行」。
+/// </summary>
+static async Task VerifyHookInterceptRulesAsync()
+{
+    static HookTransactionSnapshot Snapshot(string method, string url, string body, int? status = null,
+        IReadOnlyDictionary<string, string>? headers = null)
+    {
+        var uri = new Uri(url);
+        return new HookTransactionSnapshot(Guid.NewGuid(), Guid.NewGuid(), method, url, uri.Host, uri.PathAndQuery,
+            headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["X-Sign"] = "a1b2c3d4e5f60718" },
+            Encoding.UTF8.GetBytes(body)) { StatusCode = status };
+    }
+
+    var login = Snapshot("POST", "https://api.test.local/v2/user/login?lang=zh", "{\"password\":\"p\",\"sign\":\"abc\"}");
+    var listing = Snapshot("GET", "https://cdn.test.local/assets/app.js", "console.log(1)");
+
+    // 每个可匹配位置都要能单独命中，也要能正确地不命中。
+    (string Name, string? Url, string? Method, string? Host, string? Endpoint, string? Body, string? Status,
+        Dictionary<string, string>? Headers, bool ShouldMatch)[] cases =
+    {
+        ("URL 正则", @"/v\d+/user/login", null, null, null, null, null, null, true),
+        ("URL 不命中", @"/v\d+/order", null, null, null, null, null, null, false),
+        ("方法", null, "^POST$", null, null, null, null, null, true),
+        ("方法不命中", null, "^GET$", null, null, null, null, null, false),
+        ("主机", null, null, @"^api\.", null, null, null, null, true),
+        ("主机不命中", null, null, @"^cdn\.", null, null, null, null, false),
+        ("路径", null, null, null, @"^/v2/user/", null, null, null, true),
+        ("正文", null, null, null, null, @"""password""\s*:", null, null, true),
+        ("正文不命中", null, null, null, null, @"""token""\s*:", null, null, false),
+        ("请求头值", null, null, null, null, null, null, new() { ["X-Sign"] = "^[0-9a-f]{16}$" }, true),
+        ("请求头值不命中", null, null, null, null, null, null, new() { ["X-Sign"] = "^\\d+$" }, false),
+        ("请求头缺失", null, null, null, null, null, null, new() { ["X-Absent"] = "" }, false),
+        ("请求头仅要求存在", null, null, null, null, null, null, new() { ["X-Sign"] = "" }, true),
+        // 多条件之间是 AND：任一不满足即整体不命中。
+        ("多条件全中", @"/user/login", "^POST$", @"api\.test", null, @"password", null, null, true),
+        ("多条件其一不中", @"/user/login", "^GET$", @"api\.test", null, @"password", null, null, false),
+    };
+    foreach (var item in cases)
+    {
+        var rule = HookInterceptRule.TryCreate(HookEventNames.RequestBeforeSend, item.Url, item.Method, item.Host,
+            item.Endpoint, item.Body, item.Status, item.Headers);
+        Require(rule is not null, $"规则「{item.Name}」必须能编译");
+        Require(rule!.Matches(HookEventNames.RequestBeforeSend, login) == item.ShouldMatch,
+            $"规则「{item.Name}」的匹配结果不符合预期");
+    }
+
+    // 状态码只在响应侧有意义。
+    var responseRule = HookInterceptRule.TryCreate(HookEventNames.ResponseBeforeWrite, null, null, null, null, null, @"^4\d\d$", null);
+    Require(responseRule is not null, "响应侧状态码规则必须能编译");
+    Require(responseRule!.Matches(HookEventNames.ResponseBeforeWrite, Snapshot("GET", "https://a.test/x", "", 404)),
+        "状态码正则必须能命中 4xx");
+    Require(!responseRule.Matches(HookEventNames.ResponseBeforeWrite, Snapshot("GET", "https://a.test/x", "", 200)),
+        "状态码正则不得命中 2xx");
+
+    // 事件名不匹配、挂载点不可改写、模式非法：整条规则作废而不是部分生效。
+    Require(!responseRule.Matches(HookEventNames.RequestBeforeSend, login), "规则不得跨挂载点命中");
+    Require(HookInterceptRule.TryCreate(HookEventNames.RequestAfterSend, null, null, null, null, null, null, null) is null,
+        "只有发送前与回写前两个点可改写，其余点声明必须被拒绝");
+    Require(HookInterceptRule.TryCreate(HookEventNames.RequestBeforeSend, "([unclosed", null, null, null, null, null, null) is null,
+        "非法正则必须让整条规则作废");
+
+    // 病态正则不得拖垮热路径：线性引擎保证不回溯，退回普通引擎时也有匹配超时兜底。
+    var pathological = HookInterceptRule.TryCreate(HookEventNames.RequestBeforeSend, null, null, null, null,
+        "(a+)+$", null, null);
+    Require(pathological is not null, "病态模式仍应能编译（由线性引擎或超时兜底保证安全）");
+    var evil = Snapshot("POST", "https://api.test.local/x", new string('a', 5000) + "!");
+    var timer = Stopwatch.StartNew();
+    pathological!.Matches(HookEventNames.RequestBeforeSend, evil);
+    timer.Stop();
+    Require(timer.ElapsedMilliseconds < 1000,
+        $"病态正则匹配必须在毫秒级内收敛，实测 {timer.ElapsedMilliseconds} ms（回溯爆炸会拖死代理）");
+
+    // 未声明规则、引擎未运行时必须不拦截且立即放行——纯观察脚本不付任何代价。
+    var testRoot = Path.Combine(Path.GetTempPath(), "netmind-intercept-test-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        Directory.CreateDirectory(testRoot);
+        await using var engine = new ScriptHookEngine("dummy-host.exe", null,
+            Path.Combine(testRoot, "hook.py"), Path.Combine(testRoot, "data"),
+            [HookEventNames.RequestBeforeSend]);
+        Require(engine.InterceptRuleCount == 0, "未上报规则时拦截规则数必须为 0");
+        Require(!engine.ShouldIntercept(HookEventNames.RequestBeforeSend, login), "未声明规则时不得拦截任何请求");
+        Require(!engine.ShouldIntercept(HookEventNames.RequestAfterSend, login), "不可改写的挂载点永远不得拦截");
+        // 工作进程未启动：必须立刻返回放行，而不是等满超时。
+        var failOpenTimer = Stopwatch.StartNew();
+        var verdict = await engine.InterceptAsync(HookEventNames.RequestBeforeSend, login);
+        failOpenTimer.Stop();
+        Require(verdict is null, "工作进程不可用时必须放行（fail-open）");
+        Require(failOpenTimer.ElapsedMilliseconds < NetMindDefaults.HookInterceptTimeoutMilliseconds / 2,
+            $"工作进程不可用时必须立刻放行，不能空等超时，实测 {failOpenTimer.ElapsedMilliseconds} ms");
+    }
+    finally
+    {
+        if (Directory.Exists(testRoot)) Directory.Delete(testRoot, recursive: true);
+    }
 }
 
 /// <summary>

@@ -413,7 +413,32 @@ static string GetHookDriverModuleTemplate() => """"
         _emit({'type': 'error', 'message': '钩子脚本加载失败：' + str(exception)})
         sys.exit(3)
 
-    _emit({'type': 'ready'})
+    # 脚本用模块级 INTERCEPT 声明要拦截哪些请求，随 ready 一次性上报给宿主。
+    # 之后每个请求的匹配都在宿主进程内完成：若下推到这里判断，等于所有流量都被
+    # 单线程 worker 串行化，页面会直接卡死。未声明即纯观察，不阻塞任何请求。
+    _intercept_rules = []
+    try:
+        for _rule in (_user_globals.get('INTERCEPT') or [])[:64]:
+            if not isinstance(_rule, dict):
+                continue
+            _event = _rule.get('event')
+            if not isinstance(_event, str):
+                continue
+            _entry = {'event': _event}
+            # 条件全是正则，可同时约束 URL、方法、主机、路径、正文与状态码；给出的条件之间是 AND。
+            for _field in ('url', 'method', 'host', 'endpoint', 'body', 'status'):
+                if isinstance(_rule.get(_field), str):
+                    _entry[_field] = _rule[_field]
+            # headers: {头名: 值正则}；值为空串表示只要求该头存在。
+            if isinstance(_rule.get('headers'), dict):
+                _entry['headers'] = {str(_n): ('' if _v is None else str(_v))
+                                     for _n, _v in list(_rule['headers'].items())[:64]}
+            _intercept_rules.append(_entry)
+    except Exception as exception:
+        _emit({'type': 'error', 'message': 'INTERCEPT 声明无法解析：' + str(exception)})
+        _intercept_rules = []
+
+    _emit({'type': 'ready', 'intercept': _intercept_rules})
 
 
     # 单个工作线程 + 可丢弃任务槽：任意时刻至多一个 handler 触碰 store；
@@ -443,6 +468,37 @@ static string GetHookDriverModuleTemplate() => """"
             context = {'event': envelope.get('event'), 'txnId': envelope.get('txnId'),
                        'hookName': envelope.get('hookName')}
             status, payload = result
+
+            # 拦截模式：宿主正阻塞等待裁决，任何分支都必须回一条 pass/mutate，否则代理只能等满超时。
+            _correlation = state.get('intercept')
+            if _correlation is not None:
+                if status != 'ok' or not isinstance(payload, dict):
+                    if status != 'ok':
+                        _safe_emit({'type': 'error', **context, 'message': ('钩子执行异常：' + str(payload))[:_FINDING_MAXIMUM_BYTES]})
+                    _safe_emit({'type': 'pass', 'correlationId': _correlation})
+                    _safe_emit({'type': 'processed', **context, 'outcome': 'pass'})
+                    continue
+                _reply = {'type': 'mutate', 'correlationId': _correlation}
+                for _key, _wire in (('url', 'url'), ('method', 'method'), ('body', 'body')):
+                    if isinstance(payload.get(_key), str):
+                        _reply[_wire] = payload[_key]
+                if isinstance(payload.get('status'), int):
+                    _reply['statusCode'] = payload['status']
+                if isinstance(payload.get('headers'), dict):
+                    _reply['headers'] = {str(_n): (None if _v is None else str(_v))
+                                         for _n, _v in list(payload['headers'].items())[:64]}
+                if len(_reply) == 2:  # 只有 type 与 correlationId：没给出任何改写字段
+                    _safe_emit({'type': 'pass', 'correlationId': _correlation})
+                    _safe_emit({'type': 'processed', **context, 'outcome': 'pass'})
+                    continue
+                _safe_emit(_reply)
+                # 拦截同样可以顺带产出结论：改写事实本身往往就是分析结果。
+                if payload.get('finding') is not None:
+                    _data, _truncated = _truncate(payload['finding'])
+                    _safe_emit({'type': 'finding', **context, 'data': _data, 'truncated': _truncated})
+                _safe_emit({'type': 'processed', **context, 'outcome': 'mutate'})
+                continue
+
             if status == 'ok':
                 if payload is None:
                     _safe_emit({'type': 'processed', **context, 'outcome': 'none'})
@@ -478,18 +534,27 @@ static string GetHookDriverModuleTemplate() => """"
         if _type == 'heartbeat':
             _safe_emit({'type': 'heartbeat-ack'})
             continue
+        # 拦截：宿主正阻塞等待，信封裹在 envelope 里，且每条分支都必须回一条 pass/mutate。
+        _correlation = None
+        if _type == 'intercept':
+            _correlation = _message.get('correlationId')
+            _message = _message.get('envelope') or {}
         _event = _message.get('event')
         _hook = _EVENT_HOOKS.get(_event)
         _handler = _user_globals.get(_hook) if _hook else None
         if not callable(_handler):
+            if _correlation is not None:
+                _safe_emit({'type': 'pass', 'correlationId': _correlation})
             _safe_emit({'type': 'processed', 'event': _event, 'txnId': _message.get('txnId'),
                         'hookName': _hook, 'outcome': 'missing-handler'})
             continue
         _context = {'event': _event, 'txnId': _message.get('txnId'), 'hookName': _hook}
-        _state = {'obsolete': False, 'done': threading.Event()}
+        _state = {'obsolete': False, 'done': threading.Event(), 'intercept': _correlation}
         try:
             _WORK_QUEUE.put_nowait((_handler, _message, _state))
         except queue.Full:
+            if _correlation is not None:
+                _safe_emit({'type': 'pass', 'correlationId': _correlation})
             _safe_emit({'type': 'error', **_context, 'message': '钩子处理积压，已跳过该事件。'})
             _safe_emit({'type': 'processed', **_context, 'outcome': 'queue-full'})
             continue
@@ -497,8 +562,13 @@ static string GetHookDriverModuleTemplate() => """"
             continue  # 工作线程已在限时内完成并自行输出
         _state['obsolete'] = True
         if _state['done'].is_set():
+            if _correlation is not None:
+                _safe_emit({'type': 'pass', 'correlationId': _correlation})
             _safe_emit({'type': 'processed', **_context, 'outcome': 'timeout-boundary'})
             continue  # 刚好在临界完成：工作线程看到废弃标记后会丢弃输出，不再重复报错
+        # 超时也要立刻回执：否则宿主只能等满自己的拦截超时，白白拖慢这一个请求。
+        if _correlation is not None:
+            _safe_emit({'type': 'pass', 'correlationId': _correlation})
         _safe_emit({'type': 'error', **_context, 'message': '钩子处理超时（__TIMEOUT_MS__ 毫秒），已跳过该事件。'})
         _safe_emit({'type': 'processed', **_context, 'outcome': 'timeout'})
 
