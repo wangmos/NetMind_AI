@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -167,6 +168,14 @@ public sealed class ScriptHookEngine : IAsyncDisposable
 
     /// <summary>待取回的观察结论条数。</summary>
     public int FindingCount => _findings.Count;
+
+    /// <summary>
+    /// 定向测试专用：直接取出待投递的事件信封。
+    /// 代理挂载点是否真的按序触发、信封字段是否正确，只有绕开工作进程才能独立验证——
+    /// 否则断言会连带依赖 Python 是否可用。生产路径不使用本方法。
+    /// </summary>
+    internal bool TryDequeuePendingForTest([NotNullWhen(true)] out HookEventEnvelope? envelope) =>
+        _queue.TryDequeue(out envelope);
 
     /// <summary>返回线程安全的轻量运行指标，不读取或复制任何事务正文。</summary>
     public ScriptHookMetricsSnapshot GetMetricsSnapshot()

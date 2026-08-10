@@ -69,6 +69,7 @@ var suites = new SmokeSuite[]
         await VerifyHooksAsync();
         await VerifyPageHooksAsync();
     }),
+    new("代理钩子挂载点端到端触发（顺序、txnId、正文、单点开关）", "mountpoint-only", VerifyProxyHookMountPointsAsync),
     new("采集链路一键自检", "capture-health-only", VerifyCaptureHealthAsync),
     new("HTTPS CONNECT、TLS 解密、正文持久化与 AI 脱敏", "tls-only", VerifyTlsInspectionAsync),
     new("Windows Job Object 沙箱资源限制与真实 Python", "sandbox-only", VerifyWindowsSandboxAsync),
@@ -1144,6 +1145,135 @@ static void VerifyCaptureBrowserPlan(string testRoot)
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+/// <summary>
+/// 代理挂载点端到端触发验证。
+///
+/// 此前只有引擎层（策略、信封契约、队列背压）和 worker 端到端被覆盖，
+/// 唯一给代理传钩子引擎的测试传的是 hookEngine:null；四个挂载点里有三个
+/// 在整个测试集中从未被断言过——也就是说「代理是否真的在这四个位置按序触发、
+/// 信封字段是否正确」一直没有验证。脚本的读取/修改能力要建在这四个点上，
+/// 先把地基测出来。
+///
+/// 刻意不启动工作进程：直接读引擎待投递队列，断言才不会连带依赖本机是否装了 Python。
+/// </summary>
+static async Task VerifyProxyHookMountPointsAsync()
+{
+    var workspaceRoot = Path.Combine(Path.GetTempPath(), "netmind-mountpoint-test-" + Guid.NewGuid().ToString("N"));
+    var upstream = new TcpListener(IPAddress.Loopback, 0);
+    upstream.Start();
+    var upstreamEndpoint = (IPEndPoint)upstream.LocalEndpoint;
+    try
+    {
+        await new WorkspaceStore(workspaceRoot).InitializeAsync("挂载点测试工作区");
+        var requestBodyBytes = Encoding.UTF8.GetBytes("{\"probe\":\"请求正文\"}");
+        var upstreamTask = Task.Run(async () =>
+        {
+            using var client = await upstream.AcceptTcpClientAsync();
+            using var stream = client.GetStream();
+            await ReadUntilHeadersAsync(stream);
+            // 必须把请求正文读干净：只读头就回包，转发端写正文时会失败，整条请求被记成 502。
+            await ReadExactAsync(stream, new byte[requestBodyBytes.Length], CancellationToken.None);
+            var body = Encoding.UTF8.GetBytes("{\"ok\":true,\"marker\":\"上游响应正文\"}");
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                $"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n"));
+            await stream.WriteAsync(body);
+        });
+
+        // 引擎只构造不启动：Emit 仍会正常入队，但不依赖 SandboxHost 与 Python。
+        await using var engine = new ScriptHookEngine("dummy-host.exe", null,
+            Path.Combine(workspaceRoot, "hook.py"), Path.Combine(workspaceRoot, "data"),
+            [HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
+             HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver]);
+
+        using var archive = new TrafficArchive(workspaceRoot);
+        await using var proxy = new ExplicitHttpProxy(new ProxyOptions(IPAddress.Loopback, 0), archive, hookEngine: engine);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var proxyTask = proxy.RunAsync(cancellation.Token);
+        while (proxy.LocalEndpoint is null) await Task.Delay(10, cancellation.Token);
+
+        using (var client = new TcpClient())
+        {
+            await client.ConnectAsync(proxy.LocalEndpoint.Address, proxy.LocalEndpoint.Port, cancellation.Token);
+            using var stream = client.GetStream();
+            var bodyBytes = requestBodyBytes;
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                $"POST http://127.0.0.1:{upstreamEndpoint.Port}/v1/probe?a=1 HTTP/1.1\r\nHost: 127.0.0.1:{upstreamEndpoint.Port}\r\n" +
+                $"X-Probe: 探针\r\nContent-Type: application/json\r\nContent-Length: {bodyBytes.Length}\r\nConnection: close\r\n\r\n"), cancellation.Token);
+            await stream.WriteAsync(bodyBytes, cancellation.Token);
+            using var response = new MemoryStream();
+            await stream.CopyToAsync(response, cancellation.Token);
+            var responseText = Encoding.UTF8.GetString(response.ToArray());
+            Require(responseText.Contains("201", StringComparison.Ordinal),
+                "挂载点测试的请求本身必须成功完成，实际响应：" + (responseText.Length == 0 ? "(空)" : responseText[..Math.Min(400, responseText.Length)]));
+        }
+
+        await upstreamTask;
+        cancellation.Cancel();
+        try { await proxyTask; } catch (OperationCanceledException) { }
+        upstream.Stop();
+
+        var fired = new List<HookEventEnvelope>();
+        while (engine.TryDequeuePendingForTest(out var envelope)) fired.Add(envelope);
+
+        Require(fired.Count == 4, $"四个挂载点必须各触发一次，实际触发 {fired.Count} 次：" +
+                                  string.Join("、", fired.Select(item => item.Event)));
+        Require(fired.Select(item => item.Event).SequenceEqual(new[]
+            {
+                HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
+                HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver
+            }),
+            "挂载点触发顺序必须是 发送前 → 发送后 → 回写前 → 交付后，实际：" +
+            string.Join(" → ", fired.Select(item => item.Event)));
+
+        // 同一事务的四个点必须共用同一 txnId，否则脚本无法把请求与响应关联起来。
+        Require(fired.Select(item => item.TxnId).Distinct().Count() == 1, "同一事务的四个挂载点必须共用同一 txnId");
+        Require(fired.All(item => item.Method == "POST" && item.Url.Contains("/v1/probe", StringComparison.Ordinal)),
+            "每个挂载点的信封都必须带上本次事务的方法与 URL");
+        Require(fired.All(item => item.HookName == HookEventNames.FunctionBeforeSend ||
+                                  item.HookName == HookEventNames.FunctionAfterSend ||
+                                  item.HookName == HookEventNames.FunctionBeforeWrite ||
+                                  item.HookName == HookEventNames.FunctionAfterDeliver),
+            "每个挂载点都必须映射到对应的脚本函数名");
+
+        // 状态码只有在上游响应之后才可知：发送前必须为空，其余三点必须是真实状态码。
+        Require(fired[0].StatusCode is null, "请求发送前的挂载点不得携带状态码");
+        Require(fired.Skip(1).All(item => item.StatusCode == 201), "发送后的三个挂载点必须携带上游真实状态码");
+
+        // 请求侧挂载点带请求正文，响应侧带响应正文——这是脚本能读到正确数据的前提。
+        static string Decode(HookEventEnvelope envelope) =>
+            envelope.BodyPreviewBase64 is null ? string.Empty : Encoding.UTF8.GetString(Convert.FromBase64String(envelope.BodyPreviewBase64));
+        Require(Decode(fired[0]).Contains("请求正文", StringComparison.Ordinal) &&
+                Decode(fired[1]).Contains("请求正文", StringComparison.Ordinal),
+            "请求侧两个挂载点必须携带请求正文");
+        Require(Decode(fired[2]).Contains("上游响应正文", StringComparison.Ordinal) &&
+                Decode(fired[3]).Contains("上游响应正文", StringComparison.Ordinal),
+            "响应侧两个挂载点必须携带响应正文");
+        Require(fired[0].Headers is not null && fired[0].Headers!.Keys.Any(name => name.Equals("X-Probe", StringComparison.OrdinalIgnoreCase)),
+            "请求挂载点必须携带请求头");
+
+        // 未勾选的挂载点不得触发：单点开关在引擎侧判断，这是「只观察我关心的点」的基础。
+        await using var singleEngine = new ScriptHookEngine("dummy-host.exe", null,
+            Path.Combine(workspaceRoot, "hook.py"), Path.Combine(workspaceRoot, "data"),
+            [HookEventNames.ResponseBeforeWrite]);
+        var snapshot = new HookTransactionSnapshot(Guid.NewGuid(), Guid.NewGuid(), "GET", "http://x.test/", "x.test", "/", null, []);
+        foreach (var name in new[]
+                 {
+                     HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
+                     HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver
+                 })
+            singleEngine.Emit(name, snapshot, 200);
+        var single = new List<HookEventEnvelope>();
+        while (singleEngine.TryDequeuePendingForTest(out var envelope)) single.Add(envelope);
+        Require(single.Count == 1 && single[0].Event == HookEventNames.ResponseBeforeWrite,
+            "只勾选一个挂载点时，其余挂载点不得入队");
+    }
+    finally
+    {
+        try { upstream.Stop(); } catch (SocketException) { }
+        if (Directory.Exists(workspaceRoot)) Directory.Delete(workspaceRoot, recursive: true);
+    }
 }
 
 /// <summary>
