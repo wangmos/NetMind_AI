@@ -72,9 +72,9 @@ public sealed class AiConversationEngine(AiGatewayClient gateway)
     /// <summary>八个只读工具：本地证据地图、关联/比较、事务概览、正文片段、搜索、页内 Hook 与证据文件。</summary>
     public static IReadOnlyList<AiToolSchema> BuildToolSchemas() =>
     [
-        new("get_evidence_overview", "获取本地规则预整理的完整证据地图：归一化端点组、代表序号、错误/慢请求/重复请求候选，以及事务关联候选。该结果用于规划取证，不能替代原始事务。",
+        new("get_evidence_overview", "获取本地规则预整理的证据地图：归一化端点组（含代表序号、组内条数与序号范围）、错误/慢请求/重复请求候选，以及全局最强的关联候选。返回结果有条数上限并会写明省略数量；需要某个序号的完整关联请用 get_related_transactions。该结果用于规划取证，不能替代原始事务。",
             JsonDocument.Parse("""{"type":"object","properties":{},"additionalProperties":false}""").RootElement.Clone()),
-        new("get_related_transactions", "获取与指定 #序号 相关的事务候选。只使用同端点与时间邻近等结构信号，不把同站点普遍相同的请求头当作关联；必须再取原始事务确认因果关系。",
+        new("get_related_transactions", "就地计算与指定 #序号 相关的事务候选（覆盖该序号前后的完整时间邻域，不受证据地图的条数上限影响）。只使用同端点与时间邻近等结构信号，不把同站点普遍相同的请求头当作关联；必须再取原始事务确认因果关系。",
             JsonDocument.Parse("""{"type":"object","properties":{"ordinal":{"type":"integer","description":"中心事务的 #序号（从 1 起）"},"limit":{"type":"integer","description":"最多返回的关联候选，默认 12"}},"required":["ordinal"],"additionalProperties":false}""").RootElement.Clone()),
         new("compare_transactions", "本地比较一组事务的端点、状态、延迟、查询参数、请求头和 Cookie 字段，标记固定值、变化值、UUID、时间戳或高熵候选。正文结构仍需 get_transactions 核对。",
             JsonDocument.Parse("""{"type":"object","properties":{"ordinals":{"type":"array","items":{"type":"integer"},"description":"要比较的 #序号列表，建议选择同一端点的成功/失败/异常样本"}},"required":["ordinals"],"additionalProperties":false}""").RootElement.Clone()),
@@ -98,8 +98,19 @@ public sealed class AiConversationEngine(AiGatewayClient gateway)
     {
         var builder = new StringBuilder();
         var rows = BuildEvidenceSummaryRows(pool);
+        // 静态资源（图片/CSS/字体/音视频）的正文本来就被 AiFullContextBuilder 判为非分析相关、从不发给模型，
+        // 却按完整行占据首轮摘要，而首轮消息会在每次取数迭代与每一轮追问中重发。
+        // 这里按 主机+类型 折叠为聚合行，但逐一列出全部 #序号：模型仍可对任意一条调用 get_transactions，证据不丢。
+        var folded = 0;
+        var staticGroups = rows.Where(row => IsStaticAsset(row.ContentType))
+            .GroupBy(row => (row.Host, Kind: ShortContentType(row.ContentType)))
+            .Where(group => group.Count() >= NetMindDefaults.AiSummaryStaticAssetFoldThreshold)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var foldedOrdinals = staticGroups.Values.SelectMany(group => group.Select(row => row.Ordinal)).ToHashSet();
+
         foreach (var row in rows)
         {
+            if (foldedOrdinals.Contains(row.Ordinal)) continue;
             builder.Append('#').Append(row.Ordinal)
                 .Append(' ').Append(row.Time)
                 .Append(' ').Append(row.Method)
@@ -107,12 +118,92 @@ public sealed class AiConversationEngine(AiGatewayClient gateway)
                 .Append(' ').Append(row.Endpoint)
                 .Append(' ').Append(row.StatusCode)
                 .Append(' ').Append(row.LatencyMilliseconds).Append("ms")
-                .Append(' ').Append(row.SizeBytes).Append("B")
-                .Append(' ').Append(TrimSummaryValue(row.ContentType, 72))
+                .Append(' ').Append(FormatBytes(row.SizeBytes))
+                .Append(' ').Append(ShortContentType(row.ContentType))
                 .Append('\n');
         }
+        foreach (var (key, group) in staticGroups.OrderBy(item => item.Key.Host, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(item => item.Key.Kind, StringComparer.Ordinal))
+        {
+            folded += group.Length;
+            var errors = group.Count(row => row.StatusCode >= 400);
+            builder.Append("[静态资源] ").Append(key.Host).Append(' ').Append(key.Kind)
+                .Append(" ×").Append(group.Length)
+                .Append(errors > 0 ? $" 错误{errors}" : string.Empty)
+                .Append(' ').Append(FormatBytes(group.Sum(row => row.SizeBytes)))
+                .Append(" 序号 ").Append(FormatOrdinalRanges(group.Select(row => row.Ordinal)))
+                .Append('\n');
+        }
+        if (folded > 0)
+            builder.Append($"（以上 {folded} 条静态资源已按主机+类型折叠，正文本就不参与分析；需要任意一条的头或元数据仍可按 #序号 取）\n");
         if (pool.Count > rows.Count) builder.Append($"…… 其余 {pool.Count - rows.Count} 条摘要已省略，可用 search_transactions 定位 ……\n");
-        return builder.ToString().TrimEnd();
+
+        var summary = builder.ToString().TrimEnd();
+        return TrimSummaryToBudget(summary, pool.Count);
+    }
+
+    /// <summary>
+    /// 首轮摘要的字节兜底。行数上限管不住单行长度，这里按实际体积再截一道，
+    /// 并明确写出被截掉多少条，绝不让模型以为自己看到了全量索引。
+    /// </summary>
+    private static string TrimSummaryToBudget(string summary, int poolCount)
+    {
+        if (Encoding.UTF8.GetByteCount(summary) <= NetMindDefaults.AiConversationSummaryMaximumBytes) return summary;
+        var lines = summary.Split('\n');
+        var kept = new StringBuilder();
+        var keptLines = 0;
+        foreach (var line in lines)
+        {
+            if (Encoding.UTF8.GetByteCount(kept.ToString()) + Encoding.UTF8.GetByteCount(line) + 1
+                > NetMindDefaults.AiConversationSummaryMaximumBytes) break;
+            kept.Append(line).Append('\n');
+            keptLines++;
+        }
+        kept.Append($"…… 摘要体积已达 {NetMindDefaults.AiConversationSummaryMaximumBytes / 1024} KB 上限，" +
+                    $"其余 {Math.Max(0, lines.Length - keptLines)} 行未列出（证据池仍为 {poolCount} 条，" +
+                    "可用 search_transactions 按关键字定位，或按 #序号 直接取数）……");
+        return kept.ToString();
+    }
+
+    /// <summary>把连续序号压成区间，例如 3,4,5,9 → #3-#5,#9；静态资源折叠行常见大段连续序号。</summary>
+    private static string FormatOrdinalRanges(IEnumerable<int> ordinals)
+    {
+        var sorted = ordinals.Distinct().Order().ToArray();
+        if (sorted.Length == 0) return string.Empty;
+        var parts = new List<string>();
+        var start = sorted[0];
+        var previous = sorted[0];
+        foreach (var ordinal in sorted.Skip(1))
+        {
+            if (ordinal == previous + 1) { previous = ordinal; continue; }
+            parts.Add(start == previous ? $"#{start}" : $"#{start}-#{previous}");
+            start = previous = ordinal;
+        }
+        parts.Add(start == previous ? $"#{start}" : $"#{start}-#{previous}");
+        return string.Join(',', parts);
+    }
+
+    /// <summary>
+    /// Content-Type 只保留媒体类型，丢掉 charset/boundary 等参数——它们对取证规划毫无价值，却每行都要计费。
+    /// 媒体类型本身保持完整（application/json 不缩成 json）：摘要里 text/* 与 application/* 混排，
+    /// 只截其中一类前缀会让类型标注自相矛盾，省下的几个字节不值这个歧义。
+    /// </summary>
+    private static string ShortContentType(string contentType)
+    {
+        if (string.IsNullOrWhiteSpace(contentType)) return "未知";
+        var mediaType = contentType.Split(';')[0].Trim().ToLowerInvariant();
+        return mediaType.Length == 0 ? "未知" : TrimSummaryValue(mediaType, 40);
+    }
+
+    /// <summary>静态资源判定与 <see cref="AiFullContextBuilder"/> 的正文相关性策略保持一致。</summary>
+    private static bool IsStaticAsset(string contentType)
+    {
+        var mediaType = contentType.Split(';')[0].Trim().ToLowerInvariant();
+        return mediaType.StartsWith("image/", StringComparison.Ordinal)
+               || mediaType.StartsWith("font/", StringComparison.Ordinal)
+               || mediaType.StartsWith("audio/", StringComparison.Ordinal)
+               || mediaType.StartsWith("video/", StringComparison.Ordinal)
+               || mediaType is "text/css" or "application/font-woff" or "application/font-woff2" or "application/vnd.ms-fontobject";
     }
 
     public static IReadOnlyList<AiEvidenceSummaryRow> BuildEvidenceSummaryRows(IReadOnlyList<TrafficRecord> pool)
@@ -225,7 +316,9 @@ public sealed class AiConversationEngine(AiGatewayClient gateway)
         builder.Append("\n\n分析要求：").Append(template.AnalysisRequirement);
         if (!string.IsNullOrWhiteSpace(userRequirement))
             builder.Append("\n\n用户针对本次分析的补充要求：").Append(userRequirement.Trim());
-        builder.Append("\n\n执行要求：摘要不含查询值、头、Cookie 和正文。先规划少量代表序号，用 get_transactions 读取概览；大型正文先搜索，再用正文片段工具读取命中附近内容。完成取证后给最终结论，并用 [#序号] 引用关键证据。工具原文只在本轮临时可用。");
+        builder.Append("\n\n执行要求：摘要不含查询值、头、Cookie 和正文。标记为“[静态资源]”的聚合行是图片/CSS/字体等，正文不参与分析，" +
+                       "但其 #序号 已全部列出，必要时仍可按序号取元数据。先规划少量代表序号，用 get_transactions 读取概览；" +
+                       "大型正文先搜索，再用正文片段工具读取命中附近内容。完成取证后给最终结论，并用 [#序号] 引用关键证据。工具原文只在本轮临时可用。");
         return builder.ToString();
     }
 
@@ -356,7 +449,7 @@ public sealed class AiConversationEngine(AiGatewayClient gateway)
             switch (call.Name)
             {
                 case "get_evidence_overview":
-                    return AiEvidencePreparationEngine.ToJson(provider.PreparedEvidence);
+                    return AiEvidencePreparationEngine.BuildOverviewJson(provider.PreparedEvidence);
                 case "get_related_transactions":
                     var centerOrdinal = arguments.TryGetProperty("ordinal", out var centerElement) && centerElement.TryGetInt32(out var parsedOrdinal)
                         ? parsedOrdinal : 0;
@@ -364,7 +457,7 @@ public sealed class AiConversationEngine(AiGatewayClient gateway)
                         return $"未提供有效中心序号（有效范围 #1 到 #{provider.Pool.Count}）。";
                     var relatedLimit = arguments.TryGetProperty("limit", out var relatedLimitElement) && relatedLimitElement.TryGetInt32(out var parsedRelatedLimit)
                         ? Math.Clamp(parsedRelatedLimit, 1, 50) : 12;
-                    return AiEvidencePreparationEngine.ToJson(AiEvidencePreparationEngine.GetRelated(provider.PreparedEvidence, centerOrdinal, relatedLimit));
+                    return AiEvidencePreparationEngine.ToJson(AiEvidencePreparationEngine.GetRelated(provider.Pool, centerOrdinal, relatedLimit));
                 case "compare_transactions":
                     var compareOrdinals = arguments.TryGetProperty("ordinals", out var compareArray) && compareArray.ValueKind == JsonValueKind.Array
                         ? compareArray.EnumerateArray()

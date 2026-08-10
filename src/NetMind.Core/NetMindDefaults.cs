@@ -21,6 +21,12 @@ public static class NetMindDefaults
     /// <summary>CoreHost 就绪输出的机器可读前缀（工作台据此判定捕获后台已监听）。</summary>
     public const string CoreHostReadyMarker = "监听地址：";
 
+    /// <summary>
+    /// CoreHost 本次采集会话标识的机器可读前缀。工作台据此把流量视图限定在本次采集，
+    /// 使每次「开始采集」都从空列表起步，而不是先加载历史事务。
+    /// </summary>
+    public const string CoreHostSessionMarker = "会话标识：";
+
     // ── 哨兵字符串 ────────────────────────────────────────────────────────────
 
     /// <summary>HTTPS 加密隧道事务的协议标记（正文未解密）。</summary>
@@ -184,6 +190,24 @@ public static class NetMindDefaults
 
     /// <summary>会话首轮发送给模型的证据池摘要行数上限。</summary>
     public const int AiConversationSummaryMaximumLines = 1000;
+
+    /// <summary>
+    /// 首轮事务摘要的字节兜底上限（64 KB）。首轮消息会在本轮每次取数迭代和之后每一轮追问中重发，
+    /// 是整个会话最贵的固定成本；行数上限管不住单行长度，这里按实际体积再兜一道，超限显式标注省略条数。
+    /// </summary>
+    public const int AiConversationSummaryMaximumBytes = 64 * 1024;
+
+    /// <summary>
+    /// 摘要中静态资源（图片/CSS/字体/音视频）折叠为聚合行的触发条数。
+    /// 这些正文本来就被 <c>AiFullContextBuilder</c> 判定为非分析相关、从不发给模型，
+    /// 却按完整行占据首轮摘要；折叠后仍逐一列出全部 #序号，不丢证据。
+    /// </summary>
+    public const int AiSummaryStaticAssetFoldThreshold = 3;
+
+    /// <summary>get_evidence_overview 单次返回的端点组、异常与关联候选条数上限；超出部分显式标注省略数量。</summary>
+    public const int AiOverviewMaximumEndpointGroups = 24;
+    public const int AiOverviewMaximumAnomalies = 40;
+    public const int AiOverviewMaximumRelations = 40;
 
     /// <summary>get_transactions 单次只取少量代表事务；更多样本应分批规划，避免一次塞入大量重复头与正文。</summary>
     public const int AiToolMaximumOrdinalsPerFetch = 8;

@@ -25,6 +25,28 @@ public sealed record AiEndpointGroup(
 
 public sealed record AiEvidenceAnomaly(string Kind, int Ordinal, string Description);
 
+/// <summary>端点组的有界摘要：只带代表序号与序号范围，不逐一列出组内全部序号。</summary>
+public sealed record AiEndpointGroupDigest(
+    string Key,
+    int RequestCount,
+    int ErrorCount,
+    int MedianLatencyMs,
+    int P95LatencyMs,
+    IReadOnlyList<int> RepresentativeOrdinals,
+    int OrdinalCount,
+    string OrdinalRange);
+
+/// <summary>发给模型的证据地图投影；省略数量显式给出，不静默截断。</summary>
+public sealed record AiEvidenceOverviewProjection(
+    int TransactionCount,
+    IReadOnlyList<AiEndpointGroupDigest> EndpointGroups,
+    int OmittedEndpointGroups,
+    IReadOnlyList<AiEvidenceAnomaly> Anomalies,
+    int OmittedAnomalies,
+    IReadOnlyList<AiEvidenceRelation> Relations,
+    int OmittedRelations,
+    string Note);
+
 public sealed record AiEvidenceRelation(
     int FromOrdinal,
     int ToOrdinal,
@@ -50,9 +72,10 @@ public sealed record AiComparedField(string Location, string Name, string Classi
 public static partial class AiEvidencePreparationEngine
 {
     private const int MaximumRelationLookAhead = 25;
+    // 面向模型的 JSON 一律不缩进：缩进只服务人眼，却按字节数实打实计费。
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
-        WriteIndented = true,
+        WriteIndented = false,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
@@ -70,20 +93,37 @@ public static partial class AiEvidencePreparationEngine
         return new AiPreparedEvidence(pool.Count, groups, DetectAnomalies(indexed), DetectRelations(indexed));
     }
 
+    /// <summary>
+    /// 计算与指定 #序号 相关的事务候选。
+    /// 必须就地计算，不能去过滤 <see cref="AiPreparedEvidence.Relations"/>：那份全局清单按分数取前 300 条，
+    /// 池子一大，绝大多数序号根本不在其中，过滤的结果会是空数组——工具看起来「没有关联」，实则从未被计算。
+    /// 这里只扫描该序号前后各 <see cref="MaximumRelationLookAhead"/> 条的时间邻域，代价恒定且结果完整。
+    /// </summary>
     public static IReadOnlyList<AiEvidenceRelation> GetRelated(IReadOnlyList<TrafficRecord> pool, int ordinal, int limit = 12)
-        => GetRelated(Prepare(pool), ordinal, limit);
-
-    /// <summary>从已准备的不可变证据快照读取关联项，避免一次 AI 会话内重复扫描全部事务。</summary>
-    public static IReadOnlyList<AiEvidenceRelation> GetRelated(AiPreparedEvidence prepared, int ordinal, int limit = 12)
     {
-        if (ordinal < 1 || ordinal > prepared.TransactionCount) return [];
-        return prepared.Relations
-            .Where(relation => relation.FromOrdinal == ordinal || relation.ToOrdinal == ordinal)
+        if (ordinal < 1 || ordinal > pool.Count) return [];
+        var indexed = pool.Select((record, index) => new IndexedTraffic(index + 1, record, EndpointKey(record))).ToArray();
+        var center = indexed[ordinal - 1];
+        var relations = new List<AiEvidenceRelation>();
+        var from = Math.Max(0, ordinal - 1 - MaximumRelationLookAhead);
+        var to = Math.Min(indexed.Length - 1, ordinal - 1 + MaximumRelationLookAhead);
+        for (var index = from; index <= to; index++)
+        {
+            if (index == ordinal - 1) continue;
+            // 先后关系按序号顺序摆放，保持“序号越大时间越晚”的语义，模型据此判断依赖方向。
+            var (left, right) = index < ordinal - 1 ? (indexed[index], center) : (center, indexed[index]);
+            if (TryScore(left, right, out var relation)) relations.Add(relation);
+        }
+        return relations
             .OrderByDescending(relation => relation.Score)
             .ThenBy(relation => Math.Abs(relation.ToOrdinal - relation.FromOrdinal))
             .Take(Math.Clamp(limit, 1, 50))
             .ToArray();
     }
+
+    /// <summary>沿用已准备快照的重载：仍需要池本身才能就地计算，保留签名以兼容既有调用点。</summary>
+    public static IReadOnlyList<AiEvidenceRelation> GetRelated(IReadOnlyList<TrafficRecord> pool,
+        AiPreparedEvidence prepared, int ordinal, int limit = 12) => GetRelated(pool, ordinal, limit);
 
     public static AiTransactionComparison Compare(IReadOnlyList<TrafficRecord> pool, IEnumerable<int> requestedOrdinals)
     {
@@ -112,6 +152,33 @@ public static partial class AiEvidencePreparationEngine
     }
 
     public static string ToJson(object value) => JsonSerializer.Serialize(value, JsonOptions);
+
+    /// <summary>
+    /// get_evidence_overview 的有界投影。直接序列化 <see cref="AiPreparedEvidence"/> 会把每个端点组的
+    /// 全部 Ordinals（可达上千个整数）、200 条异常和 300 条关联一次性塞进模型——实测 1,000 条池子达 91 KB，
+    /// 占满单轮取数预算的 71%。这里改为：端点组只带代表序号与范围，异常/关联按上限截断，
+    /// 并显式写出省略条数，模型据此知道还能用 search_transactions / get_related_transactions 继续挖。
+    /// </summary>
+    public static string BuildOverviewJson(AiPreparedEvidence prepared)
+    {
+        var groups = prepared.EndpointGroups.Take(NetMindDefaults.AiOverviewMaximumEndpointGroups)
+            .Select(group => new AiEndpointGroupDigest(
+                group.Key, group.RequestCount, group.ErrorCount, group.MedianLatencyMs, group.P95LatencyMs,
+                group.RepresentativeOrdinals,
+                group.Ordinals.Count,
+                group.Ordinals.Count == 0 ? string.Empty : $"#{group.Ordinals[0]}–#{group.Ordinals[^1]}"))
+            .ToArray();
+        return ToJson(new AiEvidenceOverviewProjection(
+            prepared.TransactionCount,
+            groups,
+            Math.Max(0, prepared.EndpointGroups.Count - groups.Length),
+            prepared.Anomalies.Take(NetMindDefaults.AiOverviewMaximumAnomalies).ToArray(),
+            Math.Max(0, prepared.Anomalies.Count - NetMindDefaults.AiOverviewMaximumAnomalies),
+            prepared.Relations.Take(NetMindDefaults.AiOverviewMaximumRelations).ToArray(),
+            Math.Max(0, prepared.Relations.Count - NetMindDefaults.AiOverviewMaximumRelations),
+            "端点组只列代表序号与序号范围；需要组内某条事务时用 compare_transactions 或 get_transactions 按序号取。" +
+            "关联候选是全局最强的若干条，针对具体事务请调用 get_related_transactions（它会就地计算该序号的完整邻域）。"));
+    }
 
     /// <summary>首轮使用的有界证据地图：高价值端点、异常与关联候选，不包含原始敏感值。</summary>
     public static string BuildCompactManifest(IReadOnlyList<TrafficRecord> pool)
@@ -179,39 +246,51 @@ public static partial class AiEvidencePreparationEngine
         {
             for (var right = left + 1; right < rows.Count && right <= left + MaximumRelationLookAhead; right++)
             {
-                var elapsed = rows[right].Record.Timestamp - rows[left].Record.Timestamp;
-                if (elapsed > TimeSpan.FromSeconds(15)) break;
-                var score = 0;
-                var reasons = new List<string>();
-                if (Host(rows[left].Record).Equals(Host(rows[right].Record), StringComparison.OrdinalIgnoreCase))
-                {
-                    score += 10;
-                    reasons.Add("同主机");
-                }
-                if (rows[left].EndpointKey.Equals(rows[right].EndpointKey, StringComparison.OrdinalIgnoreCase))
-                {
-                    score += 20;
-                    reasons.Add("同端点");
-                }
-                if (rows[left].Record.Process.Equals(rows[right].Record.Process, StringComparison.OrdinalIgnoreCase)) score += 5;
-                if (elapsed <= TimeSpan.FromSeconds(2))
-                {
-                    score += 15;
-                    reasons.Add($"相隔{elapsed.TotalMilliseconds:F0}ms");
-                }
-                else if (elapsed <= TimeSpan.FromSeconds(5))
-                {
-                    score += 8;
-                    reasons.Add($"相隔{elapsed.TotalSeconds:F1}s");
-                }
-                // Accept/Accept-Encoding/Accept-Language/Host/Referer 等浏览器稳定头在同一站点大量重复，
-                // 不能证明事务之间存在依赖。关联候选只保留端点与时序信号，字段差异交给 Compare 单独展示。
-                if (score >= 35)
-                    relations.Add(new AiEvidenceRelation(rows[left].Ordinal, rows[right].Ordinal, Math.Min(100, score), reasons));
+                if (rows[right].Record.Timestamp - rows[left].Record.Timestamp > TimeSpan.FromSeconds(15)) break;
+                if (TryScore(rows[left], rows[right], out var relation)) relations.Add(relation);
             }
         }
+        // 全局清单只用于首轮地图的“最强关联”预览，按分数截断；单个序号的关联一律走 GetRelated 就地计算。
         return relations.OrderByDescending(item => item.Score)
             .ThenBy(item => item.FromOrdinal).ThenBy(item => item.ToOrdinal).Take(300).ToArray();
+    }
+
+    /// <summary>
+    /// 关联评分的唯一规则实现，全局地图与单序号查询共用，避免两条路径给出不一致的分数。
+    /// Accept/Accept-Encoding/Accept-Language/Host/Referer 等浏览器稳定头在同一站点大量重复，
+    /// 不能证明事务之间存在依赖。关联候选只保留端点与时序信号，字段差异交给 Compare 单独展示。
+    /// </summary>
+    private static bool TryScore(IndexedTraffic left, IndexedTraffic right, out AiEvidenceRelation relation)
+    {
+        relation = null!;
+        var elapsed = right.Record.Timestamp - left.Record.Timestamp;
+        if (elapsed > TimeSpan.FromSeconds(15)) return false;
+        var score = 0;
+        var reasons = new List<string>();
+        if (Host(left.Record).Equals(Host(right.Record), StringComparison.OrdinalIgnoreCase))
+        {
+            score += 10;
+            reasons.Add("同主机");
+        }
+        if (left.EndpointKey.Equals(right.EndpointKey, StringComparison.OrdinalIgnoreCase))
+        {
+            score += 20;
+            reasons.Add("同端点");
+        }
+        if (left.Record.Process.Equals(right.Record.Process, StringComparison.OrdinalIgnoreCase)) score += 5;
+        if (elapsed <= TimeSpan.FromSeconds(2))
+        {
+            score += 15;
+            reasons.Add($"相隔{elapsed.TotalMilliseconds:F0}ms");
+        }
+        else if (elapsed <= TimeSpan.FromSeconds(5))
+        {
+            score += 8;
+            reasons.Add($"相隔{elapsed.TotalSeconds:F1}s");
+        }
+        if (score < 35) return false;
+        relation = new AiEvidenceRelation(left.Ordinal, right.Ordinal, Math.Min(100, score), reasons);
+        return true;
     }
 
     private static Dictionary<FieldKey, string> ExtractComparableFields(TrafficRecord record)

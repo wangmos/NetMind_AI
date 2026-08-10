@@ -103,6 +103,9 @@ static async Task<int> RunProxyAsync(string[] arguments, string workspacePath)
     while (proxy.LocalEndpoint is null) await Task.Delay(10, cancellation.Token);
     // 先输出就绪标记再启动钩子引擎：慢机器冷启动 Python 可达十余秒，不得阻塞代理就绪。
     Console.WriteLine("NetMind CoreHost 已启动");
+    // 会话标识必须先于就绪标记输出：工作台在读到就绪标记的那一刻就会把视图限定到本次会话，
+    // stdout 按行有序投递，先写才能保证那时会话标识已经解析完毕。
+    Console.WriteLine($"{NetMindDefaults.CoreHostSessionMarker}{proxy.SessionId}");
     Console.WriteLine($"{NetMindDefaults.CoreHostReadyMarker}{proxy.LocalEndpoint}");
     Console.WriteLine($"工作区：{workspacePath}");
     Console.WriteLine(tlsInspection
@@ -258,14 +261,14 @@ static async Task<int> RunSilentAsync(string[] arguments, string workspacePath)
     if (!WinDivert.IsLibraryPresent)
     {
         var message = $"未找到 {NetMindDefaults.WinDivertLibraryFileName}：请将 WinDivert.dll 与 {NetMindDefaults.WinDivertDriverFileName} 放入采集后台目录后重试。";
-        WriteSilentReady(readyPath, failed: true, message, filter, workspacePath);
+        WriteSilentReady(readyPath, failed: true, message, filter, workspacePath, Guid.Empty);
         Console.Error.WriteLine(message);
         return 3;
     }
     if (!IsElevated())
     {
         const string message = "静默抓包需要管理员权限：请由工作台以提升权限方式重新启动采集后台。";
-        WriteSilentReady(readyPath, failed: true, message, filter, workspacePath);
+        WriteSilentReady(readyPath, failed: true, message, filter, workspacePath, Guid.Empty);
         Console.Error.WriteLine(message);
         return 4;
     }
@@ -324,7 +327,7 @@ static async Task<int> RunSilentAsync(string[] arguments, string workspacePath)
         // 句柄打开在首个 await 前同步执行；失败时返回的任务已处于错误态。
         if (runTask.IsFaulted)
             throw runTask.Exception?.InnerException ?? new InvalidOperationException("静默抓包启动失败。");
-        WriteSilentReady(readyPath, failed: false, null, filter, workspacePath);
+        WriteSilentReady(readyPath, failed: false, null, filter, workspacePath, sessionId);
         Console.WriteLine("NetMind CoreHost 静默抓包已启动");
         Console.WriteLine($"过滤表达式：{filter}");
         Console.WriteLine($"工作区：{workspacePath}");
@@ -332,7 +335,7 @@ static async Task<int> RunSilentAsync(string[] arguments, string workspacePath)
     }
     catch (Exception exception)
     {
-        WriteSilentReady(readyPath, failed: true, exception.Message, filter, workspacePath);
+        WriteSilentReady(readyPath, failed: true, exception.Message, filter, workspacePath, sessionId);
         if (pageHookReceiver is not null) await pageHookReceiver.DisposeAsync();
         try
         {
@@ -393,10 +396,11 @@ static void WriteCrashLog(string kind, Exception? exception)
     catch { /* 崩溃日志写入失败不再二次抛出 */ }
 }
 
-static void WriteSilentReady(string readyPath, bool failed, string? error, string filter, string workspacePath)
+static void WriteSilentReady(string readyPath, bool failed, string? error, string filter, string workspacePath, Guid sessionId)
 {
+    // sessionId 供工作台把流量视图限定在本次采集；失败信号里同样带上，便于排障时对齐审计。
     var payload = JsonSerializer.Serialize(new { state = failed ? "failed" : "ready", error, filter, workspace = workspacePath,
-        timestamp = DateTimeOffset.UtcNow }, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        sessionId, timestamp = DateTimeOffset.UtcNow }, new JsonSerializerOptions(JsonSerializerDefaults.Web));
     File.WriteAllText(readyPath, payload);
 }
 

@@ -35,9 +35,10 @@ public sealed record AiFullTransactionContext(
 /// </summary>
 public static class AiFullContextBuilder
 {
+    // 不缩进：这份 JSON 只发给模型，缩进纯属按字节计费的浪费。
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
-        WriteIndented = true,
+        WriteIndented = false,
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 

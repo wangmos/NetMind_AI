@@ -100,16 +100,23 @@ public sealed class SqliteMetadataStore : IDisposable
             item.ResponseHeaders);
     }
 
-    public IReadOnlyList<StoredTrafficRecord> GetRecentTraffic(int limit = NetMindDefaults.DefaultTrafficWindowCount)
+    /// <summary>
+    /// 读取最近的事务窗口。<paramref name="sessionId"/> 非空时只返回该捕获会话的事务：
+    /// 工作台据此让每次「开始采集」从空列表起步，也让下钻历史会话时窗口不被其他会话占满。
+    /// </summary>
+    public IReadOnlyList<StoredTrafficRecord> GetRecentTraffic(int limit = NetMindDefaults.DefaultTrafficWindowCount,
+        Guid? sessionId = null)
     {
         limit = Math.Clamp(limit, 1, 2000);
         const string columns = "t.id,t.session_id,t.captured_at,t.method,t.endpoint,t.status_code,t.latency_ms,t.size_bytes,t.process_name,t.protocol,t.request_blob_hash,t.response_blob_hash,t.request_summary,t.response_summary,COALESCE(s.mode,'未知'),t.request_url,t.query_parameters,t.request_headers,t.cookies,t.response_headers";
+        var scope = sessionId.HasValue ? " WHERE t.session_id=?" : string.Empty;
+        Parameter[] parameters = sessionId.HasValue ? [sessionId.Value, limit] : [limit];
         lock (_gate)
         {
             EnsureOpen();
             var statement = Prepare(
-                $"SELECT {columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id ORDER BY t.captured_at DESC LIMIT ?;",
-                "无法读取流量元数据", limit);
+                $"SELECT {columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id{scope} ORDER BY t.captured_at DESC LIMIT ?;",
+                "无法读取流量元数据", parameters);
             try
             {
                 int result;
@@ -160,17 +167,22 @@ public sealed class SqliteMetadataStore : IDisposable
         }
     }
 
-    /// <summary>读取给定 SQLite 写入游标之后的新增或更新事务，按实际写入顺序返回。</summary>
-    public IReadOnlyList<StoredTrafficChange> GetTrafficChangesAfter(long cursor, int limit = 2000)
+    /// <summary>
+    /// 读取给定 SQLite 写入游标之后的新增或更新事务，按实际写入顺序返回。
+    /// <paramref name="sessionId"/> 非空时只返回该捕获会话的变更，与 <see cref="GetRecentTraffic"/> 的限定一致。
+    /// </summary>
+    public IReadOnlyList<StoredTrafficChange> GetTrafficChangesAfter(long cursor, int limit = 2000, Guid? sessionId = null)
     {
         cursor = Math.Max(0, cursor);
         limit = Math.Clamp(limit, 1, 2000);
         const string columns = "t.id,t.session_id,t.captured_at,t.method,t.endpoint,t.status_code,t.latency_ms,t.size_bytes,t.process_name,t.protocol,t.request_blob_hash,t.response_blob_hash,t.request_summary,t.response_summary,COALESCE(s.mode,'未知'),t.request_url,t.query_parameters,t.request_headers,t.cookies,t.response_headers";
+        var scope = sessionId.HasValue ? " AND t.session_id=?" : string.Empty;
+        Parameter[] parameters = sessionId.HasValue ? [cursor, sessionId.Value, limit] : [cursor, limit];
         lock (_gate)
         {
             EnsureOpen();
-            var sql = $"SELECT t.rowid,{columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id WHERE t.rowid>? ORDER BY t.rowid ASC LIMIT ?;";
-            var statement = Prepare(sql, "无法增量读取流量元数据", cursor, limit);
+            var sql = $"SELECT t.rowid,{columns} FROM traffic_transactions t LEFT JOIN capture_sessions s ON s.id=t.session_id WHERE t.rowid>?{scope} ORDER BY t.rowid ASC LIMIT ?;";
+            var statement = Prepare(sql, "无法增量读取流量元数据", parameters);
             try
             {
                 int result;
@@ -225,22 +237,10 @@ public sealed class SqliteMetadataStore : IDisposable
         }
     }
 
-    public long GetTrafficCount()
-    {
-        lock (_gate)
-        {
-            EnsureOpen();
-            var statement = Prepare("SELECT COUNT(*) FROM traffic_transactions;", "无法读取流量数量");
-            try
-            {
-                return Native.sqlite3_step(statement) == SqliteRow ? Native.sqlite3_column_int64(statement, 0) : 0;
-            }
-            finally
-            {
-                Native.sqlite3_finalize(statement);
-            }
-        }
-    }
+    /// <summary><paramref name="sessionId"/> 非空时只统计该捕获会话的事务数。</summary>
+    public long GetTrafficCount(Guid? sessionId = null) => sessionId.HasValue
+        ? Scalar("SELECT COUNT(*) FROM traffic_transactions WHERE session_id=?;", sessionId.Value)
+        : Scalar("SELECT COUNT(*) FROM traffic_transactions;");
 
     public long GetPageHookCount() => Scalar("SELECT COUNT(*) FROM page_hooks;");
 

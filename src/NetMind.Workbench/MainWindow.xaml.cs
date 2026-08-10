@@ -265,6 +265,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     /// <summary>加载设置回填界面时为真，防止复选框同步赋值触发即时持久化回写。</summary>
     private bool _applyingWorkbenchSettings;
     private Guid? _sessionFilterId;
+    /// <summary>本次采集的捕获会话标识（由 CoreHost 就绪输出/信号文件带回）；未知时为 null，退化为不限定视图。</summary>
+    private Guid? _liveCaptureSessionId;
+    /// <summary>上一次刷新实际生效的会话范围；与 <see cref="_sessionFilterId"/> 不一致时必须整窗重读并重置游标。</summary>
+    private Guid? _trafficScopeSessionId;
     private long _pendingRefreshCount;
     private int _copyFeedbackVersion;
     private bool _highlightingScript;
@@ -536,6 +540,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             MessageBox.Show(this, "未找到流量捕获后台，请先重新构建工作台项目。", "无法开始采集", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
+        // 上一次采集的会话标识不得沿用：拿不到新会话时应退化为不限定，而不是筛到旧会话（列表会恒为空）。
+        _liveCaptureSessionId = null;
         // 页内 Hook 在代理/静默两种模式下都需要独立回环接收端口；令牌只在本次采集生命周期有效。
         _hookReceivePort = PickFreeLoopbackPort();
         _hookReceiveToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
@@ -573,6 +579,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             // 改端口后就绪探测仍成立，也避免后台控制台编码影响中文文本匹配。
             var line = eventArgs.Data;
             if (line is null) return;
+            // 会话标识行先于就绪行到达（CoreHost 保证输出顺序），据此把列表限定到本次采集。
+            var sessionIndex = line.IndexOf(CoreHostSessionMarker, StringComparison.Ordinal);
+            if (sessionIndex >= 0)
+            {
+                if (Guid.TryParse(line[(sessionIndex + CoreHostSessionMarker.Length)..].Trim(), out var liveSession))
+                    _liveCaptureSessionId = liveSession;
+                return;
+            }
             var markerIndex = line.IndexOf(CoreHostReadyMarker, StringComparison.Ordinal);
             if (markerIndex < 0) return;
             var endpoint = line[(markerIndex + CoreHostReadyMarker.Length)..].Trim();
@@ -742,6 +756,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     using var document = JsonDocument.Parse(await File.ReadAllTextAsync(readyPath));
                     var state = document.RootElement.TryGetProperty("state", out var stateProperty) ? stateProperty.GetString() : null;
                     var error = document.RootElement.TryGetProperty("error", out var errorProperty) ? errorProperty.GetString() : null;
+                    // 会话标识用于把列表限定到本次采集；旧版信号文件没有该字段时退化为不限定。
+                    if (document.RootElement.TryGetProperty("sessionId", out var sessionProperty) &&
+                        Guid.TryParse(sessionProperty.GetString(), out var liveSession) && liveSession != Guid.Empty)
+                        _liveCaptureSessionId = liveSession;
                     if (state == "ready") break;
                     throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "静默抓包后台启动失败。" : error!);
                 }
@@ -1029,6 +1047,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _showingDemoData = false;
         _preferredTrafficId = null;
         _sessionFilterId = null;
+        // 会话标识属于旧工作区，跨工作区复用会把新工作区筛成空列表。
+        _liveCaptureSessionId = null;
+        _trafficScopeSessionId = null;
         _aiSelectedTrafficIds.Clear();
         ClearGroupAiScope();
         _currentAiHistoryEntry = null;
@@ -1512,38 +1533,44 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _refreshing = true;
         try
         {
-            if (_refreshPaused && !force)
+            // 会话范围决定读取哪一批事务：采集期间限定为本次会话，下钻历史会话时限定为该会话，
+            // 清除筛选后为 null（全部历史）。范围一旦变化就必须整窗重读并重置游标。
+            var scope = _sessionFilterId;
+            var scopeChanged = scope != _trafficScopeSessionId;
+            if (_refreshPaused && !force && !scopeChanged)
             {
                 var pausedCount = await Task.Run(() =>
                 {
                     using var archive = new TrafficArchive(_workspacePath);
-                    return archive.GetTrafficCount();
+                    return archive.GetTrafficCount(scope);
                 });
                 _pendingRefreshCount = Math.Max(0, pausedCount - _capturedCount);
                 UpdateRefreshPauseUi();
                 return;
             }
+            var reload = force || scopeChanged;
             var result = await Task.Run(() =>
             {
                 using var archive = new TrafficArchive(_workspacePath);
-                var count = archive.GetTrafficCount();
+                var count = archive.GetTrafficCount(scope);
                 var sessions = archive.GetRecentSessions(_settings.SessionWindowCount);
                 var latestCursor = archive.GetLatestTrafficCursor();
-                if (force || !_hasLoadedStoredTraffic || latestCursor < _trafficRefreshCursor || count < _capturedCount)
-                    return (Count: count, Rows: archive.GetRecentTraffic(_settings.TrafficWindowCount),
+                if (reload || !_hasLoadedStoredTraffic || latestCursor < _trafficRefreshCursor || count < _capturedCount)
+                    return (Count: count, Rows: archive.GetRecentTraffic(_settings.TrafficWindowCount, scope),
                         Changes: (IReadOnlyList<StoredTrafficChange>)[], Sessions: sessions, Cursor: latestCursor, Full: true);
 
-                var changes = archive.GetTrafficChangesAfter(_trafficRefreshCursor);
+                var changes = archive.GetTrafficChangesAfter(_trafficRefreshCursor, sessionId: scope);
                 if (count > _capturedCount && changes.Count == 0)
-                    return (Count: count, Rows: archive.GetRecentTraffic(_settings.TrafficWindowCount),
+                    return (Count: count, Rows: archive.GetRecentTraffic(_settings.TrafficWindowCount, scope),
                         Changes: (IReadOnlyList<StoredTrafficChange>)[], Sessions: sessions, Cursor: latestCursor, Full: true);
                 // 一次轮询积压超过单批上限时直接读取最新窗口，避免漏过游标中间段。
                 if (changes.Count == 2000 && changes[^1].Cursor < latestCursor)
-                    return (Count: count, Rows: archive.GetRecentTraffic(_settings.TrafficWindowCount),
+                    return (Count: count, Rows: archive.GetRecentTraffic(_settings.TrafficWindowCount, scope),
                         Changes: (IReadOnlyList<StoredTrafficChange>)[], Sessions: sessions, Cursor: latestCursor, Full: true);
                 return (Count: count, Rows: (IReadOnlyList<StoredTrafficRecord>)[], Changes: changes,
                     Sessions: sessions, Cursor: latestCursor, Full: false);
             });
+            _trafficScopeSessionId = scope;
             if (result.Full && (result.Rows.Count > 0 || _capturing))
             {
                 _showingDemoData = false;
@@ -1631,8 +1658,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         _refreshPaused = false;
         _pendingRefreshCount = 0;
-        _sessionFilterId = null;
-        if (SessionFilterBadge is not null) SessionFilterBadge.Visibility = Visibility.Collapsed;
+        // 每次开始采集都从空列表起步：把视图限定到本次捕获会话，而不是先加载历史事务。
+        // 拿不到会话标识（旧版 CoreHost 或信号缺字段）时退化为不限定，行为与改动前一致。
+        _sessionFilterId = _liveCaptureSessionId;
+        if (SessionFilterBadge is not null)
+        {
+            if (_liveCaptureSessionId is null) SessionFilterBadge.Visibility = Visibility.Collapsed;
+            else
+            {
+                SessionFilterText.Text = "本次采集 · 只显示本次会话的记录";
+                SessionFilterBadge.Visibility = Visibility.Visible;
+            }
+        }
         UpdateRefreshPauseUi();
         ApplyFilter(selectFallback: false);
     }
@@ -1887,6 +1924,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 ? $"删除所选 {persistedSelectedRows.Length:N0} 条事务…"
                 : "删除所选事务…";
         }
+        if (FindMenuItem(menu.Items, "删除全部") is { } deleteAllItem)
+        {
+            deleteAllItem.DataContext = grid;
+            // 范围是 DataGrid.Items，即用户眼前的过滤结果；演示数据没有 SessionId，不可删除。
+            var displayedPersisted = GetDisplayedTrafficRows(grid).Count(candidate => candidate.SessionId is not null);
+            deleteAllItem.IsEnabled = displayedPersisted > 0;
+            deleteAllItem.Header = displayedPersisted > 0
+                ? (HasActiveTrafficFilter() ? $"删除当前列表全部 {displayedPersisted:N0} 条（已过滤）…" : $"删除全部 {displayedPersisted:N0} 条…")
+                : "删除全部…";
+        }
     }
 
     private static MenuItem? FindMenuItem(ItemCollection items, string tag) =>
@@ -2080,13 +2127,40 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    /// <summary>
+    /// 「删除全部」：删除当前列表（DataGrid.Items，即用户眼前的过滤结果）中的所有事务。
+    /// 与「清空记录」不同——后者清掉整个工作区的事务、会话与正文，这里只删列表内可见的部分。
+    /// </summary>
+    private async void 右键删除全部_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem { DataContext: DataGrid grid }) return;
+        var targets = GetDisplayedTrafficRows(grid).Where(row => row.SessionId is not null).ToArray();
+        if (targets.Length == 0) return;
+        var filtered = HasActiveTrafficFilter();
+        var answer = MessageBox.Show(this,
+            $"将删除当前列表中的 {targets.Length:N0} 条流量事务" + (filtered ? "（当前有过滤条件，只删除过滤后可见的记录）" : "") + "。\n\n" +
+            "无其他事务引用的正文 Blob 会一并删除；记录组中的引用会保留为“已清理”。此操作无法撤销，是否继续？",
+            "确认删除全部", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+        if (answer != MessageBoxResult.Yes) return;
+        try
+        {
+            var deleted = await DeleteTrafficRowsAsync(targets);
+            MessageBox.Show(this, $"已删除 {deleted:N0} 条流量事务。", "删除完成", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, "删除全部失败：\n\n" + exception.Message, "无法删除事务", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
     private async Task<long> DeleteTrafficRowsAsync(IEnumerable<TrafficRow> rows)
     {
         var targets = rows.Where(row => row.SessionId is not null).DistinctBy(row => row.Source.Id).ToArray();
         if (targets.Length == 0) return 0;
         var ids = targets.Select(row => row.Source.Id).ToHashSet();
         using var archive = new TrafficArchive(_workspacePath);
-        var deleted = await archive.DeleteTrafficAsync(ids.ToArray());
+        // 分批删除：单次 DeleteTrafficAsync 上限 1,000 条，而「删除全部」的范围是整个列表窗口。
+        var deleted = await archive.DeleteTrafficBatchedAsync(ids.ToArray());
         if (deleted == 0) return 0;
         foreach (var id in ids)
         {
@@ -2129,8 +2203,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _updatingTrafficRows = true;
         try
         {
-            _sessionFilterId = null;
-            SessionFilterBadge.Visibility = Visibility.Collapsed;
+            ResetSessionScopeForQuickFilter();
             SourceFilter.SelectedIndex = 0;
             StatusFilter.SelectedIndex = 0;
             ResetResourceTypeFilters();
@@ -2156,22 +2229,33 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         TrafficGrid.ScrollIntoView(selected);
     }
 
-    private void 清除右键过滤_Click(object sender, RoutedEventArgs e)
+    private async void 清除右键过滤_Click(object sender, RoutedEventArgs e)
     {
         var sourceGrid = (sender as MenuItem)?.DataContext as DataGrid;
         _updatingTrafficRows = true;
         try
         {
-            _sessionFilterId = null;
-            SessionFilterBadge.Visibility = Visibility.Collapsed;
+            ResetSessionScopeForQuickFilter();
             SourceFilter.SelectedIndex = 0;
             StatusFilter.SelectedIndex = 0;
             ResetResourceTypeFilters();
             TrafficSearch.Clear();
         }
         finally { _updatingTrafficRows = false; }
+        await RefreshStoredTrafficAsync();
         ApplyFilter();
         if (ReferenceEquals(sourceGrid, TrafficGrid)) SelectPage(TrafficNav);
+    }
+
+    /// <summary>
+    /// 快速过滤要清掉可能把当前记录排除在外的旧条件。但采集进行中时会话范围必须保留为本次采集：
+    /// 被右键的记录本来就属于本次会话，清掉它反而会把全部历史事务重新拉回列表。
+    /// </summary>
+    private void ResetSessionScopeForQuickFilter()
+    {
+        _sessionFilterId = _capturing ? _liveCaptureSessionId : null;
+        if (SessionFilterBadge is null) return;
+        SessionFilterBadge.Visibility = _sessionFilterId is null ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private bool HasActiveTrafficFilter() =>
@@ -2338,7 +2422,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         while (collection.Count > desired.Count) collection.RemoveAt(collection.Count - 1);
     }
 
-    private void 会话_DoubleClick(object sender, MouseButtonEventArgs e)
+    private async void 会话_DoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (SessionGrid.SelectedItem is not SessionRow session) return;
         _sessionFilterId = session.SessionId;
@@ -2349,13 +2433,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ResetResourceTypeFilters();
         TrafficSearch.Clear();
         SelectPage(TrafficNav);
+        // 会话范围现在也决定从 SQLite 读取哪一批事务，必须重新取数而不是只过滤内存中的行，
+        // 否则下钻较早的会话时最近窗口里可能一条都没有。
+        await RefreshStoredTrafficAsync();
         ApplyFilter();
     }
 
-    private void 清除会话筛选_Click(object sender, RoutedEventArgs e)
+    private async void 清除会话筛选_Click(object sender, RoutedEventArgs e)
     {
         _sessionFilterId = null;
         SessionFilterBadge.Visibility = Visibility.Collapsed;
+        await RefreshStoredTrafficAsync();
         ApplyFilter();
     }
 

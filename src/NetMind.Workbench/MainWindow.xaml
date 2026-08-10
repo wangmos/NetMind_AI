@@ -111,6 +111,7 @@
             <MenuItem Header="清除所有过滤" Tag="清除过滤" Click="清除右键过滤_Click" />
             <Separator />
             <MenuItem Header="删除所选事务…" Tag="删除选择" Foreground="{StaticResource RedBrush}" Click="右键删除选择_Click" />
+            <MenuItem Header="删除全部…" Tag="删除全部" Foreground="{StaticResource RedBrush}" Click="右键删除全部_Click" ToolTip="删除当前列表中的所有事务；有过滤条件时只删除过滤后可见的记录" />
         </ContextMenu>
         <!-- JSON 树右键：展开全部 / 折叠全部，处理函数在本窗口代码后台；x:shared=False 保证每棵树持有独立实例，PlacementTarget 才能正确指向被右键的 TreeView -->
         <ContextMenu x:Key="JsonTreeContextMenu" x:Shared="False" Style="{StaticResource TrafficContextMenuStyle}">

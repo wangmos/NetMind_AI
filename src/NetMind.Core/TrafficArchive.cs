@@ -61,10 +61,12 @@ public sealed class TrafficArchive : IDisposable
         }, cancellationToken);
     }
 
-    public IReadOnlyList<StoredTrafficRecord> GetRecentTraffic(int limit = NetMindDefaults.DefaultTrafficWindowCount) => _metadata.GetRecentTraffic(limit);
+    /// <summary><paramref name="sessionId"/> 非空时只返回该捕获会话的事务。</summary>
+    public IReadOnlyList<StoredTrafficRecord> GetRecentTraffic(int limit = NetMindDefaults.DefaultTrafficWindowCount,
+        Guid? sessionId = null) => _metadata.GetRecentTraffic(limit, sessionId);
     public long GetLatestTrafficCursor() => _metadata.GetLatestTrafficCursor();
-    public IReadOnlyList<StoredTrafficChange> GetTrafficChangesAfter(long cursor, int limit = 2000) =>
-        _metadata.GetTrafficChangesAfter(cursor, limit);
+    public IReadOnlyList<StoredTrafficChange> GetTrafficChangesAfter(long cursor, int limit = 2000, Guid? sessionId = null) =>
+        _metadata.GetTrafficChangesAfter(cursor, limit, sessionId);
 
     /// <summary>页内 Hook 事件批量入库（采集浏览器注入脚本上报），并按批追加一条计数汇总审计。</summary>
     public async Task RecordPageHooksAsync(IReadOnlyList<PageHookEvent> events, CancellationToken cancellationToken = default)
@@ -79,7 +81,7 @@ public sealed class TrafficArchive : IDisposable
     public IReadOnlyList<PageHookEvent> GetPageHooksBySessions(IEnumerable<Guid> sessionIds, string? type = null, int limit = 200) =>
         _metadata.GetPageHooksBySessions(sessionIds, type, limit);
     public IReadOnlyList<StoredTrafficRecord> GetTrafficByIds(IEnumerable<Guid> ids) => _metadata.GetTrafficByIds(ids);
-    public long GetTrafficCount() => _metadata.GetTrafficCount();
+    public long GetTrafficCount(Guid? sessionId = null) => _metadata.GetTrafficCount(sessionId);
     public IReadOnlyList<CaptureSessionSummary> GetRecentSessions(int limit = NetMindDefaults.DefaultSessionWindowCount) => _metadata.GetRecentSessions(limit);
     public Task<StoredBlobContent> ReadBlobAsync(string hash, int maximumBytes = NetMindDefaults.BlobPreviewDefaultBytes,
         CancellationToken cancellationToken = default) => _workspace.ReadBlobAsync(hash, maximumBytes, cancellationToken);
@@ -120,5 +122,22 @@ public sealed class TrafficArchive : IDisposable
         await _workspace.AppendAuditAsync("workspace.traffic-deleted", new { deletedTransactions = deleted, deletedBlobs }, cancellationToken);
         return deleted;
     }
+
+    /// <summary>
+    /// 分批定向删除任意条数的事务。<see cref="DeleteTrafficAsync"/> 单次上限为 1,000 条，
+    /// 「删除全部」面向的是整个列表窗口，可能超过该上限，因此在此按批推进。
+    /// </summary>
+    public async Task<long> DeleteTrafficBatchedAsync(IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken = default)
+    {
+        const int batchSize = 500;
+        long deleted = 0;
+        foreach (var batch in ids.Distinct().Where(id => id != Guid.Empty).Chunk(batchSize))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            deleted += await DeleteTrafficAsync(batch, cancellationToken);
+        }
+        return deleted;
+    }
+
     public void Dispose() => _metadata.Dispose();
 }

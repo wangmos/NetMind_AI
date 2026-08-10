@@ -9,6 +9,7 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using NetMind.Core;
 
 if (args.Contains("--protocol-only", StringComparer.OrdinalIgnoreCase))
@@ -60,6 +61,20 @@ if (args.Contains("--hostile-only", StringComparer.OrdinalIgnoreCase))
 {
     await VerifyHostileEvidenceRoundTripAsync();
     Console.WriteLine("站点可控证据（引号、NUL、注入片段、中文与 emoji）参数绑定往返定向测试通过。");
+    return 0;
+}
+
+if (args.Contains("--scope-only", StringComparer.OrdinalIgnoreCase))
+{
+    await VerifyCaptureSessionScopeAsync();
+    Console.WriteLine("采集会话范围限定（每次开始采集从空列表起步）定向测试通过。");
+    return 0;
+}
+
+if (args.Contains("--ai-orchestration-only", StringComparer.OrdinalIgnoreCase))
+{
+    VerifyAiEvidenceOrchestration();
+    Console.WriteLine("AI 证据编排（摘要折叠无损、证据地图有界、单序号关联就地计算）定向测试通过。");
     return 0;
 }
 
@@ -1105,6 +1120,8 @@ try
     VerifyTrafficAnalysis();
     await VerifySilentCapture();
     await VerifyHostileEvidenceRoundTripAsync();
+    await VerifyCaptureSessionScopeAsync();
+    VerifyAiEvidenceOrchestration();
 
     using (var archive = new TrafficArchive(testRoot))
     {
@@ -1144,6 +1161,140 @@ finally
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+/// <summary>
+/// AI 首轮摘要与证据地图的省 token 编排必须是无损的：
+/// 静态资源折叠后每个 #序号 仍要出现，证据地图的省略数量必须如实报出，
+/// 单序号关联查询不得因全局清单截断而返回空。
+/// </summary>
+static void VerifyAiEvidenceOrchestration()
+{
+    static IReadOnlyList<TrafficRecord> BuildPool(int count)
+    {
+        string[] hosts = ["api.test.local", "cdn.test.local", "www.test.local"];
+        // 一半是静态资源（会被折叠），一半是接口/文档（保持逐条明细）。
+        string[] types = ["application/json; charset=utf-8", "image/png", "text/css; charset=utf-8",
+                          "application/javascript", "text/html; charset=utf-8", "font/woff2"];
+        var start = new DateTimeOffset(2026, 8, 11, 10, 0, 0, TimeSpan.Zero);
+        var pool = new List<TrafficRecord>(count);
+        for (var i = 0; i < count; i++)
+        {
+            // 主机、路径、方法同用 i%3：相隔 3 条的事务端点键完全一致，即使池子只有 12 条也存在真实的同端点关联，
+            // 关联评分才可能越过阈值——否则断言测的是构造数据而不是被测逻辑。
+            var bucket = i % 3;
+            pool.Add(new TrafficRecord(Guid.NewGuid(), start.AddMilliseconds(i * 300), bucket == 0 ? "POST" : "GET",
+                $"/v2/item/{bucket}", i % 37 == 0 ? 500 : 200, 40 + i % 150, 4096 + i * 11, "msedge.exe", "HTTP/1.1",
+                "请求摘要", "响应摘要", $"https://{hosts[bucket]}/v2/item/{bucket}?id={i}",
+                $"id={i}", "Accept: */*", $"sid=s{i}", $"Content-Type: {types[i % types.Length]}"));
+        }
+        return pool;
+    }
+
+    // 展开 "#3-#5,#9" 形式的序号区间，用于核对折叠行没有丢序号。
+    static IEnumerable<int> ExpandOrdinals(string text)
+    {
+        foreach (Match match in Regex.Matches(text, @"#(\d+)(?:-#(\d+))?"))
+        {
+            var from = int.Parse(match.Groups[1].Value);
+            var to = match.Groups[2].Success ? int.Parse(match.Groups[2].Value) : from;
+            for (var value = from; value <= to; value++) yield return value;
+        }
+    }
+
+    foreach (var size in new[] { 12, 200, 1000 })
+    {
+        var pool = BuildPool(size);
+        var summary = AiConversationEngine.BuildEvidenceSummary(pool);
+        var present = ExpandOrdinals(summary).ToHashSet();
+        var missing = Enumerable.Range(1, size).Where(ordinal => !present.Contains(ordinal)).ToArray();
+        Require(missing.Length == 0,
+            $"证据池 {size} 条：首轮摘要必须覆盖全部 #序号，缺失 {missing.Length} 个（首个 #{missing.FirstOrDefault()}）");
+        Require(Encoding.UTF8.GetByteCount(summary) <= NetMindDefaults.AiConversationSummaryMaximumBytes,
+            $"证据池 {size} 条：首轮摘要不得超过字节兜底上限");
+
+        var prepared = AiEvidencePreparationEngine.Prepare(pool);
+        var overview = AiEvidencePreparationEngine.BuildOverviewJson(prepared);
+        Require(!overview.Contains("\n  ", StringComparison.Ordinal), "发给模型的证据地图不得缩进");
+        Require(Encoding.UTF8.GetByteCount(overview) <= 32 * 1024,
+            $"证据池 {size} 条：证据地图必须有界，实测 {Encoding.UTF8.GetByteCount(overview)} 字节");
+        using var document = JsonDocument.Parse(overview);
+        var omittedRelations = document.RootElement.GetProperty("omittedRelations").GetInt32();
+        var relationCount = document.RootElement.GetProperty("relations").GetArrayLength();
+        Require(relationCount <= NetMindDefaults.AiOverviewMaximumRelations, "证据地图关联候选必须受上限约束");
+        Require(relationCount + omittedRelations == prepared.Relations.Count,
+            "证据地图必须如实报出省略的关联条数，不得静默截断");
+        Require(document.RootElement.GetProperty("transactionCount").GetInt32() == size,
+            "证据地图必须报出真实事务总数");
+
+        // 全局关联清单按分数取前 300 条；单序号查询必须就地计算，不能因此返回空。
+        var middle = size / 2;
+        var related = AiEvidencePreparationEngine.GetRelated(pool, middle, 12);
+        Require(related.Count > 0, $"证据池 {size} 条：#{middle} 的关联查询不得为空（回归：曾因过滤全局截断清单而恒空）");
+        Require(related.All(relation => relation.FromOrdinal == middle || relation.ToOrdinal == middle),
+            "关联结果必须都与被查询序号相关");
+        Require(related.All(relation => relation.FromOrdinal < relation.ToOrdinal),
+            "关联方向必须与时序一致（序号小的在前）");
+    }
+
+    // 静态资源折叠必须真的省下体积，且明确标注折叠事实。
+    var assetHeavy = BuildPool(300);
+    var assetSummary = AiConversationEngine.BuildEvidenceSummary(assetHeavy);
+    Require(assetSummary.Contains("[静态资源]", StringComparison.Ordinal), "静态资源应折叠为聚合行");
+    Require(assetSummary.Contains("已按主机+类型折叠", StringComparison.Ordinal), "折叠必须对模型明确说明");
+    Require(!assetSummary.Contains("charset=", StringComparison.OrdinalIgnoreCase), "摘要不应携带 Content-Type 参数");
+}
+
+/// <summary>
+/// 每次「开始采集」都必须从空列表起步：流量读取按捕获会话限定后，
+/// 只应返回本次会话的事务，历史会话既不进窗口也不计入本次计数，但仍完整留在库里。
+/// </summary>
+static async Task VerifyCaptureSessionScopeAsync()
+{
+    var testRoot = Path.Combine(Path.GetTempPath(), "netmind-scope-test-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        using var archive = new TrafficArchive(testRoot);
+        await archive.InitializeAsync("会话范围测试工作区");
+        var traffic = DemoData.CreateTraffic();
+
+        var oldSession = Guid.NewGuid();
+        await archive.StartSessionAsync(new CaptureSessionRecord(oldSession, DateTimeOffset.UtcNow.AddMinutes(-10), null,
+            NetMindDefaults.SourceSimulated, "上一次采集", NetMindDefaults.SessionStateRunning));
+        for (var i = 0; i < 3; i++)
+            await archive.RecordAsync(oldSession, traffic[i] with { Id = Guid.NewGuid() }, "req"u8.ToArray(), "res"u8.ToArray());
+
+        var cursorBeforeNewSession = archive.GetLatestTrafficCursor();
+        var newSession = Guid.NewGuid();
+        await archive.StartSessionAsync(new CaptureSessionRecord(newSession, DateTimeOffset.UtcNow, null,
+            NetMindDefaults.SourceSimulated, "本次采集", NetMindDefaults.SessionStateRunning));
+
+        // 新会话尚未产生事务：限定读取必须是空列表，而不限定时仍能看到历史。
+        Require(archive.GetTrafficCount(newSession) == 0, "新会话开始时本次会话事务数必须为 0");
+        Require(archive.GetRecentTraffic(500, newSession).Count == 0, "新会话开始时列表必须为空，不得加载历史记录");
+        Require(archive.GetTrafficCount() == 3 && archive.GetRecentTraffic(500).Count == 3,
+            "限定视图不得删除或隐藏历史事务，不限定读取仍应返回全部");
+
+        for (var i = 0; i < 2; i++)
+            await archive.RecordAsync(newSession, traffic[i] with { Id = Guid.NewGuid() }, "req2"u8.ToArray(), "res2"u8.ToArray());
+
+        Require(archive.GetTrafficCount(newSession) == 2, "本次会话计数只统计本次会话的事务");
+        var scoped = archive.GetRecentTraffic(500, newSession);
+        Require(scoped.Count == 2 && scoped.All(item => item.SessionId == newSession), "限定读取只能返回本次会话的事务");
+        Require(archive.GetTrafficCount() == 5, "限定读取不得影响全局计数");
+
+        // 增量游标同样要受会话限定：否则采集期间旧会话的完成态更新会漏进本次列表。
+        var changes = archive.GetTrafficChangesAfter(cursorBeforeNewSession, sessionId: newSession);
+        Require(changes.Count == 2 && changes.All(change => change.Stored.SessionId == newSession),
+            "增量读取必须只返回本次会话的变更");
+        Require(archive.GetTrafficChangesAfter(0, sessionId: oldSession).Count == 3,
+            "限定到历史会话时必须能完整读回该会话的事务");
+        Require(archive.GetTrafficChangesAfter(0).Count == 5, "不限定时增量读取仍应覆盖全部会话");
+    }
+    finally
+    {
+        if (Directory.Exists(testRoot)) Directory.Delete(testRoot, recursive: true);
+    }
 }
 
 /// <summary>
