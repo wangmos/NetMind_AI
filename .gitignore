@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+artifacts/
+
+# 调试与自检残留（根目录临时工作区、探针脚本）
+tmp-*/
+tmp-*.ps1

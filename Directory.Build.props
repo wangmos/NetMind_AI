@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <Product>NetMind AI</Product>
+    <Company>NetMind AI</Company>
+    <Authors>NetMind AI</Authors>
+    <Copyright>Copyright © 2026 NetMind AI</Copyright>
+    <Version>0.8.0</Version>
+    <RepositoryUrl>https://github.com/netmind-ai/netmind-ai</RepositoryUrl>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <TreatWarningsAsErrors Condition="'$(CI)' == 'true'">true</TreatWarningsAsErrors>
+  </PropertyGroup>
+</Project>

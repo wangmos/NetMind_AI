@@ -1,0 +1,41 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 同一图标既嵌入 exe 资源（任务栏/资源管理器），也作为打包资源供窗口 Icon 使用 -->
+    <Resource Include="Assets\app.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NetMind.Core\NetMind.Core.csproj" />
+    <ProjectReference Include="..\NetMind.CoreHost\NetMind.CoreHost.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\NetMind.SandboxHost\NetMind.SandboxHost.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="CopyCoreHost" AfterTargets="Build">
+    <ItemGroup>
+      <CoreHostFiles Include="..\NetMind.CoreHost\bin\$(Configuration)\net10.0\NetMind.CoreHost.*" />
+      <CoreHostFiles Include="..\NetMind.CoreHost\bin\$(Configuration)\net10.0\NetMind.Core.dll" />
+    </ItemGroup>
+    <MakeDir Directories="$(OutDir)CoreHost" />
+    <Copy SourceFiles="@(CoreHostFiles)" DestinationFolder="$(OutDir)CoreHost" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopySandboxHost" AfterTargets="Build">
+    <ItemGroup>
+      <SandboxHostFiles Include="..\NetMind.SandboxHost\bin\$(Configuration)\net10.0\NetMind.SandboxHost.*" />
+      <SandboxHostFiles Include="..\NetMind.SandboxHost\bin\$(Configuration)\net10.0\NetMind.Core.dll" />
+    </ItemGroup>
+    <MakeDir Directories="$(OutDir)SandboxHost" />
+    <Copy SourceFiles="@(SandboxHostFiles)" DestinationFolder="$(OutDir)SandboxHost" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

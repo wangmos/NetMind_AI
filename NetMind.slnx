@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/NetMind.Core/NetMind.Core.csproj" />
+    <Project Path="src/NetMind.CoreHost/NetMind.CoreHost.csproj" />
+    <Project Path="src/NetMind.SandboxHost/NetMind.SandboxHost.csproj" />
+    <Project Path="src/NetMind.SmokeTests/NetMind.SmokeTests.csproj" />
+    <Project Path="src/NetMind.Workbench/NetMind.Workbench.csproj" />
+  </Folder>
+</Solution>

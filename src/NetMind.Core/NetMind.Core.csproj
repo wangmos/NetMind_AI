@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- 定向测试需要覆盖注册表值映射与回读校验等内部纯逻辑 -->
+    <InternalsVisibleTo Include="NetMind.SmokeTests" />
+  </ItemGroup>
+</Project>

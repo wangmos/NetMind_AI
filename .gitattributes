@@ -1,0 +1,23 @@
+# 默认按文本处理并在仓库内统一存为 LF，检出到 Windows 工作区时由 core.autocrlf 决定。
+* text=auto
+
+# 明确的文本类型，避免启发式误判中文文件名或含 BOM 的源文件。
+*.cs        text diff=csharp
+*.csproj    text
+*.props     text
+*.slnx      text
+*.xaml      text
+*.json      text
+*.md        text
+*.yml       text
+*.txt       text
+
+# PowerShell 在 Windows 上必须是 CRLF，否则 5.1 解析 here-string 会出问题。
+*.ps1       text eol=crlf
+
+# 二进制：绝不做行尾转换或文本 diff。
+*.dll       binary
+*.sys       binary
+*.ico       binary
+*.zip       binary
+*.png       binary

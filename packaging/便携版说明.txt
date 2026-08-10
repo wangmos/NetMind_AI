@@ -1,0 +1,22 @@
+NetMind AI 0.8.0 · Windows x64 便携版
+
+运行方式
+1. 解压完整 ZIP，不要只从压缩包内双击运行。
+2. 双击 NetMind.Workbench.exe。
+3. 工作区数据默认保存到：%LOCALAPPDATA%\NetMind\workspaces
+
+HTTPS 正文抓取
+默认仅转发 HTTPS 加密隧道。需要正文时，请在“工作区”页明确启用工作区 CA，使用完毕后可停用并撤销当前用户根信任。程序不会绕过证书固定。
+
+安全校验
+同目录 release-manifest.json 记录版本与文件哈希；ZIP 旁的 .sha256 文件用于验证整个压缩包。
+
+运行要求
+- Windows 10 1903 或更高版本，推荐 Windows 11 x64。
+- 本包包含 .NET 10 运行时，不需要另外安装 .NET。
+- Python 脚本验证仍需要本机安装 Python 3。
+
+目录说明
+- CoreHost：流量捕获后台。
+- SandboxHost：Python 隔离验证后台。
+- docs：安装与开发说明。
