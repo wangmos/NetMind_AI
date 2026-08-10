@@ -702,7 +702,23 @@
                                     <CheckBox x:Name="HookAfterDeliverBox" Content="响应交付后（response.after_deliver）" AutomationProperties.Name="钩子点：响应交付后" Margin="0,0,0,6" Checked="钩子勾选_Changed" Unchecked="钩子勾选_Changed" />
                                 </WrapPanel>
                                 <TextBlock Text="钩子脚本（保存后落在当前工作区 scripts 目录，采集期间由隔离的钩子工作进程执行）" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,6,0,6" />
-                                <RichTextBox x:Name="HookScriptEditor" Style="{StaticResource PythonCodeEditor}" Height="238" TextChanged="钩子脚本编辑器_TextChanged" AutomationProperties.Name="钩子脚本编辑器"><FlowDocument PagePadding="0" LineHeight="18" LineStackingStrategy="BlockLineHeight"><Paragraph Margin="0" /></FlowDocument></RichTextBox>
+                                <RichTextBox x:Name="HookScriptEditor" Style="{StaticResource PythonCodeEditor}" Height="238" TextChanged="钩子脚本编辑器_TextChanged" PreviewKeyDown="钩子脚本编辑器_按键" LostKeyboardFocus="钩子脚本编辑器_失焦" AutomationProperties.Name="钩子脚本编辑器"><FlowDocument PagePadding="0" LineHeight="18" LineStackingStrategy="BlockLineHeight"><Paragraph Margin="0" /></FlowDocument></RichTextBox>
+                                <!-- 补全弹层：词表来自 NetMind.Core 的 HookScriptApi，与运行时契约同源，不会和真实字段漂移 -->
+                                <Popup x:Name="HookCompletionPopup" Placement="RelativePoint" PlacementTarget="{Binding ElementName=HookScriptEditor}" AllowsTransparency="True" StaysOpen="False" PopupAnimation="None">
+                                    <Border Background="{StaticResource RaisedBrush}" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="4" MaxWidth="520">
+                                        <ListBox x:Name="HookCompletionList" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" MaxHeight="220" BorderThickness="0" Background="Transparent" MouseLeftButtonUp="钩子补全_点击">
+                                            <ListBox.ItemTemplate>
+                                                <DataTemplate>
+                                                    <StackPanel Orientation="Horizontal" Margin="2,1">
+                                                        <TextBlock Text="{Binding Name}" Foreground="{StaticResource AccentBrush}" FontFamily="Cascadia Mono" FontSize="12" MinWidth="150" />
+                                                        <TextBlock Text="{Binding Detail}" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="10,1,0,0" TextTrimming="CharacterEllipsis" MaxWidth="330" />
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </ListBox.ItemTemplate>
+                                        </ListBox>
+                                    </Border>
+                                </Popup>
+                                <TextBlock Text="智能提示：Ctrl+空格 手动唤出；输入 event.get('、event['、store. 或在 INTERCEPT 规则内自动弹出。Enter/Tab 插入，Esc 关闭。" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,6,0,0" TextWrapping="Wrap" />
                                 <WrapPanel Margin="0,12,0,0">
                                     <Button Content="保存钩子配置" Style="{StaticResource PrimaryButton}" Padding="13,8" Click="保存钩子配置_Click" ToolTip="把脚本与 hook-config.json 写入当前工作区，保存后下次启动采集生效" />
                                     <Button x:Name="TestHookScriptButton" Content="试跑当前脚本" Style="{StaticResource SecondaryButton}" Padding="13,8" Margin="8,0,0,0" Click="试跑钩子脚本_Click" ToolTip="在临时数据目录中启动隔离工作进程，并用当前事务快照试跑；不会修改钩子配置或正式数据" />

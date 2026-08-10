@@ -69,7 +69,25 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "#   statusCode、headers、bodyPreviewBase64、bodyTruncated、bodySha256、bodySize。\n" +
         "# store 为宿主注入的键值存储（落盘在工作区 scripts/data 目录，直接使用，无需导入）：\n" +
         "#   store.save('名称', 文本或对象) 写入 · store.load('名称') 读取（不存在返回 None）\n" +
-        "#   store.list() 列出全部键 · store.delete('名称') 删除\n\n" +
+        "#   store.list() 列出全部键 · store.delete('名称') 删除\n" +
+        "# 编辑器支持智能提示：Ctrl+空格 唤出；输入 event.get('、store. 或在 INTERCEPT 规则内自动弹出。\n" +
+        "#\n" +
+        "# 【拦截改写】默认只观察、不改写，代理不等待脚本。要修改数据并向下传播，\n" +
+        "# 取消下面 INTERCEPT 的注释：只有命中规则的请求才阻塞等待裁决，其余流量仍是即发即忘。\n" +
+        "# 条件全是正则（url/method/host/endpoint/body/status/headers），条件之间是 AND。\n" +
+        "# 命中时钩子函数的返回值即改写内容，返回 None 原样放行；超时或异常一律放行，不会卡住浏览器。\n" +
+        "#\n" +
+        "# INTERCEPT = [\n" +
+        "#     {'event': 'request.before_send', 'url': r'/v\\d+/user/login', 'method': r'^POST$'},\n" +
+        "# ]\n" +
+        "#\n" +
+        "# def on_before_send(event):\n" +
+        "#     # 删掉签名头并替换正文，验证服务端是否真的校验\n" +
+        "#     return {\n" +
+        "#         'headers': {'X-Sign': None, 'X-Debug': '1'},\n" +
+        "#         'body': '{\"password\":\"changed\"}',\n" +
+        "#         'finding': {'kind': 'probe.sign-removed'},\n" +
+        "#     }\n\n" +
         "def _header_names(event):\n" +
         "    headers = event.get('headers') or {}\n" +
         "    return sorted([str(name) for name in headers.keys()])\n\n" +
@@ -272,6 +290,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private long _pendingRefreshCount;
     private int _copyFeedbackVersion;
     private bool _highlightingScript;
+    /// <summary>补全时已键入的前缀长度；提交前要先删掉它，否则会出现 meth+method 这类重复。</summary>
+    private int _hookCompletionPrefixLength;
     private RichTextBox? _pendingHighlightEditor;
     private string? _hookScriptFilePath;
     private string? _hookConfigScriptPath; // 当前加载配置中的 scriptPath（相对工作区 scripts 目录或绝对路径），保存时非默认值原样写回
@@ -6215,7 +6235,149 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_highlightingScript || HookScriptEditor is null) return;
         RequestScriptHighlight(HookScriptEditor);
+        UpdateHookCompletion(auto: true);
     }
+
+    // ==================== 钩子脚本智能提示 ====================
+    // 词表全部来自 NetMind.Core 的 HookScriptApi，与运行时契约同源：
+    // 信封字段是反射出来的，契约一改提示立刻跟着改，不会出现「照提示写、运行时取不到值」。
+
+    /// <summary>取光标所在行从行首到光标处的文本，用于判断补全上下文。</summary>
+    private static string GetLineTextBeforeCaret(RichTextBox editor)
+    {
+        var caret = editor.CaretPosition;
+        var lineStart = caret.GetLineStartPosition(0) ?? caret.DocumentStart;
+        return new TextRange(lineStart, caret).Text;
+    }
+
+    /// <summary>
+    /// 按光标前的文本判定该补什么。刻意只认几个明确的触发形态，
+    /// 而不是任何时候都弹——编辑器里频繁跳出无关列表比没有提示更烦人。
+    /// </summary>
+    private static (IReadOnlyList<HookScriptApi.Symbol> Items, string Prefix)? ResolveHookCompletion(string lineBeforeCaret, bool auto)
+    {
+        var text = lineBeforeCaret;
+        // event.get('xxx  /  event['xxx
+        var eventMatch = HookEventFieldPattern().Match(text);
+        if (eventMatch.Success) return (HookScriptApi.EventFields, eventMatch.Groups["p"].Value);
+        // store.xxx
+        var storeMatch = HookStoreMemberPattern().Match(text);
+        if (storeMatch.Success) return (HookScriptApi.StoreMembers, storeMatch.Groups["p"].Value);
+        // INTERCEPT 规则里的 'event': 'xxx
+        var interceptEventMatch = HookInterceptEventPattern().Match(text);
+        if (interceptEventMatch.Success) return (HookScriptApi.InterceptEvents, interceptEventMatch.Groups["p"].Value);
+
+        var trimmed = text.TrimStart();
+        // 规则字典里敲引号：补规则字段名。
+        if (HookInterceptFieldPattern().IsMatch(text)) return (HookScriptApi.InterceptRuleFields, HookQuotedPrefixPattern().Match(text).Groups["p"].Value);
+        // 手动唤出时按行首内容给出最可能的候选。
+        if (!auto)
+        {
+            if (trimmed.StartsWith("def", StringComparison.Ordinal) || trimmed.Length == 0)
+                return (HookScriptApi.HookFunctions, trimmed.StartsWith("def", StringComparison.Ordinal) ? trimmed[3..].TrimStart() : string.Empty);
+            if (trimmed.StartsWith("return", StringComparison.Ordinal))
+                return (HookScriptApi.MutationFields, string.Empty);
+            return (HookScriptApi.EventFields, string.Empty);
+        }
+        return null;
+    }
+
+    private void UpdateHookCompletion(bool auto)
+    {
+        if (HookScriptEditor is null || HookCompletionPopup is null || HookCompletionList is null) return;
+        var resolved = ResolveHookCompletion(GetLineTextBeforeCaret(HookScriptEditor), auto);
+        if (resolved is null)
+        {
+            HookCompletionPopup.IsOpen = false;
+            return;
+        }
+        var (items, prefix) = resolved.Value;
+        var filtered = items.Where(symbol => symbol.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (filtered.Length == 0)
+        {
+            HookCompletionPopup.IsOpen = false;
+            return;
+        }
+        _hookCompletionPrefixLength = prefix.Length;
+        HookCompletionList.ItemsSource = filtered;
+        HookCompletionList.SelectedIndex = 0;
+        var caretRect = HookScriptEditor.CaretPosition.GetCharacterRect(LogicalDirection.Forward);
+        HookCompletionPopup.HorizontalOffset = caretRect.Left;
+        HookCompletionPopup.VerticalOffset = caretRect.Bottom + 2;
+        HookCompletionPopup.IsOpen = true;
+    }
+
+    private void 钩子脚本编辑器_按键(object sender, KeyEventArgs e)
+    {
+        if (HookCompletionPopup is null || HookCompletionList is null) return;
+        if (e.Key == Key.Space && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+        {
+            UpdateHookCompletion(auto: false);
+            e.Handled = true;
+            return;
+        }
+        if (!HookCompletionPopup.IsOpen) return;
+        switch (e.Key)
+        {
+            case Key.Escape:
+                HookCompletionPopup.IsOpen = false;
+                e.Handled = true;
+                break;
+            case Key.Down:
+                HookCompletionList.SelectedIndex = Math.Min(HookCompletionList.SelectedIndex + 1, HookCompletionList.Items.Count - 1);
+                e.Handled = true;
+                break;
+            case Key.Up:
+                HookCompletionList.SelectedIndex = Math.Max(HookCompletionList.SelectedIndex - 1, 0);
+                e.Handled = true;
+                break;
+            case Key.Enter:
+            case Key.Tab:
+                CommitHookCompletion();
+                e.Handled = true;
+                break;
+        }
+    }
+
+    private void 钩子补全_点击(object sender, MouseButtonEventArgs e) => CommitHookCompletion();
+
+    private void 钩子脚本编辑器_失焦(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        if (HookCompletionPopup is not null) HookCompletionPopup.IsOpen = false;
+    }
+
+    /// <summary>把选中项插入编辑器：先删掉已经键入的前缀，避免出现 "meth" + "method" 这种重复。</summary>
+    private void CommitHookCompletion()
+    {
+        if (HookScriptEditor is null || HookCompletionPopup is null ||
+            HookCompletionList?.SelectedItem is not HookScriptApi.Symbol symbol) return;
+        HookCompletionPopup.IsOpen = false;
+        var caret = HookScriptEditor.CaretPosition;
+        if (_hookCompletionPrefixLength > 0)
+        {
+            var start = caret.GetPositionAtOffset(-_hookCompletionPrefixLength, LogicalDirection.Backward);
+            if (start is not null) new TextRange(start, caret).Text = string.Empty;
+        }
+        // 插入文本可能含换行（钩子函数骨架）；RichTextBox 会自行拆段，无需额外处理。
+        HookScriptEditor.CaretPosition.InsertTextInRun(symbol.Insert);
+        HookScriptEditor.CaretPosition = HookScriptEditor.CaretPosition.GetPositionAtOffset(symbol.Insert.Length) ?? HookScriptEditor.CaretPosition;
+        RequestScriptHighlight(HookScriptEditor);
+    }
+
+    [GeneratedRegex(@"event(?:\.get\(|\[)\s*['""](?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
+    private static partial Regex HookEventFieldPattern();
+
+    [GeneratedRegex(@"\bstore\.(?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
+    private static partial Regex HookStoreMemberPattern();
+
+    [GeneratedRegex(@"['""]event['""]\s*:\s*['""](?<p>[A-Za-z0-9_.]*)$", RegexOptions.CultureInvariant)]
+    private static partial Regex HookInterceptEventPattern();
+
+    [GeneratedRegex(@"\{[^}]*['""](?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
+    private static partial Regex HookInterceptFieldPattern();
+
+    [GeneratedRegex(@"['""](?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
+    private static partial Regex HookQuotedPrefixPattern();
 
     private void RequestScriptHighlight(RichTextBox editor)
     {

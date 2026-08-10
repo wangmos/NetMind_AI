@@ -1,5 +1,16 @@
 # Implementation status
 
+## 2026-08-11 钩子拦截改写、挂载点测试补齐与脚本智能提示
+
+- 补齐代理钩子四个挂载点的端到端触发测试（`--mountpoint-only`）。此前引擎层测得很扎实，但唯一给 `ExplicitHttpProxy` 传钩子引擎的测试传的是 `hookEngine:null`，`RequestAfterSend` / `ResponseBeforeWrite` / `ResponseAfterDeliver` 在整个测试集中从未被断言——四个挂载点是否真的按序触发一直是未经验证的假设。测试结果：实现本来就是正确的，未发现缺陷。断言覆盖触发顺序、四点共用同一 `txnId`、请求侧带请求正文而响应侧带响应正文、状态码在发送前为空、未勾选的点不入队；刻意不启动工作进程（直接读引擎待投递队列），避免断言连带依赖本机是否装了 Python。
+- 钩子从只读观察扩展为可阻塞拦截：脚本用模块级 `INTERCEPT` 声明规则，worker 在 `ready` 时一次性上报，此后每个请求的匹配都在宿主进程内完成。不下推给 Python 判断是关键——worker 是单线程的，若所有请求都问一遍，一个页面的上百个资源会全部串行排队。未声明规则的纯观察脚本不付任何代价。
+- 规则条件全是正则，覆盖 `url` / `method` / `host` / `endpoint` / `body` / `status` 与 `headers`（`{头名: 值正则}`），条件之间是 AND。正则优先用 .NET 线性引擎（`NonBacktracking`）编译，脚本里写出病态回溯模式也炸不掉代理热路径；用到反向引用/环视时退回普通引擎并强制 50 毫秒匹配超时。任一模式非法则整条规则作废，不做部分生效。正文匹配只取前 64 KB。
+- 可改写的只有 `request.before_send` 与 `response.before_write` 两个点。脚本返回 dict 即为改写内容（`url`/`method`/`status`/`headers`/`body`，头值为 `None` 表示删除），返回 `None` 原样放行，可另带 `finding`。`Content-Length` 按改写后正文重算，改写 URL 只接受 http(s) 绝对地址。明文与 TLS 解密两条路径语义完全一致。
+- 一律 fail-open：裁决超时（2 秒）、工作进程崩溃、协议错误、改写正文超 1 MB 均按原样放行；worker 在缺 handler、队列满、超时、异常每一条分支都必须回一条 `pass`/`mutate`，否则宿主只能空等满自己的超时。落库记录实际上线的字节，同时保留改写前的 URL 与正文并标注 `Mutated`。
+- 期间修掉一个本次引入的真实回归：重构响应写出时把多值头按名合并成逗号串，`Set-Cookie` 会被并成一条、浏览器解出的 Cookie 数量出错；`--tls-only` 抓到。响应头改为以「行」为单位贯穿拦截与写出，按名合并的字典只用于快照与落库。
+- 脚本编辑器新增钩子 API 智能提示：`Ctrl+空格` 手动唤出，输入 `event.get('`、`event[`、`store.` 或在 `INTERCEPT` 规则内自动弹出，Enter/Tab 插入、Esc 关闭。词表集中在 `HookScriptApi`，`event` 字段名由反射 `HookEventEnvelope` 得到、命名策略取自同一份 `JsonOptions`，契约一改提示立刻跟着改；`--intercept-only` 断言每个反射出的字段都有中文说明、钩子函数名与实际派发一致、拦截事件补全项都是可改写挂载点。
+- 定向验证：`--intercept-only` 覆盖 15 组匹配用例（各位置命中/不命中、多条件 AND、状态码仅响应侧有效、非法正则整条作废、不可改写挂载点被拒）、病态正则 `(a+)+$` 对 5,000 个字符必须毫秒级收敛、未声明规则不拦截、工作进程不可用时立刻 fail-open 而非空等；全量 28 个套件通过。
+
 ## 2026-08-11 稳定版 .NET 10 与可验证发布
 
 - 全部项目保持 `net10.0` / `net10.0-windows`，新增 `global.json` 锁定官方稳定 SDK 10.0.302、`latestPatch` 且 `allowPrerelease=false`，避免当前机器的 10.0.400-preview 或后续预览 SDK混入发布。CI 环境启用确定性构建并把警告视为错误。

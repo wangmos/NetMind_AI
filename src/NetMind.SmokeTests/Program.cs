@@ -1225,6 +1225,31 @@ static async Task VerifyHookInterceptRulesAsync()
     Require(timer.ElapsedMilliseconds < 1000,
         $"病态正则匹配必须在毫秒级内收敛，实测 {timer.ElapsedMilliseconds} ms（回溯爆炸会拖死代理）");
 
+    // 编辑器补全词表必须与运行时契约同步：字段名反射自 HookEventEnvelope，说明是人工维护的，
+    // 漏写说明就等于提示里出现一个「不知道是什么」的字段，这里直接测挂。
+    Require(HookScriptApi.EventFields.Count > 0, "事件字段词表不得为空");
+    Require(HookScriptApi.EventFields.All(field => !field.Detail.Contains("尚未补充说明", StringComparison.Ordinal)),
+        "新增信封字段后必须补上中文说明：" +
+        string.Join("、", HookScriptApi.EventFields.Where(f => f.Detail.Contains("尚未补充说明", StringComparison.Ordinal)).Select(f => f.Name)));
+    foreach (var expected in new[] { "url", "method", "headers", "bodyPreviewBase64", "statusCode", "txnId" })
+        Require(HookScriptApi.EventFields.Any(field => field.Name == expected),
+            $"事件字段词表必须包含 {expected}（它直接来自信封契约）");
+    // 钩子函数词表必须与实际派发用的函数名一致，否则补全出来的函数永远不会被调用。
+    foreach (var function in new[]
+             {
+                 HookEventNames.FunctionBeforeSend, HookEventNames.FunctionAfterSend,
+                 HookEventNames.FunctionBeforeWrite, HookEventNames.FunctionAfterDeliver
+             })
+        Require(HookScriptApi.HookFunctions.Any(symbol => symbol.Name == function),
+            $"钩子函数词表必须包含 {function}");
+    // INTERCEPT 只能声明可改写的两个挂载点，补全里也不能出现别的。
+    Require(HookScriptApi.InterceptEvents.All(symbol => HookInterceptRule.IsMutable(symbol.Name)),
+        "拦截事件补全项必须都是可改写的挂载点");
+    // 规则字段补全必须覆盖匹配器实际支持的每个位置。
+    foreach (var field in new[] { "url", "method", "host", "endpoint", "body", "status", "headers" })
+        Require(HookScriptApi.InterceptRuleFields.Any(symbol => symbol.Name == field),
+            $"拦截规则补全必须包含匹配位置 {field}");
+
     // 未声明规则、引擎未运行时必须不拦截且立即放行——纯观察脚本不付任何代价。
     var testRoot = Path.Combine(Path.GetTempPath(), "netmind-intercept-test-" + Guid.NewGuid().ToString("N"));
     try
