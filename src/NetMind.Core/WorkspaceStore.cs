@@ -95,6 +95,20 @@ public sealed partial class WorkspaceStore
             64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
     }
 
+    /// <summary>
+    /// 追加一条脱敏审计。
+    ///
+    /// 写入必须串行：审计的写入方是并发的——CoreHost 代理每条事务写一次 traffic.recorded，
+    /// 多个连接同时结算；工作台进程还会就同一个工作区写用户操作审计。原实现直接用
+    /// <c>File.AppendAllTextAsync</c>（默认 FileShare.Read），并发追加会互相踩成 IOException：
+    /// 实测 8 路并发写 1,200 条只落盘 508 条，另外 692 条连同异常一起抛回 RecordAsync——
+    /// SQLite 行已经写下，它的采集审计却丢了。
+    ///
+    /// 用系统级命名 Mutex 串行化，同时覆盖进程内并发与工作台↔CoreHost 的跨进程并发；
+    /// 句柄以 FileShare.ReadWrite 打开，另一端持有时不再是硬失败。
+    /// 仍然是写透的：不缓冲，落盘即可见，进程崩溃不会带走已确认的条目——
+    /// 顺序吞吐实测 ~5,000 条/秒（单条 0.2 ms），远高于采集速率，没有必要拿durability换吞吐。
+    /// </summary>
     public async Task AppendAuditAsync(string eventName, object payload, CancellationToken cancellationToken = default)
     {
         var entry = JsonSerializer.Serialize(new
@@ -103,7 +117,46 @@ public sealed partial class WorkspaceStore
             eventName,
             payload = Redact(JsonSerializer.Serialize(payload))
         });
-        await File.AppendAllTextAsync(Path.Combine(RootPath, NetMindDefaults.LogsDirectoryName, NetMindDefaults.AuditLogFileName), entry + Environment.NewLine, cancellationToken);
+        var path = Path.Combine(RootPath, NetMindDefaults.LogsDirectoryName, NetMindDefaults.AuditLogFileName);
+        var bytes = Encoding.UTF8.GetBytes(entry + Environment.NewLine);
+        // Mutex 是线程亲和的，不能跨 await 持有；整段加锁写入放到线程池线程上同步完成。
+        await Task.Run(() => AppendAuditEntry(path, bytes), cancellationToken);
+    }
+
+    private static void AppendAuditEntry(string path, byte[] bytes)
+    {
+        using var mutex = new Mutex(false, AuditMutexName(path));
+        var acquired = false;
+        try
+        {
+            try
+            {
+                acquired = mutex.WaitOne(NetMindDefaults.AuditAppendLockTimeoutMilliseconds);
+            }
+            catch (AbandonedMutexException)
+            {
+                // 上一个持有者崩溃了。锁此时已归本线程所有，日志最多缺一条未写完的记录，继续写入即可。
+                acquired = true;
+            }
+            if (!acquired) throw new IOException("等待审计日志写入锁超时，未写入该条审计。");
+            using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite,
+                bufferSize: 0, FileOptions.None);
+            stream.Write(bytes);
+        }
+        finally
+        {
+            if (acquired) mutex.ReleaseMutex();
+        }
+    }
+
+    /// <summary>
+    /// 按工作区日志路径派生命名 Mutex。用 SHA-256 是因为路径含反斜杠和中文，不能直接做内核对象名；
+    /// Local\ 作用域覆盖同一登录会话内的全部进程，正好是工作台与 CoreHost（含提升权限的静默采集）的范围。
+    /// </summary>
+    private static string AuditMutexName(string path)
+    {
+        var digest = SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(path).ToLowerInvariant()));
+        return @"Local\NetMind-Audit-" + Convert.ToHexString(digest.AsSpan(0, 16));
     }
 
     /// <summary>删除单个正文 Blob；哈希非法或文件不存在时返回 false。用于记录定向删除后的孤儿正文清理。</summary>

@@ -12,195 +12,186 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using NetMind.Core;
 
-if (args.Contains("--protocol-only", StringComparer.OrdinalIgnoreCase))
+// ── 冒烟测试注册表与运行器 ────────────────────────────────────────────────
+// 原实现是 24 个 if 分支加一段内联的“全量”流程，且 Require 直接抛异常：
+// 首个失败就中止整轮，CI 上一次只能看到一个问题，也没有耗时与结果汇总。
+// 这里改为注册表驱动：逐个套件独立执行、失败继续、末尾统一汇总，退出码为失败套件数。
+// 仍然不引入任何第三方测试框架，保持离线可构建。
+var suites = new SmokeSuite[]
 {
-    VerifyProtocolParsers();
-    Console.WriteLine("协议解析定向测试通过。");
+    new("核心存储、脱敏、演示数据与沙箱策略", "core-only", VerifyCoreStorageAndSandboxAsync),
+    new("协议解析（HTTP/2、WebSocket、SSE、gRPC、DNS、Protobuf）", "protocol-only", Sync(VerifyProtocolParsers)),
+    new("确定性端点聚类与字段传播", "analysis-only", Sync(VerifyTrafficAnalysis)),
+    new("静默抓包报文解析、TCP 重组与 TLS 识别", "silent-only", async () =>
+    {
+        await VerifySilentCapture();
+        VerifyCaptureBrowserPlan(Path.Combine(Path.GetTempPath(), "netmind-smoke-browser-" + Guid.NewGuid().ToString("N")));
+    }),
+    new("HTTP 转发、HTTPS 隧道与采集浏览器启动计划", "proxy-only", async () =>
+    {
+        var root = Path.Combine(Path.GetTempPath(), "netmind-proxy-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            await new WorkspaceStore(root).InitializeAsync("代理定向测试工作区");
+            await VerifyProxyAsync(root);
+            VerifyCaptureBrowserPlan(root);
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+    }),
+    new("站点可控证据参数绑定往返（引号/NUL/注入片段/中文/emoji）", "hostile-only", VerifyHostileEvidenceRoundTripAsync),
+    new("采集会话范围限定（每次开始采集从空列表起步）", "scope-only", VerifyCaptureSessionScopeAsync),
+    new("并发审计追加（一条不丢、一行不坏）", "audit-only", VerifyConcurrentAuditAppendAsync),
+    new("AI 证据编排（折叠无损、地图有界、关联就地计算）", "ai-orchestration-only", Sync(VerifyAiEvidenceOrchestration)),
+    new("AI 对话式网关、取数回环、会话持久化与提示词目录", "ai-only", async () =>
+    {
+        await VerifyAiGatewayAsync();
+        await VerifyAiFullContextAsync();
+        await VerifyAiPromptCatalogAsync();
+    }),
+    new("AI 分析历史持久化、隔离、恢复与删除", "ai-history-only", VerifyAiAnalysisHistoryAsync),
+    new("清空记录", "clear-only", VerifyClearCaptureDataAsync),
+    new("勾选删除", "delete-only", VerifyDeleteTrafficAsync),
+    new("流量增量刷新游标", "refresh-only", VerifyIncrementalTrafficCursorAsync),
+    new("证据复制与 cURL 格式化", "copy-only", Sync(VerifyTrafficCopyFormatting)),
+    new("流量搜索布尔表达式与选择范围", "filter-only", Sync(() =>
+    {
+        VerifyTrafficFilterExpression();
+        VerifyTrafficSelectionScope();
+    })),
+    new("JSON 展示树解码、降级与复制隔离", "json-only", Sync(VerifyJsonPreview)),
+    new("记录组持久化、导出与历史事务恢复", "group-only", VerifyTrafficGroupsAsync),
+    new("工作区新建、切换、重命名与数据隔离", "workspace-only", VerifyWorkspaceCatalogAsync),
+    new("工作区保留策略、容量治理、备份与安全导入", "workspace-data-only", VerifyWorkspaceDataManagementAsync),
+    new("工作台设置存储", "settings-only", VerifyWorkbenchSettingsAsync),
+    new("系统代理快照序列化与哨兵原子读写", "sysproxy-only", VerifySystemProxySentinelAsync),
+    new("脚本钩子策略、信封契约、队列、配置与页内 Hook", "hooks-only", async () =>
+    {
+        await VerifyHooksAsync();
+        await VerifyPageHooksAsync();
+    }),
+    new("采集链路一键自检", "capture-health-only", VerifyCaptureHealthAsync),
+    new("HTTPS CONNECT、TLS 解密、正文持久化与 AI 脱敏", "tls-only", VerifyTlsInspectionAsync),
+    new("Windows Job Object 沙箱资源限制与真实 Python", "sandbox-only", VerifyWindowsSandboxAsync),
+    // 需要真实 Chromium，只能显式指定，不进默认全量运行。
+    new("真实 Chromium 页内 Hook 注入、上报与入库", "page-hook-live", VerifyLivePageHookBrowserAsync, InDefaultRun: false)
+};
+
+if (args.Contains("--list", StringComparer.OrdinalIgnoreCase))
+{
+    Console.WriteLine("可用冒烟套件（不带参数时运行标注“默认”的全部套件）：");
+    foreach (var item in suites)
+        Console.WriteLine($"  --{item.Tag,-24} {(item.InDefaultRun ? "默认" : "可选")}  {item.Name}");
     return 0;
 }
 
-if (args.Contains("--analysis-only", StringComparer.OrdinalIgnoreCase))
+// 未知开关必须报错：静默回退到默认全量会让人误以为定向验证已经跑过。
+var unknown = args.Where(argument => argument.StartsWith("--", StringComparison.Ordinal))
+    .Where(argument => !argument.Equals("--list", StringComparison.OrdinalIgnoreCase))
+    .Where(argument => !suites.Any(item => argument.Equals("--" + item.Tag, StringComparison.OrdinalIgnoreCase)))
+    .ToArray();
+if (unknown.Length > 0)
 {
-    VerifyTrafficAnalysis();
-    Console.WriteLine("确定性分析定向测试通过。");
-    return 0;
+    Console.Error.WriteLine($"未知参数：{string.Join(' ', unknown)}。用 --list 查看全部套件。");
+    return 2;
 }
 
-if (args.Contains("--proxy-only", StringComparer.OrdinalIgnoreCase))
+var requested = suites.Where(item => args.Contains("--" + item.Tag, StringComparer.OrdinalIgnoreCase)).ToArray();
+var selected = requested.Length > 0 ? requested : suites.Where(item => item.InDefaultRun).ToArray();
+Console.WriteLine($"NetMind 冒烟测试 · {(requested.Length > 0 ? "定向" : "默认全量")} {selected.Length} 个套件\n");
+
+var failedSuites = new List<(string Name, Exception Error)>();
+var wallClock = Stopwatch.StartNew();
+foreach (var item in selected)
 {
-    var proxyTestRoot = Path.Combine(Path.GetTempPath(), "netmind-proxy-test-" + Guid.NewGuid().ToString("N"));
+    var timer = Stopwatch.StartNew();
     try
     {
-        await new WorkspaceStore(proxyTestRoot).InitializeAsync("代理定向测试工作区");
-        await VerifyProxyAsync(proxyTestRoot);
-        VerifyCaptureBrowserPlan(proxyTestRoot);
-        Console.WriteLine("HTTP、HTTPS 隧道与采集浏览器定向测试通过。");
+        await item.Run();
+        timer.Stop();
+        Console.WriteLine($"  [通过] {item.Name}  ({item.Tag}, {timer.ElapsedMilliseconds:N0} ms)");
+    }
+    catch (Exception exception)
+    {
+        // 关键：单个套件失败不得中止整轮，否则一次只能暴露一个问题。
+        timer.Stop();
+        failedSuites.Add((item.Name, exception));
+        Console.WriteLine($"  [失败] {item.Name}  ({item.Tag}, {timer.ElapsedMilliseconds:N0} ms)");
+        Console.WriteLine($"         {exception.GetType().Name}：{exception.Message}");
+    }
+}
+wallClock.Stop();
+
+Console.WriteLine($"\n{selected.Length - failedSuites.Count} 通过 / {failedSuites.Count} 失败 · 合计 {wallClock.Elapsed.TotalSeconds:F1} 秒");
+if (failedSuites.Count == 0)
+{
+    Console.WriteLine(requested.Length > 0 ? "定向冒烟测试通过。" : "全部核心冒烟测试通过。");
+    return 0;
+}
+Console.WriteLine("\n失败详情：");
+foreach (var (name, error) in failedSuites)
+{
+    Console.WriteLine($"── {name}");
+    Console.WriteLine(error.ToString());
+}
+// 退出码为失败套件数（上限 100，避开 shell 退出码的 8 位语义）。
+return Math.Min(100, failedSuites.Count);
+
+/// <summary>把同步验证函数包装成注册表要求的异步签名。</summary>
+static Func<Task> Sync(Action body) => () => { body(); return Task.CompletedTask; };
+
+/// <summary>核心存储、脱敏、演示数据与 Python 静态策略；其余能力各自独立成套件。</summary>
+static async Task VerifyCoreStorageAndSandboxAsync()
+{
+    var testRoot = Path.Combine(Path.GetTempPath(), "netmind-smoke-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var store = new WorkspaceStore(testRoot);
+        await store.InitializeAsync("冒烟测试工作区");
+
+        var content = Encoding.UTF8.GetBytes("deterministic payload");
+        var firstHash = await store.StoreBlobAsync(content);
+        var secondHash = await store.StoreBlobAsync(content);
+        Require(firstHash == secondHash, "相同内容必须生成相同哈希");
+        Require(File.Exists(Path.Combine(testRoot, NetMindDefaults.BlobsDirectoryName, firstHash[..2], firstHash)), "Blob 文件必须按哈希持久化");
+
+        var redacted = WorkspaceStore.Redact("token=super-secret authorization=Bearer-value");
+        Require(!redacted.Contains("super-secret", StringComparison.Ordinal), "令牌必须脱敏");
+        Require(!redacted.Contains("Bearer-value", StringComparison.Ordinal), "授权信息必须脱敏");
+
+        var traffic = DemoData.CreateTraffic();
+        Require(traffic.Count >= 10, "演示流量必须覆盖主要协议场景");
+        Require(DemoData.CreateFinding(traffic.First(t => t.StatusCode >= 400)).Evidence.Count >= 3, "异常发现必须包含完整证据链");
+
+        using (var archive = new TrafficArchive(testRoot))
+        {
+            var sessionId = Guid.NewGuid();
+            await archive.StartSessionAsync(new CaptureSessionRecord(sessionId, DateTimeOffset.UtcNow, null, NetMindDefaults.SourceSimulated, "全部进程", NetMindDefaults.SessionStateRunning));
+            var item = traffic[0];
+            var stored = await archive.RecordAsync(sessionId, item, Encoding.UTF8.GetBytes(item.RequestSummary), Encoding.UTF8.GetBytes(item.ResponseSummary));
+            Require(stored.RequestBlobHash.Length == NetMindDefaults.Sha256HexLength, "正文哈希必须为 SHA-256");
+            Require(archive.GetTrafficCount() == 1, "SQLite 必须保存事务元数据");
+            var restored = archive.GetRecentTraffic(10).Single();
+            Require(restored.Traffic.Endpoint == item.Endpoint, "SQLite 查询必须还原端点");
+            Require(restored.RequestBlobHash == stored.RequestBlobHash, "SQLite 只能保存正文哈希引用");
+            await archive.CompleteSessionAsync(new CaptureSessionRecord(sessionId, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, NetMindDefaults.SourceSimulated, "全部进程", NetMindDefaults.SessionStateCompleted));
+        }
+
+        var rejected = PythonSandboxPolicy.Validate("import os\nopen('secret.txt')");
+        Require(rejected.Count == 2, "Python 静态策略必须拒绝文件和系统模块能力");
+        var accepted = PythonSandboxPolicy.Validate("from netmind import fixture\nprint(len(fixture.transactions))");
+        Require(accepted.Count == 0, "Python 静态策略必须允许只读样例分析");
+        var missingRuntime = await new PythonSandboxRunner().RunAsync(new SandboxJob(
+            "from netmind import fixture\nprint(len(fixture.transactions))",
+            JsonSerializer.SerializeToElement(new { transactions = Array.Empty<object>() }),
+            PythonPath: Path.Combine(testRoot, "不存在的-python.exe")));
+        Require(missingRuntime.State == "运行时不可用", "缺少 Python 时必须返回结构化中文状态");
     }
     finally
     {
-        if (Directory.Exists(proxyTestRoot)) Directory.Delete(proxyTestRoot, recursive: true);
+        if (Directory.Exists(testRoot)) Directory.Delete(testRoot, recursive: true);
     }
-    return 0;
 }
 
-if (args.Contains("--clear-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyClearCaptureDataAsync();
-    Console.WriteLine("清空记录定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--delete-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyDeleteTrafficAsync();
-    Console.WriteLine("勾选删除定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--hostile-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyHostileEvidenceRoundTripAsync();
-    Console.WriteLine("站点可控证据（引号、NUL、注入片段、中文与 emoji）参数绑定往返定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--scope-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyCaptureSessionScopeAsync();
-    Console.WriteLine("采集会话范围限定（每次开始采集从空列表起步）定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--ai-orchestration-only", StringComparer.OrdinalIgnoreCase))
-{
-    VerifyAiEvidenceOrchestration();
-    Console.WriteLine("AI 证据编排（摘要折叠无损、证据地图有界、单序号关联就地计算）定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--copy-only", StringComparer.OrdinalIgnoreCase))
-{
-    VerifyTrafficCopyFormatting();
-    Console.WriteLine("证据复制与 cURL 格式化定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--filter-only", StringComparer.OrdinalIgnoreCase))
-{
-    VerifyTrafficFilterExpression();
-    VerifyTrafficSelectionScope();
-    Console.WriteLine("流量搜索布尔表达式定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--json-only", StringComparer.OrdinalIgnoreCase))
-{
-    VerifyJsonPreview();
-    Console.WriteLine("JSON 展示树解码、降级与复制隔离定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--ai-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyAiGatewayAsync();
-    await VerifyAiFullContextAsync();
-    await VerifyAiPromptCatalogAsync();
-    Console.WriteLine("AI 对话式网关、取数回环、会话持久化、完整上下文与提示词目录定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--group-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyTrafficGroupsAsync();
-    Console.WriteLine("记录组持久化与历史事务恢复定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--workspace-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyWorkspaceCatalogAsync();
-    Console.WriteLine("工作区新建、切换、重命名与数据隔离定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--workspace-data-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyWorkspaceDataManagementAsync();
-    Console.WriteLine("工作区保留策略、容量治理、备份与安全导入定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--refresh-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyIncrementalTrafficCursorAsync();
-    Console.WriteLine("流量增量刷新游标定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--ai-history-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyAiAnalysisHistoryAsync();
-    Console.WriteLine("AI 分析历史持久化、隔离、恢复与删除定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--settings-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyWorkbenchSettingsAsync();
-    Console.WriteLine("工作台设置存储定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--sysproxy-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifySystemProxySentinelAsync();
-    Console.WriteLine("系统代理快照序列化与哨兵原子读写定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--hooks-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyHooksAsync();
-    await VerifyPageHooksAsync();
-    Console.WriteLine("脚本钩子系统策略、信封契约、队列、配置、直通代理与页内 Hook 定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--page-hook-live", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyLivePageHookBrowserAsync();
-    Console.WriteLine("真实 Chromium 页内 Hook 注入、上报与入库定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--capture-health-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyCaptureHealthAsync();
-    Console.WriteLine("采集链路一键自检定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--tls-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyTlsInspectionAsync();
-    Console.WriteLine("HTTPS CONNECT、TLS 解密、正文持久化与 AI 脱敏定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--sandbox-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifyWindowsSandboxAsync();
-    Console.WriteLine("Windows Job Object 沙箱资源限制与真实 Python 定向测试通过。");
-    return 0;
-}
-
-if (args.Contains("--silent-only", StringComparer.OrdinalIgnoreCase))
-{
-    await VerifySilentCapture();
-    VerifyCaptureBrowserPlan(Path.Combine(Path.GetTempPath(), "netmind-smoke-browser-" + Guid.NewGuid().ToString("N")));
-    Console.WriteLine("静默抓包报文解析、TCP 重组、HTTP 配对与 TLS 识别定向测试通过。");
-    return 0;
-}
 
 static async Task VerifyCaptureHealthAsync()
 {
@@ -1097,70 +1088,61 @@ static void VerifyCaptureBrowserPlan(string testRoot)
         "静默抓包浏览器不得连接不存在的显式代理端口");
 }
 
-var testRoot = Path.Combine(Path.GetTempPath(), "netmind-smoke-" + Guid.NewGuid().ToString("N"));
-try
-{
-    var store = new WorkspaceStore(testRoot);
-    await store.InitializeAsync("冒烟测试工作区");
-
-    var content = Encoding.UTF8.GetBytes("deterministic payload");
-    var firstHash = await store.StoreBlobAsync(content);
-    var secondHash = await store.StoreBlobAsync(content);
-    Require(firstHash == secondHash, "相同内容必须生成相同哈希");
-    Require(File.Exists(Path.Combine(testRoot, NetMindDefaults.BlobsDirectoryName, firstHash[..2], firstHash)), "Blob 文件必须按哈希持久化");
-
-    var redacted = WorkspaceStore.Redact("token=super-secret authorization=Bearer-value");
-    Require(!redacted.Contains("super-secret", StringComparison.Ordinal), "令牌必须脱敏");
-    Require(!redacted.Contains("Bearer-value", StringComparison.Ordinal), "授权信息必须脱敏");
-
-    var traffic = DemoData.CreateTraffic();
-    Require(traffic.Count >= 10, "演示流量必须覆盖主要协议场景");
-    Require(DemoData.CreateFinding(traffic.First(t => t.StatusCode >= 400)).Evidence.Count >= 3, "异常发现必须包含完整证据链");
-    VerifyProtocolParsers();
-    VerifyTrafficAnalysis();
-    await VerifySilentCapture();
-    await VerifyHostileEvidenceRoundTripAsync();
-    await VerifyCaptureSessionScopeAsync();
-    VerifyAiEvidenceOrchestration();
-
-    using (var archive = new TrafficArchive(testRoot))
-    {
-        var sessionId = Guid.NewGuid();
-        await archive.StartSessionAsync(new CaptureSessionRecord(sessionId, DateTimeOffset.UtcNow, null, NetMindDefaults.SourceSimulated, "全部进程", NetMindDefaults.SessionStateRunning));
-        var item = traffic[0];
-        var stored = await archive.RecordAsync(sessionId, item, Encoding.UTF8.GetBytes(item.RequestSummary), Encoding.UTF8.GetBytes(item.ResponseSummary));
-        Require(stored.RequestBlobHash.Length == NetMindDefaults.Sha256HexLength, "正文哈希必须为 SHA-256");
-        Require(archive.GetTrafficCount() == 1, "SQLite 必须保存事务元数据");
-        var restored = archive.GetRecentTraffic(10).Single();
-        Require(restored.Traffic.Endpoint == item.Endpoint, "SQLite 查询必须还原端点");
-        Require(restored.RequestBlobHash == stored.RequestBlobHash, "SQLite 只能保存正文哈希引用");
-        await archive.CompleteSessionAsync(new CaptureSessionRecord(sessionId, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, NetMindDefaults.SourceSimulated, "全部进程", NetMindDefaults.SessionStateCompleted));
-    }
-
-    await VerifyProxyAsync(testRoot);
-    await VerifyHooksAsync();
-
-    var rejected = PythonSandboxPolicy.Validate("import os\nopen('secret.txt')");
-    Require(rejected.Count == 2, "Python 静态策略必须拒绝文件和系统模块能力");
-    var accepted = PythonSandboxPolicy.Validate("from netmind import fixture\nprint(len(fixture.transactions))");
-    Require(accepted.Count == 0, "Python 静态策略必须允许只读样例分析");
-    var missingRuntime = await new PythonSandboxRunner().RunAsync(new SandboxJob(
-        "from netmind import fixture\nprint(len(fixture.transactions))",
-        JsonSerializer.SerializeToElement(new { transactions = Array.Empty<object>() }),
-        PythonPath: Path.Combine(testRoot, "不存在的-python.exe")));
-    Require(missingRuntime.State == "运行时不可用", "缺少 Python 时必须返回结构化中文状态");
-
-    Console.WriteLine("全部核心冒烟测试通过。");
-    return 0;
-}
-finally
-{
-    if (Directory.Exists(testRoot)) Directory.Delete(testRoot, recursive: true);
-}
-
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+/// <summary>
+/// 审计写入方本身是并发的：CoreHost 代理每条事务写一次 traffic.recorded，多个连接同时结算，
+/// 工作台还会就同一工作区写用户操作审计。并发追加必须一条不丢、一行不坏。
+/// 回归背景：原实现用 File.AppendAllTextAsync（FileShare.Read），实测 8 路并发 1,200 条只落盘 508 条。
+/// </summary>
+static async Task VerifyConcurrentAuditAppendAsync()
+{
+    const int workers = 8;
+    const int perWorker = 150;
+    var testRoot = Path.Combine(Path.GetTempPath(), "netmind-audit-test-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var store = new WorkspaceStore(testRoot);
+        await store.InitializeAsync("并发审计测试工作区");
+
+        var failures = 0;
+        await Task.WhenAll(Enumerable.Range(0, workers).Select(worker => Task.Run(async () =>
+        {
+            // 各处代码都是就地 new WorkspaceStore(path)，这里照此模拟，确保串行化不依赖共享实例。
+            var local = new WorkspaceStore(testRoot);
+            for (var index = 0; index < perWorker; index++)
+            {
+                try { await local.AppendAuditAsync("concurrent.probe", new { worker, index, note = "token=abc123secret" }); }
+                catch (IOException) { Interlocked.Increment(ref failures); }
+            }
+        })));
+
+        Require(failures == 0, $"并发审计写入不得抛 IOException，实际 {failures} 次");
+
+        var logPath = Path.Combine(testRoot, NetMindDefaults.LogsDirectoryName, NetMindDefaults.AuditLogFileName);
+        var lines = await File.ReadAllLinesAsync(logPath);
+        var probes = lines.Count(line => line.Contains("\"eventName\":\"concurrent.probe\"", StringComparison.Ordinal));
+        Require(probes == workers * perWorker,
+            $"并发写入的审计条目一条都不能丢：应有 {workers * perWorker} 条，实际 {probes} 条");
+        Require(lines.All(line => line.Length == 0 || (line.StartsWith('{') && line.EndsWith('}'))),
+            "并发追加不得写出结构损坏的审计行");
+        foreach (var line in lines.Where(line => line.Length > 0))
+        {
+            using var document = JsonDocument.Parse(line);
+            Require(document.RootElement.TryGetProperty("eventName", out _), "每条审计都必须带 eventName");
+        }
+        // 串行化不得绕开脱敏通道：载荷里的 token=值 必须已被替换。
+        var joined = string.Join('\n', lines);
+        Require(!joined.Contains("abc123secret", StringComparison.Ordinal), "审计载荷中的令牌必须已脱敏");
+        Require(joined.Contains(NetMindDefaults.RedactedPlaceholder, StringComparison.Ordinal), "审计仍必须经过脱敏通道");
+    }
+    finally
+    {
+        if (Directory.Exists(testRoot)) Directory.Delete(testRoot, recursive: true);
+    }
 }
 
 /// <summary>
@@ -3801,6 +3783,12 @@ static async Task VerifyLivePageHookBrowserAsync()
         if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
     }
 }
+
+/// <summary>
+/// 一个冒烟套件：名称、定向开关标签、执行体，以及是否进入默认全量运行。
+/// 需要外部依赖（真实浏览器等）的套件设 InDefaultRun=false，只能显式指定。
+/// </summary>
+sealed record SmokeSuite(string Name, string Tag, Func<Task> Run, bool InDefaultRun = true);
 
 /// <summary>冒烟测试用引擎释放器：无论断言成败都优雅关停引擎。</summary>
 sealed class ScriptHookEngineDisposer : IDisposable

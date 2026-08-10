@@ -497,6 +497,12 @@ public static class NetMindDefaults
 
     // ── 宿主布局（工作台设置目录与沙箱宿主相对布局） ─────────────────────────
 
+    /// <summary>
+    /// 审计日志写入锁的等待上限。串行化只覆盖一次「打开-追加-关闭」，正常情况是亚毫秒级；
+    /// 取 5 秒是给磁盘卡顿和跨进程排队留余量，超时宁可显式抛错也不静默丢审计。
+    /// </summary>
+    public const int AuditAppendLockTimeoutMilliseconds = 5000;
+
     /// <summary>工作台用户设置目录名（%LocalAppData% 下，settings.json、哨兵与工作区根所在目录）。</summary>
     public const string SettingsDirectoryName = "NetMind";
 
