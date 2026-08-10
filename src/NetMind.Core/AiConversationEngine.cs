@@ -72,13 +72,17 @@ public sealed class AiConversationEngine(AiGatewayClient gateway)
     /// <summary>八个只读工具：本地证据地图、关联/比较、事务概览、正文片段、搜索、页内 Hook 与证据文件。</summary>
     public static IReadOnlyList<AiToolSchema> BuildToolSchemas() =>
     [
-        new("get_evidence_overview", "获取本地规则预整理的证据地图：归一化端点组（含代表序号、组内条数与序号范围）、错误/慢请求/重复请求候选，以及全局最强的关联候选。返回结果有条数上限并会写明省略数量；需要某个序号的完整关联请用 get_related_transactions。该结果用于规划取证，不能替代原始事务。",
+        new("get_evidence_overview", "获取本地规则预整理的证据地图：归一化端点组（含代表序号、组内条数与序号范围）、错误/慢请求/重复请求候选，以及全局最强的关联候选。返回结果有条数上限并会写明省略数量；需要某个序号的完整关联请用 get_related_transactions。该结果用于规划取证，不能替代原始事务。" +
+            AiJsonFieldLegend.EndpointGroup + AiJsonFieldLegend.Anomaly + AiJsonFieldLegend.Relation,
             JsonDocument.Parse("""{"type":"object","properties":{},"additionalProperties":false}""").RootElement.Clone()),
-        new("get_related_transactions", "就地计算与指定 #序号 相关的事务候选（覆盖该序号前后的完整时间邻域，不受证据地图的条数上限影响）。只使用同端点与时间邻近等结构信号，不把同站点普遍相同的请求头当作关联；必须再取原始事务确认因果关系。",
+        new("get_related_transactions", "就地计算与指定 #序号 相关的事务候选（覆盖该序号前后的完整时间邻域，不受证据地图的条数上限影响）。只使用同端点与时间邻近等结构信号，不把同站点普遍相同的请求头当作关联；必须再取原始事务确认因果关系。" +
+            AiJsonFieldLegend.Relation,
             JsonDocument.Parse("""{"type":"object","properties":{"ordinal":{"type":"integer","description":"中心事务的 #序号（从 1 起）"},"limit":{"type":"integer","description":"最多返回的关联候选，默认 12"}},"required":["ordinal"],"additionalProperties":false}""").RootElement.Clone()),
-        new("compare_transactions", "本地比较一组事务的端点、状态、延迟、查询参数、请求头和 Cookie 字段，标记固定值、变化值、UUID、时间戳或高熵候选。正文结构仍需 get_transactions 核对。",
+        new("compare_transactions", "本地比较一组事务的端点、状态、延迟、查询参数、请求头和 Cookie 字段，标记固定值、变化值、UUID、时间戳或高熵候选。正文结构仍需 get_transactions 核对。" +
+            AiJsonFieldLegend.ComparedField,
             JsonDocument.Parse("""{"type":"object","properties":{"ordinals":{"type":"array","items":{"type":"integer"},"description":"要比较的 #序号列表，建议选择同一端点的成功/失败/异常样本"}},"required":["ordinals"],"additionalProperties":false}""").RootElement.Clone()),
-        new("get_transactions", "按序号获取事务元数据、请求头、响应头及有界正文预览。ordinals 为证据池摘要中的 #序号数组（从 1 起），单次最多 " + NetMindDefaults.AiToolMaximumOrdinalsPerFetch + " 个；长正文请用 get_transaction_body_excerpt 按关键词读取片段。",
+        new("get_transactions", "按序号获取事务元数据、请求头、响应头及有界正文预览。ordinals 为证据池摘要中的 #序号数组（从 1 起），单次最多 " + NetMindDefaults.AiToolMaximumOrdinalsPerFetch + " 个；长正文请用 get_transaction_body_excerpt 按关键词读取片段。" +
+            AiJsonFieldLegend.Transaction,
             JsonDocument.Parse("""{"type":"object","properties":{"ordinals":{"type":"array","items":{"type":"integer"},"description":"要获取完整数据的事务序号列表（从 1 起）"}},"required":["ordinals"],"additionalProperties":false}""").RootElement.Clone()),
         new("get_transaction_body_excerpt", "读取单条事务请求或响应正文的有界片段。优先提供 keyword 返回命中附近上下文，避免把整个大型 HTML/JS/JSON 放入模型。",
             JsonDocument.Parse("""{"type":"object","properties":{"ordinal":{"type":"integer","description":"事务 #序号（从 1 起）"},"direction":{"type":"string","enum":["request","response"],"description":"读取请求或响应正文"},"keyword":{"type":"string","description":"可选；返回首次命中附近上下文"},"max_characters":{"type":"integer","minimum":512,"maximum":24000,"description":"最多返回字符数，默认 6000"}},"required":["ordinal","direction"],"additionalProperties":false}""").RootElement.Clone()),

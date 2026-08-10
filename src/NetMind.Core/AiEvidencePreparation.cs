@@ -23,18 +23,25 @@ public sealed record AiEndpointGroup(
     IReadOnlyList<int> RepresentativeOrdinals,
     IReadOnlyList<int> Ordinals);
 
-public sealed record AiEvidenceAnomaly(string Kind, int Ordinal, string Description);
+/// <summary>异常候选。字段名缩写，见 <see cref="AiJsonFieldLegend.Anomaly"/>。</summary>
+public sealed record AiEvidenceAnomaly(
+    [property: JsonPropertyName("k")] string Kind,
+    [property: JsonPropertyName("o")] int Ordinal,
+    [property: JsonPropertyName("d")] string Description);
 
-/// <summary>端点组的有界摘要：只带代表序号与序号范围，不逐一列出组内全部序号。</summary>
+/// <summary>
+/// 端点组的有界摘要：只带代表序号与序号范围，不逐一列出组内全部序号。
+/// 字段名缩写，见 <see cref="AiJsonFieldLegend.EndpointGroup"/>。
+/// </summary>
 public sealed record AiEndpointGroupDigest(
-    string Key,
-    int RequestCount,
-    int ErrorCount,
-    int MedianLatencyMs,
-    int P95LatencyMs,
-    IReadOnlyList<int> RepresentativeOrdinals,
-    int OrdinalCount,
-    string OrdinalRange);
+    [property: JsonPropertyName("k")] string Key,
+    [property: JsonPropertyName("n")] int RequestCount,
+    [property: JsonPropertyName("err")] int ErrorCount,
+    [property: JsonPropertyName("p50")] int MedianLatencyMs,
+    [property: JsonPropertyName("p95")] int P95LatencyMs,
+    [property: JsonPropertyName("rep")] IReadOnlyList<int> RepresentativeOrdinals,
+    [property: JsonPropertyName("cnt")] int OrdinalCount,
+    [property: JsonPropertyName("rng")] string OrdinalRange);
 
 /// <summary>发给模型的证据地图投影；省略数量显式给出，不静默截断。</summary>
 public sealed record AiEvidenceOverviewProjection(
@@ -47,11 +54,12 @@ public sealed record AiEvidenceOverviewProjection(
     int OmittedRelations,
     string Note);
 
+/// <summary>关联候选。单次可返回数十条，字段名缩写，见 <see cref="AiJsonFieldLegend.Relation"/>。</summary>
 public sealed record AiEvidenceRelation(
-    int FromOrdinal,
-    int ToOrdinal,
-    int Score,
-    IReadOnlyList<string> Reasons);
+    [property: JsonPropertyName("f")] int FromOrdinal,
+    [property: JsonPropertyName("t")] int ToOrdinal,
+    [property: JsonPropertyName("s")] int Score,
+    [property: JsonPropertyName("r")] IReadOnlyList<string> Reasons);
 
 public sealed record AiTransactionComparison(
     IReadOnlyList<int> Ordinals,
@@ -63,7 +71,39 @@ public sealed record AiTransactionComparison(
     IReadOnlyList<AiComparedField> Fields,
     string Note);
 
-public sealed record AiComparedField(string Location, string Name, string Classification, int PresentCount, int DistinctCount);
+/// <summary>比较结果的单个字段。一次比较可产出上百条，字段名缩写，见 <see cref="AiJsonFieldLegend.ComparedField"/>。</summary>
+public sealed record AiComparedField(
+    [property: JsonPropertyName("l")] string Location,
+    [property: JsonPropertyName("n")] string Name,
+    [property: JsonPropertyName("c")] string Classification,
+    [property: JsonPropertyName("p")] int PresentCount,
+    [property: JsonPropertyName("d")] int DistinctCount);
+
+/// <summary>
+/// 发给模型的 JSON 字段缩写图例。
+///
+/// 只压缩会重复出现的元素（事务、关联、异常、端点组、比较字段）——它们在单次工具结果里
+/// 出现几十上百次，长字段名按次计费；容器层的单例字段（总数、省略数、说明）保持可读全名，
+/// 压了省不下几个字节，却平白增加模型的理解成本。
+///
+/// 图例随工具说明发送，每次请求只有一份；改动上面任何 JsonPropertyName 都必须同步这里，
+/// 否则模型会拿着过期的对照表解析结果。<c>--ai-orchestration-only</c> 有一致性断言兜底。
+/// </summary>
+public static class AiJsonFieldLegend
+{
+    public const string Transaction =
+        "事务字段：m=方法 u=URL ep=端点 st=状态码 ms=延迟毫秒 sz=字节数 pr=协议 ps=进程 cm=采集模式 " +
+        "qs=查询参数 rqh=请求头 ck=Cookie rsh=响应头 rqb=请求正文 rqt=请求正文是否截断 rsb=响应正文 rst=响应正文是否截断。";
+
+    public const string EndpointGroup =
+        "端点组字段：k=端点键 n=请求数 err=错误数 p50=延迟中位数 p95=延迟P95 rep=代表序号 cnt=组内条数 rng=序号范围。";
+
+    public const string Anomaly = "异常字段：k=类型 o=序号 d=说明。";
+
+    public const string Relation = "关联字段：f=起始序号 t=目标序号 s=分数 r=依据。";
+
+    public const string ComparedField = "比较字段：l=位置 n=字段名 c=分类 p=出现次数 d=不同取值数。";
+}
 
 /// <summary>
 /// AI 证据编排的本地规则层：稳定序号、端点归一化、代表样本、异常检测和事务关联评分。

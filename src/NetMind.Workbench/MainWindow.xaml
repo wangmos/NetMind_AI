@@ -761,13 +761,46 @@
                 <TabItem Header="设置">
                     <Grid Margin="26,22,26,24">
                         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
-                        <StackPanel Margin="0,0,0,18"><TextBlock Text="偏好与运行参数设置" FontSize="24" FontWeight="SemiBold" /><TextBlock Text="这里只保留会改变采集行为与隐私边界的选项；性能与取数预算由系统统一管理。" Foreground="{StaticResource MutedBrush}" Margin="0,6,0,0" /></StackPanel>
+                        <StackPanel Margin="0,0,0,18"><TextBlock Text="偏好与运行参数设置" FontSize="24" FontWeight="SemiBold" /><TextBlock Text="采集行为、隐私边界，以及列表与 AI 证据的条数上限；取数预算与单条正文上限仍由系统统一管理。" Foreground="{StaticResource MutedBrush}" Margin="0,6,0,0" /></StackPanel>
                         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                             <Border Style="{StaticResource Card}" Padding="20" VerticalAlignment="Top">
                                 <StackPanel>
                                     <TextBlock Text="采集与监听" FontSize="15" FontWeight="SemiBold" />
                                     <Border Background="{StaticResource RaisedBrush}" CornerRadius="6" Padding="14" Margin="0,12,0,0">
                                         <StackPanel><TextBlock Text="监听端口" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,0,0,5" /><TextBox x:Name="SettingsListenPortBox" Width="220" HorizontalAlignment="Left" AutomationProperties.Name="监听端口" ToolTip="回环代理监听端口，范围 1024–65535，默认 8877；监听地址固定为本机回环" /><TextBlock Text="范围 1024–65535，默认 8877；监听地址固定为本机回环（127.0.0.1），代理不提供对外监听。" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,6,0,0" TextWrapping="Wrap" /></StackPanel>
+                                    </Border>
+                                    <TextBlock Text="列表与证据条数" FontSize="15" FontWeight="SemiBold" Margin="0,20,0,0" />
+                                    <Border Background="{StaticResource RaisedBrush}" CornerRadius="6" Padding="14" Margin="0,12,0,0">
+                                        <StackPanel>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="16" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                                <StackPanel Grid.Column="0">
+                                                    <TextBlock Text="流量列表条数" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,0,0,5" />
+                                                    <TextBox x:Name="SettingsTrafficWindowBox" AutomationProperties.Name="流量列表条数" ToolTip="每轮从工作区读取并渲染的最近事务条数，范围 50–2000，默认 200" />
+                                                </StackPanel>
+                                                <StackPanel Grid.Column="2">
+                                                    <TextBlock Text="AI 证据条数上限" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,0,0,5" />
+                                                    <TextBox x:Name="SettingsAiEvidenceBox" AutomationProperties.Name="AI 证据条数上限" ToolTip="单次分析最多纳入证据池的事务条数，范围 1–1000，默认 200" />
+                                                </StackPanel>
+                                            </Grid>
+                                            <Grid Margin="0,12,0,0">
+                                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="16" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                                <StackPanel Grid.Column="0">
+                                                    <TextBlock Text="页内 Hook 列表条数" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,0,0,5" />
+                                                    <TextBox x:Name="SettingsPageHookWindowBox" AutomationProperties.Name="页内 Hook 列表条数" ToolTip="页内 Hook 列表一次读取的事件条数，范围 50–1000，默认 500" />
+                                                </StackPanel>
+                                                <StackPanel Grid.Column="2">
+                                                    <TextBlock Text="会话列表条数" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,0,0,5" />
+                                                    <TextBox x:Name="SettingsSessionWindowBox" AutomationProperties.Name="会话列表条数" ToolTip="工作区页展示的最近采集会话条数，范围 10–500，默认 100" />
+                                                </StackPanel>
+                                            </Grid>
+                                            <StackPanel Margin="0,12,0,0">
+                                                <TextBlock Text="列表刷新间隔（毫秒）" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,0,0,5" />
+                                                <TextBox x:Name="SettingsRefreshIntervalBox" Width="220" HorizontalAlignment="Left" AutomationProperties.Name="列表刷新间隔" ToolTip="采集期间流量列表的增量刷新间隔，范围 500–30000 毫秒，默认 1500" />
+                                            </StackPanel>
+                                            <TextBlock Text="条数越大，单轮读取与界面渲染成本越高；AI 证据条数还会直接影响首轮发送给模型的摘要体积与令牌消耗。修改后立即生效并保存。" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,10,0,0" TextWrapping="Wrap" />
+                                            <TextBlock x:Name="SettingsCountsStatusText" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,6,0,0" TextWrapping="Wrap" />
+                                        </StackPanel>
                                     </Border>
                                     <TextBlock Text="采集方式" FontSize="15" FontWeight="SemiBold" Margin="0,20,0,0" />
                                     <Border Background="{StaticResource RaisedBrush}" CornerRadius="6" Padding="14" Margin="0,12,0,0">

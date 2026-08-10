@@ -637,20 +637,34 @@ static async Task VerifyWorkbenchSettingsAsync()
         await store.SaveAsync(custom);
         Require(!Directory.EnumerateFiles(settingsRoot).Any(file => file.Contains(".tmp-", StringComparison.Ordinal)), "原子写不得残留临时文件");
         Require((await store.LoadAsync()).Equals(custom), "设置保存后必须可完整往返读取");
+        // V3 起这些条数由用户配置，必须持久化；此前是系统托管、写入时丢弃。
         var compactJson = await File.ReadAllTextAsync(settingsPath);
-        Require(!compactJson.Contains("refreshIntervalMilliseconds", StringComparison.OrdinalIgnoreCase) &&
-                !compactJson.Contains("trafficWindowCount", StringComparison.OrdinalIgnoreCase) &&
-                !compactJson.Contains("sessionWindowCount", StringComparison.OrdinalIgnoreCase) &&
-                !compactJson.Contains("aiEvidenceMaximumTransactions", StringComparison.OrdinalIgnoreCase),
-            "V2 设置文件不应继续持久化系统托管的性能参数");
+        Require(compactJson.Contains("refreshIntervalMilliseconds", StringComparison.OrdinalIgnoreCase) &&
+                compactJson.Contains("trafficWindowCount", StringComparison.OrdinalIgnoreCase) &&
+                compactJson.Contains("sessionWindowCount", StringComparison.OrdinalIgnoreCase) &&
+                compactJson.Contains("pageHookWindowCount", StringComparison.OrdinalIgnoreCase) &&
+                compactJson.Contains("aiEvidenceMaximumTransactions", StringComparison.OrdinalIgnoreCase),
+            "V3 设置文件必须持久化用户可配置的刷新间隔与各列表/证据条数");
 
-        var legacyTuning = new WorkbenchSettings(RefreshIntervalMilliseconds: 800, TrafficWindowCount: 300,
-            SessionWindowCount: 60, AiEvidenceMaximumTransactions: 50).Validate();
-        Require(legacyTuning.RefreshIntervalMilliseconds == NetMindDefaults.DefaultRefreshIntervalMilliseconds &&
-                legacyTuning.TrafficWindowCount == NetMindDefaults.DefaultTrafficWindowCount &&
-                legacyTuning.SessionWindowCount == NetMindDefaults.DefaultSessionWindowCount &&
-                legacyTuning.AiEvidenceMaximumTransactions == NetMindDefaults.DefaultAiEvidenceMaximumTransactions,
-            "旧版性能参数必须归一化为系统托管值");
+        var tuned = new WorkbenchSettings(RefreshIntervalMilliseconds: 800, TrafficWindowCount: 300,
+            SessionWindowCount: 60, AiEvidenceMaximumTransactions: 50, PageHookWindowCount: 120,
+            WorkspaceRootPath: workspaceRoot);
+        await store.SaveAsync(tuned);
+        var reloaded = await store.LoadAsync();
+        Require(reloaded.RefreshIntervalMilliseconds == 800 && reloaded.TrafficWindowCount == 300 &&
+                reloaded.SessionWindowCount == 60 && reloaded.AiEvidenceMaximumTransactions == 50 &&
+                reloaded.PageHookWindowCount == 120,
+            "用户配置的条数与刷新间隔必须原样往返，不得被回填为默认值");
+
+        // 旧版 V2 文件没有这些字段，读取时按记录默认值补齐而不是报错。
+        var legacyPath = Path.Combine(settingsRoot, "legacy-v2.json");
+        await File.WriteAllTextAsync(legacyPath,
+            """{"schemaVersion":2,"listenPort":8877,"systemProxyAutomation":false,"enableTrafficHooks":false,"useSilentCapture":false,"browserEnvironment":null,"workspaceRootPath":null}""");
+        var legacy = await new WorkbenchSettingsStore(legacyPath).LoadAsync();
+        Require(legacy.TrafficWindowCount == NetMindDefaults.DefaultTrafficWindowCount &&
+                legacy.PageHookWindowCount == NetMindDefaults.DefaultPageHookWindowCount &&
+                legacy.AiEvidenceMaximumTransactions == NetMindDefaults.DefaultAiEvidenceMaximumTransactions,
+            "V2 旧设置文件必须能加载，缺失的新字段按默认值补齐");
 
         Require(!defaults.UseSilentCapture, "静默抓包开关默认必须关闭（走回环代理模式）");
         await store.SaveAsync(custom with { UseSilentCapture = true });
@@ -668,7 +682,15 @@ static async Task VerifyWorkbenchSettingsAsync()
         {
             new WorkbenchSettings(ListenPort: 80),
             new WorkbenchSettings(ListenPort: 70000),
-            new WorkbenchSettings(WorkspaceRootPath: Path.GetPathRoot(settingsRoot))
+            new WorkbenchSettings(WorkspaceRootPath: Path.GetPathRoot(settingsRoot)),
+            // 条数越界必须显式报错，不能静默夹取——否则用户填了 5000 却按 2000 跑，会以为设置没生效。
+            new WorkbenchSettings(TrafficWindowCount: NetMindDefaults.MinimumTrafficWindowCount - 1),
+            new WorkbenchSettings(TrafficWindowCount: NetMindDefaults.MaximumTrafficWindowCount + 1),
+            new WorkbenchSettings(SessionWindowCount: NetMindDefaults.MaximumSessionWindowCount + 1),
+            new WorkbenchSettings(PageHookWindowCount: NetMindDefaults.MinimumPageHookWindowCount - 1),
+            new WorkbenchSettings(AiEvidenceMaximumTransactions: 0),
+            new WorkbenchSettings(AiEvidenceMaximumTransactions: NetMindDefaults.AiMaximumEvidenceTransactions + 1),
+            new WorkbenchSettings(RefreshIntervalMilliseconds: NetMindDefaults.MinimumRefreshIntervalMilliseconds - 1)
         })
         {
             var rejected = false;
@@ -1217,6 +1239,56 @@ static void VerifyAiEvidenceOrchestration()
             "关联结果必须都与被查询序号相关");
         Require(related.All(relation => relation.FromOrdinal < relation.ToOrdinal),
             "关联方向必须与时序一致（序号小的在前）");
+    }
+
+    // 字段缩写图例必须与实际序列化出来的字段名一致，否则模型拿着过期对照表解析结果。
+    {
+        var pool = BuildPool(24);
+        var prepared = AiEvidencePreparationEngine.Prepare(pool);
+
+        static IEnumerable<string> KeysOf(JsonElement element) =>
+            element.ValueKind == JsonValueKind.Object
+                ? element.EnumerateObject().Select(property => property.Name)
+                : element.ValueKind == JsonValueKind.Array && element.GetArrayLength() > 0
+                    ? KeysOf(element[0])
+                    : [];
+
+        static void RequireLegendCovers(string legend, IEnumerable<string> keys, string what)
+        {
+            foreach (var key in keys)
+                Require(Regex.IsMatch(legend, $@"(?:^|[ ：])({Regex.Escape(key)})="),
+                    $"{what} 的字段 “{key}” 未出现在缩写图例中；改字段名必须同步 AiJsonFieldLegend");
+        }
+
+        using var overviewDocument = JsonDocument.Parse(AiEvidencePreparationEngine.BuildOverviewJson(prepared));
+        RequireLegendCovers(AiJsonFieldLegend.EndpointGroup,
+            KeysOf(overviewDocument.RootElement.GetProperty("endpointGroups")), "端点组");
+        RequireLegendCovers(AiJsonFieldLegend.Anomaly,
+            KeysOf(overviewDocument.RootElement.GetProperty("anomalies")), "异常候选");
+        RequireLegendCovers(AiJsonFieldLegend.Relation,
+            KeysOf(overviewDocument.RootElement.GetProperty("relations")), "关联候选");
+        // 容器层字段刻意保留可读全名：单例压缩省不了字节，只会增加理解成本。
+        Require(overviewDocument.RootElement.TryGetProperty("transactionCount", out _) &&
+                overviewDocument.RootElement.TryGetProperty("omittedRelations", out _),
+            "证据地图的容器层字段必须保持可读全名");
+
+        using var compareDocument = JsonDocument.Parse(
+            AiEvidencePreparationEngine.ToJson(AiEvidencePreparationEngine.Compare(pool, [1, 2, 3, 4])));
+        RequireLegendCovers(AiJsonFieldLegend.ComparedField,
+            KeysOf(compareDocument.RootElement.GetProperty("fields")), "比较字段");
+
+        using var relatedDocument = JsonDocument.Parse(
+            AiEvidencePreparationEngine.ToJson(AiEvidencePreparationEngine.GetRelated(pool, 12, 8)));
+        RequireLegendCovers(AiJsonFieldLegend.Relation, KeysOf(relatedDocument.RootElement), "单序号关联");
+
+        // 全部图例都必须随工具说明一起发出去，否则缩写就是无法解码的。
+        var toolText = string.Join('\n', AiConversationEngine.BuildToolSchemas().Select(tool => tool.Description));
+        foreach (var legend in new[]
+                 {
+                     AiJsonFieldLegend.Transaction, AiJsonFieldLegend.EndpointGroup,
+                     AiJsonFieldLegend.Anomaly, AiJsonFieldLegend.Relation, AiJsonFieldLegend.ComparedField
+                 })
+            Require(toolText.Contains(legend, StringComparison.Ordinal), "每份字段缩写图例都必须出现在工具说明中");
     }
 
     // 静态资源折叠必须真的省下体积，且明确标注折叠事实。

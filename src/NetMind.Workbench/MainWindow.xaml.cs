@@ -2730,10 +2730,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         try
         {
             var type = (PageHookTypeFilter.SelectedItem as ComboBoxItem)?.Tag as string;
+            // 与流量列表同一套会话范围：开始采集后只显示本次会话的页内 Hook，
+            // 否则新一轮采集会带出上一轮的调用记录。历史事件不删除，清除会话筛选即可看到全部。
+            var scope = _sessionFilterId;
+            var limit = _settings.PageHookWindowCount;
             _pageHookEvents = await Task.Run(() =>
             {
                 using var archive = new TrafficArchive(_workspacePath);
-                return archive.GetPageHooks(type, 500);
+                return scope is null
+                    ? archive.GetPageHooks(type, limit)
+                    : archive.GetPageHooksBySessions([scope.Value], type, limit);
             });
             ApplyPageHookFilter();
         }
@@ -3686,6 +3692,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         try
         {
             SettingsListenPortBox.Text = _settings.ListenPort.ToString();
+            SettingsTrafficWindowBox.Text = _settings.TrafficWindowCount.ToString();
+            SettingsSessionWindowBox.Text = _settings.SessionWindowCount.ToString();
+            SettingsPageHookWindowBox.Text = _settings.PageHookWindowCount.ToString();
+            SettingsAiEvidenceBox.Text = _settings.AiEvidenceMaximumTransactions.ToString();
+            SettingsRefreshIntervalBox.Text = _settings.RefreshIntervalMilliseconds.ToString();
             SettingsSystemProxyBox.IsChecked = _settings.SystemProxyAutomation;
             SettingsHooksBox.IsChecked = _settings.EnableTrafficHooks;
             SettingsSilentCaptureBox.IsChecked = _settings.UseSilentCapture;
@@ -3708,12 +3719,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (!int.TryParse(SettingsListenPortBox.Text.Trim(), out var listenPort))
             throw new InvalidOperationException("监听端口必须是整数。");
-        return new WorkbenchSettings(listenPort, NetMindDefaults.DefaultRefreshIntervalMilliseconds,
-            NetMindDefaults.DefaultTrafficWindowCount, NetMindDefaults.DefaultSessionWindowCount,
-            NetMindDefaults.DefaultAiEvidenceMaximumTransactions,
+        // 条数与间隔的范围校验在 WorkbenchSettings.Validate() 内统一完成，越界抛中文异常而非静默夹取。
+        return new WorkbenchSettings(listenPort,
+            ReadCountBox(SettingsRefreshIntervalBox, "列表刷新间隔"),
+            ReadCountBox(SettingsTrafficWindowBox, "流量列表条数"),
+            ReadCountBox(SettingsSessionWindowBox, "会话列表条数"),
+            ReadCountBox(SettingsAiEvidenceBox, "AI 证据条数上限"),
+            ReadCountBox(SettingsPageHookWindowBox, "页内 Hook 列表条数"),
             SettingsSystemProxyBox.IsChecked == true, SettingsHooksBox.IsChecked == true,
             SettingsSilentCaptureBox.IsChecked == true, null, ReadBrowserEnvironmentFromUi(), _workspaceRoot).Validate();
     }
+
+    private static int ReadCountBox(TextBox box, string label) =>
+        int.TryParse(box.Text.Trim(), out var value) ? value : throw new InvalidOperationException($"{label}必须是整数。");
 
     private BrowserEnvironmentProfile ReadBrowserEnvironmentFromUi()
     {
@@ -3842,18 +3860,30 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 settings.EnableTrafficHooks,
                 settings.UseSilentCapture,
                 browserEnvironmentEnabled = settings.BrowserEnvironment?.Enabled == true,
-                browserEnvironmentSummary = settings.BrowserEnvironment?.Summary
+                browserEnvironmentSummary = settings.BrowserEnvironment?.Summary,
+                settings.RefreshIntervalMilliseconds,
+                settings.TrafficWindowCount,
+                settings.SessionWindowCount,
+                settings.PageHookWindowCount,
+                settings.AiEvidenceMaximumTransactions
             });
             _settings = settings;
-            _captureTimer.Interval = TimeSpan.FromMilliseconds(NetMindDefaults.DefaultRefreshIntervalMilliseconds);
+            // 刷新间隔按用户配置生效，不再回落到默认常量。
+            _captureTimer.Interval = TimeSpan.FromMilliseconds(settings.RefreshIntervalMilliseconds);
             SettingsListenPortBox.IsEnabled = !_capturing;
             BrowserProfileSummaryText.Text = settings.BrowserEnvironment?.Summary ?? "使用浏览器原生环境";
             SettingsStatusText.Text = "设置已保存，监听端口和浏览器画像将在下次开始采集时生效";
             SettingsStatusText.Foreground = Green;
+            SettingsCountsStatusText.Text =
+                $"当前生效：流量 {settings.TrafficWindowCount} 条 · AI 证据上限 {settings.AiEvidenceMaximumTransactions} 条 · " +
+                $"页内 Hook {settings.PageHookWindowCount} 条 · 会话 {settings.SessionWindowCount} 条 · 刷新 {settings.RefreshIntervalMilliseconds} 毫秒";
+            SettingsCountsStatusText.Foreground = Green;
             UpdateModeText();
             UpdateAiSelectionUi();
             UpdateAiEvidencePreview();
             UpdateHookStatusLine();
+            // 条数改变会影响每轮读取范围，立即整窗重读一次，让新配置所见即所得。
+            await RefreshStoredTrafficAsync(force: true);
         }
         catch (Exception exception)
         {

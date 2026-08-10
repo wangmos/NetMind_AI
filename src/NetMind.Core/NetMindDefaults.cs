@@ -353,6 +353,24 @@ public static class NetMindDefaults
     /// <summary>流量列表默认窗口条数。</summary>
     public const int DefaultTrafficWindowCount = 200;
 
+    /// <summary>页内 Hook 列表默认窗口条数。</summary>
+    public const int DefaultPageHookWindowCount = 500;
+
+    // ── 用户可配置窗口/上限的取值范围 ────────────────────────────────────────
+    // 这些值直接决定每轮从 SQLite 读多少行、界面渲染多少行、以及发给模型多少条证据，
+    // 因此只做范围约束，不再由系统强制回填默认值——上界与 SQLite 查询层的 Clamp 保持一致。
+
+    public const int MinimumRefreshIntervalMilliseconds = 500;
+    public const int MaximumRefreshIntervalMilliseconds = 30_000;
+    public const int MinimumTrafficWindowCount = 50;
+    public const int MaximumTrafficWindowCount = 2000;
+    public const int MinimumSessionWindowCount = 10;
+    public const int MaximumSessionWindowCount = 500;
+    public const int MinimumPageHookWindowCount = 50;
+    public const int MaximumPageHookWindowCount = 1000;
+    /// <summary>AI 证据条数下限为 1；上限沿用 <see cref="AiMaximumEvidenceTransactions"/>。</summary>
+    public const int MinimumAiEvidenceMaximumTransactions = 1;
+
     /// <summary>采集浏览器优雅关闭等待时间（毫秒），超时后强制结束进程树。</summary>
     public const int CaptureBrowserCloseTimeoutMilliseconds = 3000;
 

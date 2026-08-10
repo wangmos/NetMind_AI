@@ -1,31 +1,36 @@
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace NetMind.Core;
 
 /// <summary>
 /// 单条事务进入 AI 上下文的完整原始投影：URL、查询参数、请求头、Cookie、响应头原样保留，
 /// 请求与响应正文以文本形式完整携带（二进制正文只保留有界十六进制预览）。不做任何脱敏。
+///
+/// JSON 字段名采用缩写：单次取数最多返回 8 条事务，长字段名会重复 8 遍，
+/// 而字段含义由工具说明里的一份图例一次性交代即可。缩写表见
+/// <see cref="AiJsonFieldLegend.Transaction"/>，改名时必须同步。
 /// </summary>
 public sealed record AiFullTransactionContext(
-    string Method,
-    string Url,
-    string Endpoint,
-    int StatusCode,
-    int LatencyMilliseconds,
-    long SizeBytes,
-    string Protocol,
-    string Process,
-    string CaptureMode,
-    string QueryParameters,
-    string RequestHeaders,
-    string Cookies,
-    string ResponseHeaders,
-    string RequestBody,
-    bool RequestBodyTruncated,
-    string ResponseBody,
-    bool ResponseBodyTruncated);
+    [property: JsonPropertyName("m")] string Method,
+    [property: JsonPropertyName("u")] string Url,
+    [property: JsonPropertyName("ep")] string Endpoint,
+    [property: JsonPropertyName("st")] int StatusCode,
+    [property: JsonPropertyName("ms")] int LatencyMilliseconds,
+    [property: JsonPropertyName("sz")] long SizeBytes,
+    [property: JsonPropertyName("pr")] string Protocol,
+    [property: JsonPropertyName("ps")] string Process,
+    [property: JsonPropertyName("cm")] string CaptureMode,
+    [property: JsonPropertyName("qs")] string QueryParameters,
+    [property: JsonPropertyName("rqh")] string RequestHeaders,
+    [property: JsonPropertyName("ck")] string Cookies,
+    [property: JsonPropertyName("rsh")] string ResponseHeaders,
+    [property: JsonPropertyName("rqb")] string RequestBody,
+    [property: JsonPropertyName("rqt")] bool RequestBodyTruncated,
+    [property: JsonPropertyName("rsb")] string ResponseBody,
+    [property: JsonPropertyName("rst")] bool ResponseBodyTruncated);
 
 /// <summary>
 /// AI 完整上下文构建器：把已持久化事务连同 Blob 正文组装为发送给模型的原始 JSON。
