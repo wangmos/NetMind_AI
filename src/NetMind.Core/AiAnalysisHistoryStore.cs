@@ -90,6 +90,8 @@ public sealed class AiAnalysisHistoryStore
                 Validate(item);
                 metadata.Add(item);
             }
+            // 单条历史损坏不阻断其余历史，但**跳过是静默的**：损坏项会直接从界面消失，
+            // 用户可能误以为数据已丢失。让损坏可见需要把跳过计数带回界面，属于独立改动。
             catch (JsonException) { }
             catch (InvalidDataException) { }
         }

@@ -67,7 +67,7 @@ HTTPS 解密必须保持默认关闭。每个工作区使用独立 CA，私钥�
 
 - `NetMind.Core` 不依赖 WPF，负责领域模型、工作区、内容寻址存储、脱敏审计、AI 完整上下文构建、静默抓包解析与演示数据。
 - `NetMind.CoreHost` 是独立进程，负责显式代理、静默抓包、会话生命周期和流量持久化；运行异常通过中文标准错误和非零退出码报告。
-- `NetMind.SandboxHost` 的 `run` 动词只接收暂存作业 JSON，执行静态能力检查，并在随机临时目录中以隔离参数启动 Python；Python 必须加入 kill-on-close 的 Windows Job Object，限制为单进程、有限内存、CPU 时间和墙钟时间。`hook-worker` 动词则拉起长驻钩子工作进程（只读观察、受控 store 持久化、不改写流量），契约见 `docs/scripting.md` 的请求钩子章节与 `docs/adr/ADR-008-hook-worker.md`。脚本验证的 fixture 契约、输出契约与资源限制见 `docs/scripting.md`。
+- `NetMind.SandboxHost` 的 `run` 动词只接收暂存作业 JSON，执行静态能力检查，并在随机临时目录中以隔离参数启动 Python；Python 必须加入 kill-on-close 的 Windows Job Object，限制为单进程、有限内存、CPU 时间和墙钟时间。`hook-worker` 动词则拉起长驻钩子工作进程（只读观察、受控 store 持久化、不改写流量），契约见 `docs/scripting.md` 的请求钩子章节。脚本验证的 fixture 契约、输出契约与资源限制见 `docs/scripting.md`。
 - `NetMind.Workbench` 负责中文桌面界面、交互状态与数据可视化。
 - `NetMind.SmokeTests` 以普通控制台程序验证核心安全不变量，避免引入外部测试包。
 

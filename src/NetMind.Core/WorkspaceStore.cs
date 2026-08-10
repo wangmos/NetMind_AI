@@ -258,11 +258,25 @@ public sealed partial class WorkspaceStore
                && parts[1].All(Uri.IsHexDigit);
     }
 
-    public static string Redact(string value) => SecretPattern().Replace(value, "$1=" + NetMindDefaults.RedactedPlaceholder);
+    /// <summary>
+    /// 审计日志与对外导出的稳定脱敏。只替换凭据本身，键名、引号与鉴权方案原样保留——
+    /// 「用的是 Bearer 还是 Basic」本身是有价值的证据，遮掉它并不会更安全。
+    ///
+    /// 之前的实现漏掉两类最常见的写法（均有定向断言兜底）：
+    ///   1. <c>Authorization: Bearer eyJ…</c>：值的匹配止于空白，结果只把 <c>Bearer</c> 当成值遮掉，
+    ///      真正的凭据留在明文里——而本工具的职责就是抓 HTTP 头，这是最要命的一种。
+    ///   2. <c>"token":"…"</c>：键名被引号包住，正则要求键后紧跟 <c>:</c> 或 <c>=</c>，整条不命中。
+    ///      审计载荷本身就是 JSON，等于对结构化载荷完全失效。
+    /// </summary>
+    public static string Redact(string value) => SecretPattern().Replace(value,
+        match => match.Groups["prefix"].Value + NetMindDefaults.RedactedPlaceholder);
 
     public static string RedactUrl(string value) => SensitiveQueryPattern().Replace(value, "$1" + NetMindDefaults.RedactedPlaceholder);
 
-    [GeneratedRegex("(?i)(authorization|token|api[_-]?key|secret)\\s*[:=]\\s*(?:\\[[^\\]\\r\\n]*\\]|[^,;\\s\\\"]+)")]
+    // prefix 捕获「键名 + 可选引号 + 分隔符 + 可选鉴权方案」，原样回写；其后的凭据整体替换。
+    // 凭据终止于 , ; " 空白 & } ] 与换行：& 与 } 是后补的，否则 token=abc&x=1 会把后续参数一起吞掉。
+    // 第一分支先匹配 [已脱敏] 形态，保证重复脱敏是幂等的。
+    [GeneratedRegex("""(?i)(?<prefix>"?(?:authorization|token|api[_-]?key|secret)"?\s*[:=]\s*"?(?:(?:bearer|basic|digest|jwt)\s+)?)(?:\[[^\]\r\n]*\]|[^,;\s"&}\]\r\n]+)""")]
     private static partial Regex SecretPattern();
 
     [GeneratedRegex("(?i)([?&][^?&=]*(?:token|key|secret|auth|session|cookie|password)[^?&=]*=)[^&#]*")]

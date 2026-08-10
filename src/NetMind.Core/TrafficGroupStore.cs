@@ -58,6 +58,8 @@ public sealed class TrafficGroupStore
                 var group = await JsonSerializer.DeserializeAsync<TrafficGroup>(stream, JsonOptions, cancellationToken);
                 if (group is not null) groups.Add(Validate(group));
             }
+            // 单个记录组损坏不阻断其余记录组，但**跳过是静默的**：损坏项会直接从界面消失，
+            // 用户可能误以为数据已丢失。让损坏可见需要把跳过计数带回界面，属于独立改动。
             catch (JsonException) { }
             catch (InvalidDataException) { }
         }

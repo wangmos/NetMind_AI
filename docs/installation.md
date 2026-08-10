@@ -130,7 +130,7 @@ $env:NETMIND_PYTHON = "C:\Python312\python.exe"
 
 工作台只会把脚本和脱敏样例暂存到随机临时目录，通过独立 SandboxHost 使用 `-X utf8 -I -B -S` 参数执行。系统模块、网络、文件打开、动态执行等能力会在启动前被静态策略拒绝；执行时间和输出大小均有上限。
 
-可选的“请求钩子”复用同一套 Python 发现与 SandboxHost 隔离宿主（`hook-worker` 动词拉起长驻工作进程）：未安装 Python 时钩子保持关闭，采集不受影响；已安装时在脚本页保存启用状态的当前工作区钩子配置即可，详见 `docs/scripting.md` 的请求钩子章节与 `docs/adr/ADR-008-hook-worker.md`。
+可选的“请求钩子”复用同一套 Python 发现与 SandboxHost 隔离宿主（`hook-worker` 动词拉起长驻工作进程）：未安装 Python 时钩子保持关闭，采集不受影响；已安装时在脚本页保存启用状态的当前工作区钩子配置即可，详见 `docs/scripting.md` 的请求钩子章节。
 
 ## 生成自包含发布包
 

@@ -158,6 +158,37 @@ static async Task VerifyCoreStorageAndSandboxAsync()
         Require(!redacted.Contains("super-secret", StringComparison.Ordinal), "令牌必须脱敏");
         Require(!redacted.Contains("Bearer-value", StringComparison.Ordinal), "授权信息必须脱敏");
 
+        // 回归：以下两类写法此前完全绕过脱敏通道，而它们恰恰是最常见的形态。
+        foreach (var (input, secret) in new[]
+                 {
+                     // Bearer/Basic：旧正则把方案名当成值遮掉，真正的凭据留在明文里。
+                     ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.LEAKED", "LEAKED"),
+                     ("authorization: Basic QWxhZGRpbjpMRUFLRUQ=", "QWxhZGRpbjpMRUFLRUQ="),
+                     // JSON 属性名带引号，旧正则要求键后紧跟 : 或 =，整条不命中；而审计载荷本身就是 JSON。
+                     ("""{"token":"tok_live_LEAKED"}""", "tok_live_LEAKED"),
+                     ("""{"api_key": "ak_LEAKED"}""", "ak_LEAKED"),
+                     ("""{"secret" : "s3cr3t_LEAKED"}""", "s3cr3t_LEAKED")
+                 })
+        {
+            var result = WorkspaceStore.Redact(input);
+            Require(!result.Contains(secret, StringComparison.Ordinal), $"脱敏必须覆盖该写法：{input}");
+            Require(result.Contains(NetMindDefaults.RedactedPlaceholder, StringComparison.Ordinal),
+                $"脱敏后必须留下占位符：{input}");
+        }
+
+        // 不得过度脱敏：只替换凭据本身，键名、鉴权方案与相邻字段必须原样保留。
+        Require(WorkspaceStore.Redact("token=abc&page=2&size=50").Contains("page=2&size=50", StringComparison.Ordinal),
+            "脱敏不得吞掉凭据之后的查询参数");
+        Require(WorkspaceStore.Redact("https://api.test/api_keys/list").Contains("api_keys/list", StringComparison.Ordinal),
+            "路径中出现 api_key 字样但无键值形态时不得脱敏");
+        Require(WorkspaceStore.Redact("Authorization: Bearer XYZ").Contains("Bearer", StringComparison.Ordinal),
+            "鉴权方案本身是有价值的证据，必须保留");
+        // JSON 载荷脱敏后必须仍是合法 JSON，否则审计与导出会带出结构损坏的内容。
+        using (JsonDocument.Parse(WorkspaceStore.Redact("""{"token":"tok_live_LEAKED","userId":1001}"""))) { }
+        // 幂等：重复脱敏不得反复吞掉占位符。
+        var onceRedacted = WorkspaceStore.Redact("Authorization: Bearer eyJLEAKED");
+        Require(onceRedacted == WorkspaceStore.Redact(onceRedacted), "重复脱敏必须幂等");
+
         var traffic = DemoData.CreateTraffic();
         Require(traffic.Count >= 10, "演示流量必须覆盖主要协议场景");
         Require(DemoData.CreateFinding(traffic.First(t => t.StatusCode >= 400)).Evidence.Count >= 3, "异常发现必须包含完整证据链");
@@ -3525,6 +3556,18 @@ static async Task VerifyPageHooksAsync()
     var script = PageHookScript.Build(4321);
     foreach (var marker in new[] { "XMLHttpRequest.prototype.open", "XMLHttpRequest.prototype.send", "ROOT.fetch", "crypto", "btoa", "atob", "setItem", "hook.installed", "service_worker" })
         Require(script.Contains(marker, StringComparison.Ordinal), $"页内 Hook 脚本必须包裹 {marker}");
+
+    // 存储读取与安装快照：只钩 setItem 会漏掉“上次会话写入、本次只读取”的令牌，
+    // 那是参数溯源里最常见的盲区。以下断言锁住这条链路的三个要点。
+    Require(script.Contains("Storage.prototype.getItem", StringComparison.Ordinal),
+        "页内 Hook 脚本必须包裹 Storage.prototype.getItem，否则采集前写入的值只会被静默读走");
+    Require(script.Contains("storage.snapshot", StringComparison.Ordinal),
+        "页内 Hook 脚本必须在安装时对现有存储做一份快照");
+    Require(script.Contains("nativeStorageGetItem.call(store, key)", StringComparison.Ordinal),
+        "快照必须走原生 getItem：经包装版本读取会自造一批读取事件并把所有键标记为已见");
+    Require(script.Contains("seenReads", StringComparison.Ordinal) &&
+            script.Contains("Object.create(null)", StringComparison.Ordinal),
+        "读取事件必须按键去重，且去重表不能用普通对象（页面可控的 __proto__ 会污染判断）");
     Require(script.Contains("http://127.0.0.1:4321/hooks", StringComparison.Ordinal), "脚本必须把接收端口替换进上报端点");
     Require(!script.Contains("__NETMIND_HOOK_PORT__", StringComparison.Ordinal), "脚本不得残留端口占位符");
     Require(PageHookInjector.IsSupportedTargetType("page") && PageHookInjector.IsSupportedTargetType("worker") &&

@@ -218,6 +218,56 @@ public static class PageHookScript
             };
           }
 
+          // ⑥ 存储读取与安装快照。
+          // 只钩 setItem 会留下参数溯源里最常见的一个盲区：上一次会话（比如登录）写入、
+          // 本次采集只是读取的令牌——值和读取行为都看不到。这里补两件事：
+          //   a) 安装时对现有键值做一份有界快照，让“值早就在那里”这个事实本身可见；
+          //   b) 包装 getItem，记录每个键的首次读取及其调用栈，指出该值被谁使用。
+          // 读取事件比快照更有价值：它给出使用点，而不只是存在性。
+          if (ROOT.Storage && ROOT.Storage.prototype && typeof ROOT.Storage.prototype.getItem === 'function') {
+            var nativeStorageGetItem = ROOT.Storage.prototype.getItem;
+
+            // 快照必须走原生 getItem：若经包装后的版本读取，会自己产生一批读取事件，
+            // 并把所有键标记为“已见”，真正来自页面的首次读取反而被去重掉。
+            var snapshotStore = function (store, name) {
+              var items = [];
+              var omitted = 0;
+              var total = store.length;
+              for (var i = 0; i < total; i++) {
+                var key = store.key(i);
+                if (key === null) continue;
+                if (items.length >= 100) { omitted = total - items.length; break; }
+                items.push({ key: key, value: toText(nativeStorageGetItem.call(store, key)) });
+              }
+              return { store: name, total: total, omitted: omitted, items: items };
+            };
+
+            // 存储在 Worker、不透明来源或被禁用 Cookie 的上下文中不可访问，取不到就跳过，绝不影响页面。
+            try {
+              var stores = [];
+              try { if (ROOT.localStorage) stores.push(snapshotStore(ROOT.localStorage, 'localStorage')); } catch (e) { }
+              try { if (ROOT.sessionStorage) stores.push(snapshotStore(ROOT.sessionStorage, 'sessionStorage')); } catch (e) { }
+              if (stores.length > 0) recordHook('storage', 'storage.snapshot', '', { context: CONTEXT, stores: stores });
+            } catch (e) { }
+
+            // Object.create(null) 而不是 {}：键来自页面，__proto__ 之类会污染普通对象的去重判断。
+            var seenReads = Object.create(null);
+            ROOT.Storage.prototype.getItem = function (key) {
+              var result = nativeStorageGetItem.apply(this, arguments);
+              try {
+                var scope = 'storage';
+                try { scope = this === ROOT.localStorage ? 'localStorage' : (this === ROOT.sessionStorage ? 'sessionStorage' : scope); } catch (e) { }
+                // 只记首次读取：某些框架每帧都读同一个键，全记会挤爆有界队列，把真正有用的事件淘汰掉。
+                var dedupeKey = scope + '\n' + toText(key);
+                if (!seenReads[dedupeKey] && result !== null && result !== undefined) {
+                  seenReads[dedupeKey] = true;
+                  recordHook('storage', scope + '.getItem', '', { key: toText(key), value: toText(result) });
+                }
+              } catch (e) { }
+              return result;
+            };
+          }
+
           // 安装握手：即使页面尚未调用 XHR/加密函数，也立即产生一条可见事件，
           // 用于区分“页面没有触发目标 API”和“注入成功但上报通道已断”。
           // 停止/重新开始采集时接收端口和令牌会轮换；保留已包装函数，只热更新上报地址，

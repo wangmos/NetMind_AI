@@ -8,6 +8,13 @@
     <RepositoryUrl>https://github.com/netmind-ai/netmind-ai</RepositoryUrl>
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
-    <TreatWarningsAsErrors Condition="'$(CI)' == 'true'">true</TreatWarningsAsErrors>
+    <!--
+      警告即错误对本地和 CI 一视同仁：只在 CI 生效时，问题会一直堆到流水线才爆，
+      而本地改动的人看不到。当前全解决方案在默认分析级别下是 0 警告，开启不增加任何负担。
+      分析级别保持 SDK 默认（推荐子集）：实测 latest-all 仅 NetMind.Core 就有约 1,600 条，
+      其中 812 条是 CA2007（ConfigureAwait），属于类库规则，对 Windows 桌面应用没有意义。
+    -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
   </PropertyGroup>
 </Project>
