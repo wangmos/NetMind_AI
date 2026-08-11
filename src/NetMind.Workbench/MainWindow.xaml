@@ -171,6 +171,7 @@
                     <Button x:Name="SandboxNav" Content="脚本" Style="{StaticResource NavButton}" Click="导航_Click" />
                     <Button x:Name="WorkspaceNav" Content="安全与会话" Style="{StaticResource NavButton}" Click="导航_Click" />
                     <Button x:Name="SettingsNav" Content="设置" Style="{StaticResource NavButton}" Click="导航_Click" />
+                    <Button x:Name="AboutNav" Content="关于" Style="{StaticResource NavButton}" Click="导航_Click" />
                 </StackPanel>
                 <Border Grid.Row="4" Style="{StaticResource Card}" Padding="13">
                     <StackPanel>
@@ -431,7 +432,7 @@
                         </TabItem>
                         <TabItem Header="页内 Hook">
                             <Grid Margin="0,8,0,0">
-                                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="170" /></Grid.RowDefinitions>
+                                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
                                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                                     <ComboBox x:Name="PageHookTypeFilter" Width="120" SelectedIndex="0" SelectionChanged="页内Hook筛选_Changed">
                                         <ComboBoxItem Content="全部类型" /><ComboBoxItem Content="xhr" Tag="xhr" /><ComboBoxItem Content="fetch" Tag="fetch" /><ComboBoxItem Content="crypto" Tag="crypto" /><ComboBoxItem Content="encode" Tag="encode" /><ComboBoxItem Content="storage" Tag="storage" />
@@ -442,28 +443,32 @@
                                     <TextBlock x:Name="PageHookAttachStatusText" Text="浏览器尚未挂载" Foreground="{StaticResource AmberBrush}" VerticalAlignment="Center" Margin="12,0,0,0" />
                                     <TextBlock x:Name="PageHookStatusText" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" Margin="12,0,0,0" />
                                 </StackPanel>
-                                <ListBox x:Name="PageHookList" Grid.Row="1" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" MouseDoubleClick="页内Hook_双击" Margin="0,8,0,8" ToolTip="双击条目在下方详情区查看完整参数">
-                                    <ListBox.ItemTemplate>
-                                        <DataTemplate>
-                                            <Grid>
-                                                <Grid.ColumnDefinitions><ColumnDefinition Width="86" /><ColumnDefinition Width="64" /><ColumnDefinition Width="200" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                                                <TextBlock Grid.Column="0" Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="11.5" />
-                                                <TextBlock Grid.Column="1" Text="{Binding Type}" Foreground="{StaticResource AmberBrush}" FontSize="11.5" />
-                                                <TextBlock Grid.Column="2" Text="{Binding Function}" Foreground="{StaticResource AccentBrush}" FontSize="11.5" TextTrimming="CharacterEllipsis" />
-                                                <TextBlock Grid.Column="3" Text="{Binding ArgsSummary}" Foreground="{StaticResource TextBrush}" FontSize="11.5" TextTrimming="CharacterEllipsis" Margin="8,0,0,0" />
-                                            </Grid>
-                                        </DataTemplate>
-                                    </ListBox.ItemTemplate>
-                                </ListBox>
-                                <TextBlock x:Name="PageHookEmptyHint" Grid.Row="1" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" HorizontalAlignment="Center" TextWrapping="Wrap" TextAlignment="Center" Text="暂无页内 Hook 事件。&#10;请打开采集浏览器并访问目标页面：注入脚本包裹的调用（XHR/fetch/加密/编码/存储）会自动出现在这里。" />
-                                <Border Grid.Row="2" Background="{StaticResource RaisedBrush}" CornerRadius="5" Padding="12">
-                                    <ScrollViewer VerticalScrollBarVisibility="Auto">
-                                        <StackPanel>
-                                            <TextBlock x:Name="PageHookDetailTitle" Text="双击列表条目查看完整参数" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" Margin="0,0,0,6" />
-                                            <RichTextBox x:Name="PageHookDetailBox" Style="{StaticResource EvidenceRichBox}" FontFamily="Cascadia Mono" FontSize="13" />
-                                        </StackPanel>
-                                    </ScrollViewer>
-                                </Border>
+                                <!-- 列表与详情左右并排：详情框此前固定在底部 170px，装不下稍长的参数；改为并排后详情拿到整列高度。 -->
+                                <Grid Grid.Row="1" Margin="0,8,0,0">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="1.1*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <ListBox x:Name="PageHookList" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" MouseDoubleClick="页内Hook_双击" SelectionChanged="页内Hook_选择变化" Margin="0,0,10,0" ToolTip="双击或选中条目在右侧详情区查看完整参数">
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions><ColumnDefinition Width="86" /><ColumnDefinition Width="64" /><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="11.5" />
+                                                    <TextBlock Grid.Column="1" Text="{Binding Type}" Foreground="{StaticResource AmberBrush}" FontSize="11.5" />
+                                                    <TextBlock Grid.Column="2" Text="{Binding Function}" Foreground="{StaticResource AccentBrush}" FontSize="11.5" TextTrimming="CharacterEllipsis" />
+                                                    <TextBlock Grid.Column="3" Text="{Binding ArgsSummary}" Foreground="{StaticResource TextBrush}" FontSize="11.5" TextTrimming="CharacterEllipsis" Margin="8,0,0,0" />
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                    <TextBlock x:Name="PageHookEmptyHint" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" HorizontalAlignment="Center" TextWrapping="Wrap" TextAlignment="Center" Margin="0,0,10,0" Text="暂无页内 Hook 事件。&#10;请打开采集浏览器并访问目标页面：注入脚本包裹的调用（XHR/fetch/加密/编码/存储）会自动出现在这里。" />
+                                    <Border Grid.Column="1" Background="{StaticResource RaisedBrush}" CornerRadius="5" Padding="12">
+                                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                            <StackPanel>
+                                                <TextBlock x:Name="PageHookDetailTitle" Text="双击或选中列表条目查看完整参数" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" Margin="0,0,0,6" />
+                                                <RichTextBox x:Name="PageHookDetailBox" Style="{StaticResource EvidenceRichBox}" FontFamily="Cascadia Mono" FontSize="13" />
+                                            </StackPanel>
+                                        </ScrollViewer>
+                                    </Border>
+                                </Grid>
                             </Grid>
                         </TabItem>
                         </TabControl>
@@ -775,7 +780,7 @@
                                                 <MenuItem Header="展开全部" InputGestureText="Ctrl+Shift+]" Click="展开全部_Click" />
                                             </ContextMenu>
                                         </RichTextBox.ContextMenu>
-                                        <FlowDocument PagePadding="0" LineHeight="18" LineStackingStrategy="BlockLineHeight"><Paragraph Margin="0" /></FlowDocument>
+                                        <FlowDocument PagePadding="0" LineHeight="21" LineStackingStrategy="BlockLineHeight"><Paragraph Margin="0" /></FlowDocument>
                                     </RichTextBox>
                                     <!-- 补全弹层：词表来自 NetMind.Core 的 HookScriptApi，与运行时契约同源，不会和真实字段漂移 -->
                                     <Popup x:Name="ScriptCompletionPopup" Grid.Row="1" Placement="RelativePoint" PlacementTarget="{Binding ElementName=ScriptEditor}" AllowsTransparency="True" StaysOpen="True" PopupAnimation="None" Focusable="False">
@@ -794,15 +799,18 @@
                                     </Popup>
                                     <Border Grid.Row="2" Background="{StaticResource RaisedBrush}" CornerRadius="0,0,7,7" Padding="14,9">
                                         <Grid>
-                                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
-                                            <!-- 让 AI 接手写脚本：系统提示词由 HookScriptApi 按当前用途生成，与编辑器补全、运行时同源 -->
+                                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                                            <!-- 让 AI 接手写脚本：系统提示词由 HookScriptApi 按当前用途生成，与编辑器补全、运行时同源。
+                                                 会话保持上下文——第一次不满意可以直接在输入框里接着说怎么改，不必重新描述一遍。 -->
                                             <Grid>
-                                                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
                                                 <TextBlock Text="让 AI 写" Foreground="{StaticResource PurpleBrush}" FontSize="11.5" FontWeight="SemiBold" VerticalAlignment="Center" />
-                                                <TextBox x:Name="AiScriptRequestBox" Grid.Column="1" Margin="9,0,8,0" MinHeight="30" Padding="9,5" FontSize="11.5" MaxLength="800" KeyDown="AI写脚本_按键" AutomationProperties.Name="AI 脚本需求" ToolTip="用中文描述你要的脚本，例如：拦截登录请求，删掉签名头并把密码字段改掉，同时记录原始正文的 SHA-256。回车即生成" />
-                                                <Button x:Name="AiWriteScriptButton" Grid.Column="2" Content="生成脚本" Style="{StaticResource CompactActionButton}" Padding="12,6" MinHeight="30" FontSize="11.5" Click="AI写脚本_Click" ToolTip="把脚本规范作为系统提示词发给模型，生成结果直接写入编辑器（会覆盖当前内容，可 Ctrl+Z 撤销）" />
+                                                <TextBox x:Name="AiScriptRequestBox" Grid.Column="1" Margin="9,0,8,0" MinHeight="30" Padding="9,5" FontSize="11.5" MaxLength="800" KeyDown="AI写脚本_按键" AutomationProperties.Name="AI 脚本需求" ToolTip="用中文描述你要的脚本；不满意可以直接说怎么改，回车即继续本次对话生成" />
+                                                <Button x:Name="AiWriteScriptButton" Grid.Column="2" Content="生成脚本" Style="{StaticResource CompactActionButton}" Padding="12,6" MinHeight="30" FontSize="11.5" Click="AI写脚本_Click" ToolTip="把需求（连同此前的对话历史）发给模型，生成结果直接写入编辑器（会覆盖当前内容，可 Ctrl+Z 撤销）" />
+                                                <Button Grid.Column="3" Content="清空对话" Style="{StaticResource CompactActionButton}" Padding="10,6" MinHeight="30" FontSize="11.5" Margin="6,0,0,0" Click="清空脚本AI对话_Click" ToolTip="丢弃当前的多轮对话历史，下一次生成从头开始" />
                                             </Grid>
-                                            <TextBlock x:Name="ScriptEditorHintText" Grid.Row="1" Margin="0,8,0,0" Foreground="{StaticResource MutedBrush}" FontSize="10.5" TextWrapping="Wrap" />
+                                            <TextBlock x:Name="AiScriptTurnText" Grid.Row="1" Margin="0,6,0,0" Foreground="{StaticResource PurpleBrush}" FontSize="10.5" />
+                                            <TextBlock x:Name="ScriptEditorHintText" Grid.Row="2" Margin="0,4,0,0" Foreground="{StaticResource MutedBrush}" FontSize="10.5" TextWrapping="Wrap" />
                                         </Grid>
                                     </Border>
                                 </Grid>
@@ -836,14 +844,38 @@
                                 </Border>
                                 <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,12,0,0" Padding="16,14">
                                     <Grid>
-                                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
                                         <Grid>
                                             <TextBlock Text="运行结果" FontSize="15" FontWeight="SemiBold" />
                                             <TextBlock x:Name="ScriptRunStateText" Foreground="{StaticResource MutedBrush}" FontSize="11" HorizontalAlignment="Right" VerticalAlignment="Center" />
                                         </Grid>
-                                        <ScrollViewer Grid.Row="1" Margin="0,12,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                        <ScrollViewer Grid.Row="1" MaxHeight="160" Margin="0,12,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                                             <TextBlock x:Name="SandboxOutput" Text="脚本尚未运行。&#x0a;&#x0a;点击右上角「运行」：钩子脚本会在临时目录里隔离试跑，验证脚本会在受限沙箱中执行一次。" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
                                         </ScrollViewer>
+                                        <!-- 试跑期间脚本返回的结论累积在这里，而不是只显示最近一次、看完就没了。点条目可在上方查看完整 JSON。 -->
+                                        <Grid Grid.Row="2" Margin="0,12,0,0">
+                                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                                            <Grid>
+                                                <TextBlock Text="返回数据" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                                    <TextBlock x:Name="ScriptFindingsCountText" Text="空" Foreground="{StaticResource MutedBrush}" FontSize="10.5" VerticalAlignment="Center" />
+                                                    <Button Content="清空" Style="{StaticResource CompactActionButton}" Padding="8,3" MinHeight="0" FontSize="10" Margin="8,0,0,0" Click="清空脚本结果列表_Click" />
+                                                </StackPanel>
+                                            </Grid>
+                                            <ListBox x:Name="ScriptFindingsList" Grid.Row="1" Margin="0,6,0,0" ItemsSource="{Binding ScriptFindings}" SelectionChanged="脚本结果_选择变化" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" AutomationProperties.Name="脚本返回数据列表">
+                                                <ListBox.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <StackPanel Margin="0,2">
+                                                            <Grid>
+                                                                <TextBlock Text="{Binding Event}" Foreground="{StaticResource AccentBrush}" FontSize="10.5" TextTrimming="CharacterEllipsis" />
+                                                                <TextBlock Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="10" HorizontalAlignment="Right" />
+                                                            </Grid>
+                                                            <TextBlock Text="{Binding Summary}" FontSize="11" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" />
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ListBox.ItemTemplate>
+                                            </ListBox>
+                                        </Grid>
                                     </Grid>
                                 </Border>
                             </Grid>
@@ -997,6 +1029,50 @@
                                     <TextBlock Text="安全说明：监听地址固定为本机回环；采集进行中无法修改监听端口。刷新频率、列表容量和 AI 取数预算由系统统一管理。" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,14,0,0" />
                                 </StackPanel>
                             </Border>
+                        </ScrollViewer>
+                    </Grid>
+                </TabItem>
+
+                <TabItem Header="关于">
+                    <Grid Margin="26,22,26,24">
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                        <StackPanel Margin="0,0,0,18">
+                            <TextBlock Text="关于" FontSize="24" FontWeight="SemiBold" />
+                            <TextBlock Text="项目简介、版本与作者信息。" Foreground="{StaticResource MutedBrush}" Margin="0,6,0,0" />
+                        </StackPanel>
+                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                            <StackPanel MaxWidth="720" HorizontalAlignment="Left">
+                                <Border Style="{StaticResource Card}" Padding="20">
+                                    <StackPanel>
+                                        <Grid>
+                                            <TextBlock Text="NetMind AI" FontSize="20" FontWeight="SemiBold" Foreground="{StaticResource AccentBrush}" />
+                                            <TextBlock x:Name="AboutVersionText" Text="v0.0.0" Foreground="{StaticResource MutedBrush}" FontSize="12" HorizontalAlignment="Right" VerticalAlignment="Center" />
+                                        </Grid>
+                                        <TextBlock Margin="0,10,0,0" TextWrapping="Wrap" LineHeight="21" Foreground="{StaticResource TextBrush}"
+                                            Text="面向 Windows 的中文流量分析工作台：HTTP/HTTPS 抓包、逐字节可查的原始证据、Python 钩子脚本拦截改写、对话式分层取证的 AI 分析。捕获与脚本执行运行在独立进程中，工作区之间彼此隔离。零第三方 NuGet 依赖，可完全离线构建。" />
+                                        <TextBlock Margin="0,14,0,0" Text="使用范围" FontWeight="SemiBold" Foreground="{StaticResource AmberBrush}" />
+                                        <TextBlock Margin="0,6,0,0" TextWrapping="Wrap" LineHeight="20" Foreground="{StaticResource MutedBrush}" FontSize="11.5"
+                                            Text="请仅用于你自己拥有或已获明确授权的系统的调试与安全测试。AI 分析在你显式触发时会发送未脱敏的原始数据，请只对自有测试账号使用。使用者需自行确保符合所在地法律法规与目标服务的条款；作者不对滥用承担责任。" />
+                                    </StackPanel>
+                                </Border>
+                                <Border Style="{StaticResource Card}" Padding="20" Margin="0,14,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="作者与版权" FontSize="15" FontWeight="SemiBold" />
+                                        <Grid Margin="0,14,0,0">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="90" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                                            <TextBlock Grid.Row="0" Text="作者" Foreground="{StaticResource MutedBrush}" />
+                                            <TextBlock Grid.Row="0" Grid.Column="1" Text="varlar" FontFamily="Cascadia Code, Consolas" />
+                                            <TextBlock Grid.Row="1" Text="邮箱" Foreground="{StaticResource MutedBrush}" Margin="0,10,0,0" />
+                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="766159@qq.com" FontFamily="Cascadia Code, Consolas" Margin="0,10,0,0" />
+                                            <TextBlock Grid.Row="2" Text="仓库" Foreground="{StaticResource MutedBrush}" Margin="0,10,0,0" />
+                                            <TextBlock Grid.Row="2" Grid.Column="1" Margin="0,10,0,0"><Hyperlink x:Name="AboutRepositoryLink" Click="关于仓库链接_Click">github.com/wangmos/NetMind_AI</Hyperlink></TextBlock>
+                                            <TextBlock Grid.Row="3" Text="版权" Foreground="{StaticResource MutedBrush}" Margin="0,10,0,0" />
+                                            <TextBlock Grid.Row="3" Grid.Column="1" x:Name="AboutCopyrightText" Text="Copyright © 2026 varlar" Margin="0,10,0,0" />
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+                            </StackPanel>
                         </ScrollViewer>
                     </Grid>
                 </TabItem>

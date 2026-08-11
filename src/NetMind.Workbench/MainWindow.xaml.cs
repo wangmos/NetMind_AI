@@ -316,6 +316,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly LinkedList<string> _jsonTreeCacheOrder = [];
 
     public ObservableCollection<ScriptRow> Scripts { get; } = [];
+    /// <summary>钩子脚本试跑期间返回的结论，累积保留供用户回看，而不是每次运行就覆盖上一次的预览。</summary>
+    public ObservableCollection<ScriptFindingRow> ScriptFindings { get; } = [];
+    /// <summary>累积上限：够看清脚本行为，又不至于让列表无限增长拖慢界面。</summary>
+    private const int ScriptFindingsCapacity = 300;
     public ObservableCollection<TrafficRow> TrafficRows { get; } = [];
     public ObservableCollection<TrafficRow> FilteredTrafficRows { get; } = [];
     public ObservableCollection<SessionRow> Sessions { get; } = [];
@@ -367,6 +371,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         SetScriptText(DefaultHookScriptTemplate);
         ApplyPythonSyntaxHighlighting();
         UpdateScriptHeader();
+        InitializeAboutPage();
         // 分析模板与快捷追问：先用内置默认填充，工作区载入后改读可编辑目录（ai-prompts.json）。
         ApplyAiCatalog(AiPromptCatalog.BuiltIn, AiPromptTemplate.DefaultTemplateId);
         AiQuickFollowUpPanel.IsEnabled = false;
@@ -403,12 +408,32 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void SelectPage(Button selected)
     {
-        var buttons = new[] { OverviewNav, TrafficNav, GroupNav, AiNav, SandboxNav, WorkspaceNav, SettingsNav };
+        var buttons = new[] { OverviewNav, TrafficNav, GroupNav, AiNav, SandboxNav, WorkspaceNav, SettingsNav, AboutNav };
         var index = Array.IndexOf(buttons, selected);
         if (index < 0) return;
         foreach (var button in buttons) button.Tag = null;
         selected.Tag = "选中";
         MainTabs.SelectedIndex = index;
+    }
+
+    /// <summary>版本号取自程序集（与 Directory.Build.props 的 &lt;Version&gt; 同源），不在这里手写第二份。</summary>
+    private void InitializeAboutPage()
+    {
+        var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+        if (AboutVersionText is not null)
+            AboutVersionText.Text = version is null ? "版本未知" : $"v{version.Major}.{version.Minor}.{version.Build}";
+        if (AboutCopyrightText is not null)
+            AboutCopyrightText.Text = $"Copyright © {DateTime.Now.Year} varlar";
+    }
+
+    /// <summary>关于页仓库链接：用系统默认浏览器打开，不在应用内嵌 WebView（项目约定不发起远程内容渲染）。</summary>
+    private void 关于仓库链接_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo("https://github.com/wangmos/NetMind_AI") { UseShellExecute = true });
+        }
+        catch { /* 打开默认浏览器失败不影响关于页其余信息的可读性 */ }
     }
 
     private async void 主页面_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -423,7 +448,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             3 => "基于证据生成可审计的分析建议",
             4 => "在受限 Python 沙箱中验证规则",
             5 => "管理当前项目的 HTTPS 边界与捕获会话",
-            _ => "偏好与运行参数设置"
+            6 => "偏好与运行参数设置",
+            _ => "项目简介与版本信息"
         };
         if (MainTabs.SelectedIndex == 4) await RefreshScriptHookRuntimeStatusAsync();
     }
@@ -2343,28 +2369,56 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             : selectedCount == ResourceTypeCheckBoxes.Length ? true : null;
     }
 
+    /// <summary>
+    /// 勾选「全部」→ 全选，逻辑不变。取消勾选「全部」→ 退回默认可见类型，而不是清空整张表
+    /// （清空后列表看起来像是坏了，用户还得自己记住原来选的是哪几类）。
+    /// 正常点击路径已被 <see cref="资源类型全选_按下"/> 接管；这里只处理键盘/自动化等
+    /// 不经过鼠标按下事件的路径，同一条规则兜底。
+    /// </summary>
     private void 资源类型全选_Changed(object sender, RoutedEventArgs e)
     {
         if (!IsLoaded || _updatingTrafficRows || _syncingResourceTypeFilters ||
             sender is not CheckBox { IsChecked: bool selected }) return;
-        _syncingResourceTypeFilters = true;
-        try { foreach (var box in ResourceTypeCheckBoxes) box.IsChecked = selected; }
-        finally { _syncingResourceTypeFilters = false; }
+        if (selected)
+        {
+            _syncingResourceTypeFilters = true;
+            try { foreach (var box in ResourceTypeCheckBoxes) box.IsChecked = true; }
+            finally { _syncingResourceTypeFilters = false; }
+        }
+        else
+        {
+            ResetResourceTypeFilters();
+        }
         ApplyFilter();
     }
 
+    /// <summary>
+    /// WPF 三态复选框默认点击循环是 未选 → 全选 → 部分（不确定）→ 未选，这里改写两段：
+    /// 从「部分选择」点击 → 直接全选（而不是继续走到「未选」）；
+    /// 从「全选」点击 → 直接退回默认可见类型（而不是先滑进「部分选择」的中间态再等下一次点击）。
+    /// 「未选」状态下点击维持默认框架行为（未选 → 全选），与「勾选全部」入口一致。
+    /// </summary>
     private void 资源类型全选_按下(object sender, MouseButtonEventArgs e)
     {
-        if (sender is not CheckBox { IsChecked: null } || _syncingResourceTypeFilters) return;
-        e.Handled = true;
-        _syncingResourceTypeFilters = true;
-        try
+        if (sender is not CheckBox box || _syncingResourceTypeFilters) return;
+        if (box.IsChecked is null)
         {
-            foreach (var box in ResourceTypeCheckBoxes) box.IsChecked = true;
-            ResourceTypeAllBox.IsChecked = true;
+            e.Handled = true;
+            _syncingResourceTypeFilters = true;
+            try
+            {
+                foreach (var item in ResourceTypeCheckBoxes) item.IsChecked = true;
+                ResourceTypeAllBox.IsChecked = true;
+            }
+            finally { _syncingResourceTypeFilters = false; }
+            ApplyFilter();
         }
-        finally { _syncingResourceTypeFilters = false; }
-        ApplyFilter();
+        else if (box.IsChecked == true)
+        {
+            e.Handled = true;
+            ResetResourceTypeFilters();
+            ApplyFilter();
+        }
     }
 
     private void 资源类型筛选_Changed(object sender, RoutedEventArgs e)
@@ -2878,7 +2932,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         PageHookStatusText.Foreground = Muted;
     }
 
-    private void 页内Hook_双击(object sender, MouseButtonEventArgs e)
+    /// <summary>列表与详情现在左右并排（不再是需要双击才展开的折叠区），选中即预览更顺手；双击保留兼容。</summary>
+    private void 页内Hook_选择变化(object sender, SelectionChangedEventArgs e) => RenderPageHookDetail();
+
+    private void 页内Hook_双击(object sender, MouseButtonEventArgs e) => RenderPageHookDetail();
+
+    private void RenderPageHookDetail()
     {
         if (PageHookList.SelectedItem is not PageHookRow row) return;
         var hook = row.Event;
@@ -6804,6 +6863,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     // ==================== 让 AI 写脚本 ====================
 
+    /// <summary>
+    /// 当前脚本代写会话的消息历史（含系统提示词）。保留它是为了支持追问式修改——
+    /// 第一次生成的往往不满意，用户需要接着说「再加个 xxx」而不是每次从零描述一遍。
+    /// 只在内存里，不落盘、不进 AI 分析历史：这是脚本编辑器的辅助功能，不是取证会话。
+    /// </summary>
+    private List<AiChatMessage>? _scriptAiMessages;
+    private ScriptPurpose? _scriptAiPurpose;
+
     private void AI写脚本_按键(object sender, KeyEventArgs e)
     {
         if (e.Key != Key.Enter) return;
@@ -6811,9 +6878,24 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         AI写脚本_Click(sender, e);
     }
 
+    /// <summary>切换脚本或改变用途时旧对话的上下文就不再适用（面向的是另一个文件/另一套契约），清空重开。</summary>
+    private void ResetScriptAiConversation()
+    {
+        _scriptAiMessages = null;
+        _scriptAiPurpose = null;
+        if (AiScriptTurnText is not null) AiScriptTurnText.Text = string.Empty;
+    }
+
+    private void 清空脚本AI对话_Click(object sender, RoutedEventArgs e)
+    {
+        ResetScriptAiConversation();
+        WriteRunOutput("已清空对话，下一次生成会重新开始。", Muted, "对话已清空");
+    }
+
     /// <summary>
-    /// 把脚本规范作为系统提示词、用户需求作为提问发一次模型调用，回复里的代码块写进编辑器。
-    /// 不带任何工具，也不进 AI 会话历史：这是一次性的代码生成，不是取证分析。
+    /// 把需求发给模型，回复里的代码块写进编辑器；同一个脚本、同一种用途下的后续追问
+    /// 会带着此前的对话历史一起发送，模型因此知道「上一版写的是什么、你现在想改什么」。
+    /// 不带工具调用，也不进 AI 分析会话历史：这是脚本编辑器内的辅助功能。
     /// </summary>
     private async void AI写脚本_Click(object sender, RoutedEventArgs e)
     {
@@ -6828,32 +6910,42 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var purpose = CurrentScriptPurpose;
         try
         {
+            // 用途变了（钩子 ⇄ 验证）说明这是另一套契约，旧对话继续发送只会误导模型。
+            if (_scriptAiMessages is null || _scriptAiPurpose != purpose)
+            {
+                _scriptAiMessages = [new("system", HookScriptApi.BuildAuthoringSystemPrompt(purpose))];
+                _scriptAiPurpose = purpose;
+            }
+            var isFollowUp = _scriptAiMessages.Count > 1;
+
             var settings = await new AiGatewaySettingsStore(_aiSettingsPath).LoadAsync();
             var enteredKey = AiApiKeyBox.Password;
             var apiKey = string.IsNullOrWhiteSpace(enteredKey) ? WindowsCredentialStore.ReadApiKey() : enteredKey;
-            WriteRunOutput($"正在请求模型生成{(purpose == ScriptPurpose.Hook ? "钩子" : "验证")}脚本…", Accent, "生成中");
+            WriteRunOutput(
+                $"正在请求模型{(isFollowUp ? "按你的追问修改" : "生成")}{(purpose == ScriptPurpose.Hook ? "钩子" : "验证")}脚本…",
+                Accent, "生成中");
 
+            // 每一轮都带上编辑器当前内容：用户可能在两轮之间手动改过，模型必须以实际文件为准，
+            // 而不是自己上一轮回复的记忆（两者一旦分叉，继续对着记忆改只会越改越错）。
             var current = GetScriptText();
             var userPrompt = new StringBuilder(request);
             if (!string.IsNullOrWhiteSpace(current))
             {
-                userPrompt.Append("\n\n当前编辑器里的脚本如下，若与需求相关请在它基础上修改，否则整体重写：\n```python\n")
+                userPrompt.Append("\n\n当前编辑器里的脚本如下，请在它基础上按需求修改：\n```python\n")
                           .Append(current.Length > 6000 ? current[..6000] + "\n# …（已截断）" : current)
                           .Append("\n```");
             }
-            var messages = new List<AiChatMessage>
-            {
-                new("system", HookScriptApi.BuildAuthoringSystemPrompt(purpose)),
-                new("user", userPrompt.ToString())
-            };
+            _scriptAiMessages.Add(new AiChatMessage("user", userPrompt.ToString()));
 
             using var gateway = new AiGatewayClient();
-            // 关掉扩展思考：这是一次性代码生成，思考令牌会吃掉绝大部分输出预算却毫无用处
+            // 关掉扩展思考：这是代码生成，思考令牌会吃掉绝大部分输出预算却毫无用处
             // （开着时生成 30 行脚本花了 13,000 输出令牌）。
-            var result = await gateway.AnalyzeConversationAsync(settings, apiKey, messages, [],
+            var result = await gateway.AnalyzeConversationAsync(settings, apiKey, _scriptAiMessages, [],
                 enableReasoning: false);
             var code = HookScriptApi.ExtractPythonCode(result.Text);
             if (code.Length == 0) throw new InvalidDataException("模型没有返回可用的 Python 代码块。");
+            // 助手回复原样存进历史（不是改写后的 code 变量）：模型下一轮看到的必须是它自己真实说过的话。
+            _scriptAiMessages.Add(new AiChatMessage("assistant", result.Text));
 
             // 静态策略先过一遍：与其让用户点了运行才看到「策略拒绝」，不如当场说清楚。
             var violations = PythonSandboxPolicy.Validate(code);
@@ -6862,6 +6954,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _folds.Clear();
             MarkScriptDirty();
             AiScriptRequestBox.Clear();
+            var turnIndex = (_scriptAiMessages.Count - 1) / 2; // 每轮 user+assistant 两条
+            if (AiScriptTurnText is not null)
+                AiScriptTurnText.Text = $"第 {turnIndex} 轮 · 不满意可以继续在上面描述怎么改";
             var summary = $"已生成并写入编辑器（{code.Split('\n').Length} 行）。检查无误后按 Ctrl+S 保存。\n" +
                           $"输入 {result.InputTokens} 令牌 · 输出 {result.OutputTokens} 令牌";
             // 输出令牌远大于代码量时，多半是模型仍在思考。把思考文本长度摆出来，免得只能靠猜。
@@ -6875,6 +6970,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         catch (Exception exception)
         {
+            // 失败的这一轮不该留在历史里干扰下一次重试：撤掉刚才追加的 user 消息（assistant 消息在失败时还没加入）。
+            if (_scriptAiMessages is { Count: > 0 } && _scriptAiMessages[^1].Role == "user")
+                _scriptAiMessages.RemoveAt(_scriptAiMessages.Count - 1);
             WriteRunOutput("AI 生成脚本失败\n\n" + exception.Message, Red, "生成失败");
         }
         finally
@@ -7310,6 +7408,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ApplyPythonSyntaxHighlighting();
         ApplyScriptPurposeCombo(row.Purpose);
         _scriptDirty = false;
+        ResetScriptAiConversation(); // 换了文件，旧对话谈的是另一个脚本，继续带着发只会误导模型
         UpdateScriptHeader();
     }
 
@@ -7702,6 +7801,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 await Task.Delay(50);
             var metrics = engine.GetMetricsSnapshot();
             var findings = engine.DrainFindings();
+            AppendScriptFindings(findings);
             var builder = new StringBuilder();
             foreach (var notice in notices) builder.Append(notice).Append('\n');
             if (notices.Count > 0) builder.Append('\n');
@@ -7713,15 +7813,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (metrics.ProcessedEvents < enabledEvents.Count) builder.Append("\n\n等待处理完成超时，请检查脚本是否阻塞。");
             if (!string.IsNullOrWhiteSpace(metrics.LastError)) builder.Append("\n\n最近错误：").Append(metrics.LastError);
             if (findings.Count > 0)
-            {
-                var preview = string.Join("\n", findings.Take(4).Select(finding =>
-                    $"{finding.Event}：{JsonSerializer.Serialize(finding.Data)}"));
-                builder.Append("\n\n试跑结论：\n").Append(preview.Length > 1600 ? preview[..1600] + "…" : preview);
-            }
+                builder.Append($"\n\n本次新增 {findings.Count} 条结论，已加入下方「返回数据」列表（点击查看完整内容）。");
             else if (metrics.WorkerErrors == 0)
-            {
                 builder.Append("\n\n脚本返回 None 或未定义对应函数，因此没有生成结论。");
-            }
             WriteRunOutput(builder.ToString(), failedRun ? Red : Green, failedRun ? "试跑异常" : "试跑完成");
         }
         catch (Exception exception)
@@ -7733,6 +7827,47 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (engine is not null) await engine.DisposeAsync();
             try { if (Directory.Exists(temporaryRoot)) Directory.Delete(temporaryRoot, recursive: true); } catch { /* 临时目录清理失败不影响结果展示。 */ }
         }
+    }
+
+    /// <summary>把本次试跑产出的结论前插进列表（最新在上），并裁掉超出容量的旧条目。</summary>
+    private void AppendScriptFindings(IReadOnlyList<HookFinding> findings)
+    {
+        if (findings.Count == 0) return;
+        var scriptName = _currentScript?.FileName ?? "（未命名脚本）";
+        for (var index = findings.Count - 1; index >= 0; index--)
+        {
+            var finding = findings[index];
+            var json = JsonSerializer.Serialize(finding.Data, new JsonSerializerOptions
+                { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
+            ScriptFindings.Insert(0, new ScriptFindingRow
+            {
+                Time = finding.ReceivedAtUtc.ToLocalTime().ToString("HH:mm:ss"),
+                Event = finding.Event,
+                Script = scriptName,
+                Summary = json.Length > 90 ? json.Replace('\n', ' ')[..90] + "…" : json.Replace('\n', ' '),
+                FullJson = json
+            });
+        }
+        while (ScriptFindings.Count > ScriptFindingsCapacity) ScriptFindings.RemoveAt(ScriptFindings.Count - 1);
+        UpdateScriptFindingsCount();
+    }
+
+    private void UpdateScriptFindingsCount()
+    {
+        if (ScriptFindingsCountText is not null)
+            ScriptFindingsCountText.Text = ScriptFindings.Count == 0 ? "空" : $"{ScriptFindings.Count} 条";
+    }
+
+    private void 脚本结果_选择变化(object sender, SelectionChangedEventArgs e)
+    {
+        if (ScriptFindingsList?.SelectedItem is not ScriptFindingRow row) return;
+        WriteRunOutput($"{row.Script} · {row.Event} · {row.Time}\n\n{row.FullJson}", Green, "查看结论");
+    }
+
+    private void 清空脚本结果列表_Click(object sender, RoutedEventArgs e)
+    {
+        ScriptFindings.Clear();
+        UpdateScriptFindingsCount();
     }
 
     /// <summary>流量表为空时的兜底试跑事务：让「运行」在任何时刻都能给出结果，而不是报「没有可用快照」。</summary>
@@ -7996,4 +8131,14 @@ public sealed class ScriptRow(ScriptLibraryItem item) : INotifyPropertyChanged
 
     private void OnPropertyChanged(string propertyName) =>
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+}
+
+/// <summary>钩子脚本试跑返回的一条结论，用于「运行结果」下方的可回看列表。</summary>
+public sealed class ScriptFindingRow
+{
+    public required string Time { get; init; }
+    public required string Event { get; init; }
+    public required string Script { get; init; }
+    public required string Summary { get; init; }
+    public required string FullJson { get; init; }
 }

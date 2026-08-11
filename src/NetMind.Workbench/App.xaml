@@ -477,8 +477,10 @@
             <Setter Property="CaretBrush" Value="{StaticResource AccentBrush}" />
             <Setter Property="SelectionBrush" Value="{StaticResource AccentBrush}" />
             <Setter Property="SelectionOpacity" Value="0.38" />
-            <Setter Property="FontFamily" Value="Cascadia Mono" />
-            <Setter Property="FontSize" Value="13" />
+            <!-- 项目约定代码用 Cascadia Code；退化链保证 Cascadia 系列缺失时仍落在等宽字体上，
+                 不会静默退回不等宽的界面字体导致代码对不齐。字号比界面文字大一号，长时间盯脚本更不费眼。 -->
+            <Setter Property="FontFamily" Value="Cascadia Code, Consolas, Courier New" />
+            <Setter Property="FontSize" Value="15" />
             <Setter Property="Padding" Value="14,12" />
             <Setter Property="AcceptsTab" Value="True" />
             <Setter Property="VerticalContentAlignment" Value="Top" />
