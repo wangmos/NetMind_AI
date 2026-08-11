@@ -30,7 +30,7 @@
 
 ### 1. 安装
 
-从 [Releases](../../releases) 下载对应的 ZIP，**完整解压后**双击 `NetMind.Workbench.exe`。
+从 [Releases](../../../releases) 下载对应的 ZIP，**完整解压后**双击 `NetMind.Workbench.exe`。
 
 | 包 | 体积 | 要求 |
 | --- | --- | --- |
