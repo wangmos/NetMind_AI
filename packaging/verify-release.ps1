@@ -1,5 +1,6 @@
-param(
-    [string]$Version = "0.8.0"
+﻿param(
+    [string]$Version = "0.8.0",
+    [bool]$SelfContained = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,13 +9,14 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?$') {
 }
 
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$packageRoot = Join-Path $projectRoot "artifacts\stage\NetMind-AI-$Version-win-x64"
+$packageName = if ($SelfContained) { "NetMind-AI-$Version-win-x64" } else { "NetMind-AI-$Version-win-x64-framework-dependent" }
+$packageRoot = Join-Path $projectRoot "artifacts\stage\$packageName"
 $manifestPath = Join-Path $packageRoot "release-manifest.json"
 if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Release manifest was not found: $manifestPath" }
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
 if ($manifest.product -ne "NetMind AI" -or $manifest.version -ne $Version -or
-    $manifest.target -ne "win-x64" -or -not $manifest.selfContained) {
+    $manifest.target -ne "win-x64" -or $manifest.selfContained -ne $SelfContained) {
     throw "Release manifest identity does not match the requested self-contained win-x64 package."
 }
 
