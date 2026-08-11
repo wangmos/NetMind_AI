@@ -69,6 +69,7 @@ var suites = new SmokeSuite[]
         await VerifyHooksAsync();
         await VerifyPageHooksAsync();
     }),
+    new("工作区脚本库（命名校验、用途推断、重命名/删除一致性、补全词表同源）", "script-library-only", VerifyScriptLibraryAsync),
     new("代理钩子挂载点端到端触发（顺序、txnId、正文、单点开关）", "mountpoint-only", VerifyProxyHookMountPointsAsync),
     new("拦截规则正则匹配（URL/方法/主机/路径/头/正文/状态码）与 fail-open", "intercept-only", VerifyHookInterceptRulesAsync),
     new("采集链路一键自检", "capture-health-only", VerifyCaptureHealthAsync),
@@ -1146,6 +1147,128 @@ static void VerifyCaptureBrowserPlan(string testRoot)
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+/// <summary>
+/// 工作区脚本库：命名校验（唯一的路径穿越防线）、用途推断与 sidecar 往返、
+/// 重命名/删除的目录一致性，以及编辑器补全词表与运行时契约的一致性。
+///
+/// 脚本名来自用户输入且会拼进工作区 scripts 路径，所以命名校验被当作安全断言写在这里。
+/// </summary>
+static async Task VerifyScriptLibraryAsync()
+{
+    var root = Path.Combine(Path.GetTempPath(), "netmind-scriptlib-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        await new WorkspaceStore(root).InitializeAsync("脚本库定向测试工作区");
+        Require(ScriptLibraryStore.List(root).Count == 0, "新工作区的脚本库必须是空的");
+
+        // ── 命名校验：路径穿越、非法字符、空名与超长名一律拒绝 ──
+        foreach (var hostile in new[]
+                 {
+                     "../escape", @"..\escape", "sub/child", @"sub\child", "", "   ", ".", "..", ".py",
+                     "bad:name", "bad*name", "bad?name", "bad\"name", "bad|name", new string('x', 100)
+                 })
+        {
+            var rejected = false;
+            try { ScriptLibraryStore.NormalizeFileName(hostile); }
+            catch (ArgumentException) { rejected = true; }
+            Require(rejected, $"脚本名 {hostile.Replace('\\', '/')} 必须被拒绝，否则可写出 scripts 目录之外");
+        }
+        Require(ScriptLibraryStore.NormalizeFileName("probe") == "probe.py", "缺少后缀的脚本名必须补齐 .py");
+        Require(ScriptLibraryStore.NormalizeFileName(" probe.PY ") == "probe.py", "脚本名必须去空白并统一 .py 后缀");
+        Require(ScriptLibraryStore.NormalizeFileName("接口探针") == "接口探针.py", "中文脚本名必须可用");
+
+        // ── 用途推断：钩子函数名优先于 fixture 导入 ──
+        Require(ScriptLibraryStore.InferPurpose("def on_before_send(event):\n    return None") == ScriptPurpose.Hook,
+            "定义钩子函数的脚本必须推断为钩子脚本");
+        Require(ScriptLibraryStore.InferPurpose("from netmind import fixture\nprint(len(fixture.transactions))") == ScriptPurpose.Fixture,
+            "导入 fixture 的脚本必须推断为验证脚本");
+        Require(ScriptLibraryStore.InferPurpose("from netmind import fixture\ndef on_before_write(event):\n    return None") == ScriptPurpose.Hook,
+            "同时具备两种特征时，钩子语义更强，必须推断为钩子脚本");
+
+        // ── 新建、列举与 sidecar 往返 ──
+        var hook = await ScriptLibraryStore.CreateAsync(root, "hook-script", ScriptPurpose.Hook, "def on_before_send(event):\n    return None\n");
+        var check = await ScriptLibraryStore.CreateAsync(root, "check", ScriptPurpose.Fixture, "from netmind import fixture\n");
+        Require(hook.FileName == "hook-script.py" && check.FileName == "check.py", "新建脚本必须落在 scripts 目录且带 .py 后缀");
+        var listed = ScriptLibraryStore.List(root);
+        Require(listed.Count == 2, $"脚本库应有 2 个脚本，实际 {listed.Count}");
+        Require(listed.Single(item => item.FileName == "check.py").Purpose == ScriptPurpose.Fixture,
+            "sidecar 记录的用途必须能读回来，而不是每次都退回内容推断");
+        Require(listed.All(item => File.Exists(item.FullPath)), "列出的脚本必须都真实存在");
+
+        // 重名新建必须拒绝；CreateUniqueFileName 负责给出不冲突的名字。
+        var duplicated = false;
+        try { await ScriptLibraryStore.CreateAsync(root, "check", ScriptPurpose.Fixture, "x = 1\n"); }
+        catch (InvalidOperationException) { duplicated = true; }
+        Require(duplicated, "同名脚本必须拒绝创建，不能静默覆盖已有内容");
+        Require(ScriptLibraryStore.CreateUniqueFileName(root, "check") == "check-2.py", "唯一命名必须在冲突时追加序号");
+
+        // 目录即真相：sidecar 里残留的条目不能变成幽灵脚本。
+        File.Delete(check.FullPath);
+        Require(ScriptLibraryStore.List(root).All(item => item.FileName != "check.py"),
+            "文件被外部删除后不得继续出现在脚本库中");
+        await ScriptLibraryStore.CreateAsync(root, "check", ScriptPurpose.Fixture, "from netmind import fixture\n");
+
+        // 用户直接丢进目录的脚本必须被接纳，并按内容推断用途。
+        await File.WriteAllTextAsync(Path.Combine(TrafficHookConfigStore.GetScriptsDirectory(root), "dropped.py"),
+            "from netmind import fixture\n", new UTF8Encoding(false));
+        var dropped = ScriptLibraryStore.List(root).Single(item => item.FileName == "dropped.py");
+        Require(dropped.Purpose == ScriptPurpose.Fixture, "外部放入的脚本必须按内容推断用途");
+
+        // hook-config.json 与 hook-status.json 不是脚本，不能出现在库里。
+        await TrafficHookConfigStore.SaveConfigAsync(root, new TrafficHookConfiguration(true, "hook-script.py",
+            new TrafficHookSwitches(BeforeSend: true)));
+        Require(ScriptLibraryStore.List(root).All(item => item.FileName.EndsWith(".py", StringComparison.Ordinal)),
+            "脚本库只能包含 *.py，配置与状态文件不得混入");
+
+        // ── 重命名：文件与 sidecar 用途一起迁移 ──
+        var renamed = await ScriptLibraryStore.RenameAsync(root, "check.py", "回归校验");
+        Require(renamed == "回归校验.py", "重命名必须返回规范化后的文件名");
+        var afterRename = ScriptLibraryStore.List(root);
+        Require(afterRename.All(item => item.FileName != "check.py"), "重命名后旧文件名必须消失");
+        Require(afterRename.Single(item => item.FileName == renamed).Purpose == ScriptPurpose.Fixture,
+            "重命名必须把 sidecar 中的用途一并迁移，否则用途会被内容推断悄悄改掉");
+        var collided = false;
+        try { await ScriptLibraryStore.RenameAsync(root, renamed, "hook-script"); }
+        catch (InvalidOperationException) { collided = true; }
+        Require(collided, "重命名到已存在的脚本名必须拒绝，不能覆盖另一个脚本");
+
+        // ── 删除：文件与 sidecar 条目一起清掉 ──
+        await ScriptLibraryStore.DeleteAsync(root, renamed);
+        Require(ScriptLibraryStore.List(root).All(item => item.FileName != renamed), "删除后脚本必须从库中消失");
+        var document = await File.ReadAllTextAsync(ScriptLibraryStore.GetDocumentPath(root));
+        Require(!document.Contains(renamed, StringComparison.Ordinal), "删除脚本必须一并清掉 sidecar 中的用途条目");
+
+        // sidecar 损坏时退回内容推断，不能让整个脚本库不可用。
+        await File.WriteAllTextAsync(ScriptLibraryStore.GetDocumentPath(root), "{ 这不是 JSON", new UTF8Encoding(false));
+        var resilient = ScriptLibraryStore.List(root);
+        Require(resilient.Count >= 2, "sidecar 损坏时脚本库仍必须可列举");
+        Require(resilient.Single(item => item.FileName == "hook-script.py").Purpose == ScriptPurpose.Hook,
+            "sidecar 损坏时必须退回内容推断而不是报错");
+
+        // ── 补全词表与运行时契约同源 ──
+        Require(HookScriptApi.FixtureFields.Count > 0, "验证脚本补全必须给出 fixture 事务字段");
+        Require(HookScriptApi.FixtureFields.All(symbol => symbol.Detail != "（尚未补充说明）"),
+            "fixture 字段补全说明有遗漏：新增字段后必须在 HookScriptApi 补上中文说明");
+        var fixtureNames = HookScriptApi.FixtureFields.Select(symbol => symbol.Name).ToHashSet(StringComparer.Ordinal);
+        foreach (var required in new[] { "method", "url", "host", "endpoint", "status", "latency_ms", "size_bytes", "protocol", "process" })
+            Require(fixtureNames.Contains(required), $"fixture 字段补全缺少 {required}");
+        var sample = AiPrivacyFilter.CreateScriptTransaction(DemoData.CreateTraffic()[0]);
+        var serialized = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+            JsonSerializer.Serialize(sample, new JsonSerializerOptions(JsonSerializerDefaults.Web)))!;
+        Require(serialized.Keys.All(fixtureNames.Contains) && fixtureNames.All(serialized.ContainsKey),
+            "fixture 补全词表必须与真实序列化字段完全一致，否则照提示写会取不到值");
+        Require(HookScriptApi.HookVocabulary.Any(symbol => symbol.Name == "INTERCEPT"),
+            "钩子词表必须包含 INTERCEPT，它是拦截改写的唯一声明入口");
+        foreach (var function in HookScriptApi.HookFunctions)
+            Require(HookScriptApi.HookVocabulary.Any(symbol => symbol.Name == function.Name),
+                $"钩子词表必须包含挂载点函数 {function.Name}");
+    }
+    finally
+    {
+        if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+    }
 }
 
 /// <summary>

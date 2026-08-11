@@ -291,10 +291,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private int _copyFeedbackVersion;
     private bool _highlightingScript;
     /// <summary>补全时已键入的前缀长度；提交前要先删掉它，否则会出现 meth+method 这类重复。</summary>
-    private int _hookCompletionPrefixLength;
+    private int _scriptCompletionPrefixLength;
     private RichTextBox? _pendingHighlightEditor;
-    private string? _hookScriptFilePath;
-    private string? _hookConfigScriptPath; // 当前加载配置中的 scriptPath（相对工作区 scripts 目录或绝对路径），保存时非默认值原样写回
+    /// <summary>脚本库中当前编辑的脚本；脚本库为空时为 null。</summary>
+    private ScriptRow? _currentScript;
+    /// <summary>当前脚本最后一次落盘的内容，用于判断是否真的有未保存改动。</summary>
+    private string _loadedScriptText = string.Empty;
+    private bool _scriptDirty;
+    private bool _suppressScriptListChange;
+    private bool _suppressScriptPurposeChange;
+    /// <summary>hook-config.json 中 scriptPath 的原值；指向 scripts 目录外的自定义路径也原样保留。</summary>
+    private string? _activeHookScriptPath;
+    /// <summary>采集钩子脚本在脚本库中的文件名；scriptPath 指向 scripts 目录之外时为 null。</summary>
+    private string? _activeHookScriptFileName;
     private CancellationTokenSource? _evidenceLoadCts;
 
     /// <summary>停止采集时系统代理还原结果，决定状态栏提示文案。</summary>
@@ -302,6 +311,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly Dictionary<string, JsonTreeNode> _jsonTreeCache = [];
     private readonly LinkedList<string> _jsonTreeCacheOrder = [];
 
+    public ObservableCollection<ScriptRow> Scripts { get; } = [];
     public ObservableCollection<TrafficRow> TrafficRows { get; } = [];
     public ObservableCollection<TrafficRow> FilteredTrafficRows { get; } = [];
     public ObservableCollection<SessionRow> Sessions { get; } = [];
@@ -348,10 +358,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _pendingHighlightEditor = null;
             if (editor is not null) ApplyPythonSyntaxHighlighting(editor);
         };
-        SetScriptText(DefaultGuidedScript);
-        SetHookScriptText(DefaultHookScriptTemplate);
+        // 工作区载入前先摆一份默认钩子脚本模板；LoadScriptWorkspaceAsync 会用真实脚本库覆盖它。
+        ApplyScriptPurposeCombo(ScriptPurpose.Hook);
+        SetScriptText(DefaultHookScriptTemplate);
         ApplyPythonSyntaxHighlighting();
-        ApplyPythonSyntaxHighlighting(HookScriptEditor);
+        UpdateScriptHeader();
         // 分析模板与快捷追问：先用内置默认填充，工作区载入后改读可编辑目录（ai-prompts.json）。
         ApplyAiCatalog(AiPromptCatalog.BuiltIn, AiPromptTemplate.DefaultTemplateId);
         AiQuickFollowUpPanel.IsEnabled = false;
@@ -1107,7 +1118,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ShowAiEmptyHint();
         await LoadAiConversationsAsync();
         await LoadAiHistoryAsync();
-        await LoadHookConfigurationAsync();
+        await LoadScriptWorkspaceAsync();
         await RefreshWorkspaceDataStatusAsync();
         await ReloadWorkspaceCatalogAsync(workspace.Id);
         await new WorkspaceStore(_workspacePath).AppendAuditAsync("workspace.opened", new { workspace.Id });
@@ -6229,155 +6240,275 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_highlightingScript || ScriptEditor is null) return;
         RequestScriptHighlight(ScriptEditor);
+        MarkScriptDirty();
+        UpdateScriptCompletion(auto: true);
     }
 
-    private void 钩子脚本编辑器_TextChanged(object sender, TextChangedEventArgs e)
-    {
-        if (_highlightingScript || HookScriptEditor is null) return;
-        RequestScriptHighlight(HookScriptEditor);
-        UpdateHookCompletion(auto: true);
-    }
-
-    // ==================== 钩子脚本智能提示 ====================
+    // ==================== 脚本编辑器智能提示 ====================
     // 词表全部来自 NetMind.Core 的 HookScriptApi，与运行时契约同源：
-    // 信封字段是反射出来的，契约一改提示立刻跟着改，不会出现「照提示写、运行时取不到值」。
+    // event 信封字段与 fixture 事务字段都是反射出来的，契约一改提示立刻跟着改，
+    // 不会出现「照提示写、运行时取不到值」。
 
-    /// <summary>取光标所在行从行首到光标处的文本，用于判断补全上下文。</summary>
-    private static string GetLineTextBeforeCaret(RichTextBox editor)
+    /// <summary>判断补全上下文时向光标前回看的字符数；够覆盖跨行的 INTERCEPT 规则和 return 字典。</summary>
+    private const int ScriptCompletionLookBehind = 600;
+
+    /// <summary>自动弹出所需的最短标识符前缀；太短会在正常打字时频繁跳出无关列表。</summary>
+    private const int ScriptCompletionMinimumPrefix = 2;
+
+    /// <summary>取光标前一段文本（含换行），用于判断补全上下文。</summary>
+    private static string GetTextBeforeCaret(RichTextBox editor, int maximumCharacters)
     {
         var caret = editor.CaretPosition;
-        var lineStart = caret.GetLineStartPosition(0) ?? caret.DocumentStart;
-        return new TextRange(lineStart, caret).Text;
+        var start = caret.GetPositionAtOffset(-maximumCharacters, LogicalDirection.Backward) ?? caret.DocumentStart;
+        return new TextRange(start, caret).Text;
+    }
+
+    private static string LastLineOf(string text)
+    {
+        var index = text.LastIndexOfAny(['\n', '\r']);
+        return index < 0 ? text : text[(index + 1)..];
+    }
+
+    /// <summary>光标是否落在 # 注释里。字符串里的 # 不算注释，所以要跟着引号状态走。</summary>
+    private static bool IsInsideComment(string lineBeforeCaret)
+    {
+        var single = false;
+        var quoted = false;
+        foreach (var character in lineBeforeCaret)
+        {
+            if (character == '\'' && !quoted) single = !single;
+            else if (character == '"' && !single) quoted = !quoted;
+            else if (character == '#' && !single && !quoted) return true;
+        }
+        return false;
     }
 
     /// <summary>
-    /// 按光标前的文本判定该补什么。刻意只认几个明确的触发形态，
-    /// 而不是任何时候都弹——编辑器里频繁跳出无关列表比没有提示更烦人。
+    /// 判断光标是否在一个未闭合的字典字面量里，并区分它属于 INTERCEPT 规则还是钩子返回值。
+    /// 只在回看窗口内做括号配对，不真的解析 Python——编辑器提示够用，且不会因为语法未写完就失效。
     /// </summary>
-    private static (IReadOnlyList<HookScriptApi.Symbol> Items, string Prefix)? ResolveHookCompletion(string lineBeforeCaret, bool auto)
+    private static bool TryResolveDictionaryContext(string before, out bool interceptRule)
     {
-        var text = lineBeforeCaret;
-        // event.get('xxx  /  event['xxx
-        var eventMatch = HookEventFieldPattern().Match(text);
-        if (eventMatch.Success) return (HookScriptApi.EventFields, eventMatch.Groups["p"].Value);
-        // store.xxx
-        var storeMatch = HookStoreMemberPattern().Match(text);
-        if (storeMatch.Success) return (HookScriptApi.StoreMembers, storeMatch.Groups["p"].Value);
-        // INTERCEPT 规则里的 'event': 'xxx
-        var interceptEventMatch = HookInterceptEventPattern().Match(text);
-        if (interceptEventMatch.Success) return (HookScriptApi.InterceptEvents, interceptEventMatch.Groups["p"].Value);
-
-        var trimmed = text.TrimStart();
-        // 规则字典里敲引号：补规则字段名。
-        if (HookInterceptFieldPattern().IsMatch(text)) return (HookScriptApi.InterceptRuleFields, HookQuotedPrefixPattern().Match(text).Groups["p"].Value);
-        // 手动唤出时按行首内容给出最可能的候选。
-        if (!auto)
+        interceptRule = false;
+        var depth = 0;
+        var openIndex = -1;
+        for (var index = before.Length - 1; index >= 0; index--)
         {
-            if (trimmed.StartsWith("def", StringComparison.Ordinal) || trimmed.Length == 0)
-                return (HookScriptApi.HookFunctions, trimmed.StartsWith("def", StringComparison.Ordinal) ? trimmed[3..].TrimStart() : string.Empty);
-            if (trimmed.StartsWith("return", StringComparison.Ordinal))
-                return (HookScriptApi.MutationFields, string.Empty);
-            return (HookScriptApi.EventFields, string.Empty);
+            var character = before[index];
+            if (character == '}') depth++;
+            else if (character == '{')
+            {
+                if (depth == 0) { openIndex = index; break; }
+                depth--;
+            }
         }
-        return null;
+        if (openIndex < 0) return false;
+        var head = before[..openIndex];
+        // 谁离这个左花括号更近，就按谁解释：INTERCEPT 规则表，还是钩子函数的返回值。
+        interceptRule = head.LastIndexOf("INTERCEPT", StringComparison.Ordinal) >
+                        head.LastIndexOf("return", StringComparison.Ordinal);
+        return true;
     }
 
-    private void UpdateHookCompletion(bool auto)
+    /// <summary>
+    /// 按光标前的文本判定该补什么。明确的触发形态（event.get('、store.、字典字段…）优先，
+    /// 其次才是按标识符前缀的模糊补全；自动触发时要求至少 2 个字符，手动唤出则一律给候选。
+    /// </summary>
+    private static (IReadOnlyList<HookScriptApi.Symbol> Items, string Prefix)? ResolveScriptCompletion(
+        string before, ScriptPurpose purpose, bool auto)
     {
-        if (HookScriptEditor is null || HookCompletionPopup is null || HookCompletionList is null) return;
-        var resolved = ResolveHookCompletion(GetLineTextBeforeCaret(HookScriptEditor), auto);
+        var line = LastLineOf(before);
+        if (auto && IsInsideComment(line)) return null;
+        return purpose == ScriptPurpose.Fixture
+            ? ResolveFixtureCompletion(before, line, auto)
+            : ResolveHookCompletion(before, line, auto);
+    }
+
+    private static (IReadOnlyList<HookScriptApi.Symbol> Items, string Prefix)? ResolveHookCompletion(
+        string before, string line, bool auto)
+    {
+        // event.get('xxx  /  event['xxx
+        var eventMatch = ScriptEventFieldPattern().Match(line);
+        if (eventMatch.Success) return (HookScriptApi.EventFields, eventMatch.Groups["p"].Value);
+        // store.xxx
+        var storeMatch = ScriptStoreMemberPattern().Match(line);
+        if (storeMatch.Success) return (HookScriptApi.StoreMembers, storeMatch.Groups["p"].Value);
+        // INTERCEPT 规则里的 'event': 'xxx
+        var interceptEventMatch = ScriptInterceptEventPattern().Match(line);
+        if (interceptEventMatch.Success) return (HookScriptApi.InterceptEvents, interceptEventMatch.Groups["p"].Value);
+        // 字典字面量里敲引号：按上下文补规则字段或改写字段。
+        var quoted = ScriptQuotedPrefixPattern().Match(line);
+        if (quoted.Success && TryResolveDictionaryContext(before, out var interceptRule))
+            return (interceptRule ? HookScriptApi.InterceptRuleFields : HookScriptApi.MutationFields, quoted.Groups["p"].Value);
+        return ResolveVocabularyCompletion(line, HookScriptApi.HookVocabulary, auto);
+    }
+
+    private static (IReadOnlyList<HookScriptApi.Symbol> Items, string Prefix)? ResolveFixtureCompletion(
+        string before, string line, bool auto)
+    {
+        _ = before;
+        var memberMatch = ScriptMemberPattern().Match(line);
+        if (memberMatch.Success)
+        {
+            var prefix = memberMatch.Groups["p"].Value;
+            return memberMatch.Groups["base"].Value is "fixture"
+                ? (HookScriptApi.FixtureVocabulary.Where(symbol => symbol.Name is "transactions").ToArray(), prefix)
+                : (HookScriptApi.FixtureFields, prefix);
+        }
+        return ResolveVocabularyCompletion(line, HookScriptApi.FixtureVocabulary, auto);
+    }
+
+    private static (IReadOnlyList<HookScriptApi.Symbol> Items, string Prefix)? ResolveVocabularyCompletion(
+        string line, IReadOnlyList<HookScriptApi.Symbol> vocabulary, bool auto)
+    {
+        var word = ScriptWordPrefixPattern().Match(line);
+        if (word.Success)
+        {
+            var prefix = word.Groups["p"].Value;
+            if (!auto || prefix.Length >= ScriptCompletionMinimumPrefix) return (vocabulary, prefix);
+            return null;
+        }
+        // 手动唤出且光标不在标识符上：把整份词表摆出来，让用户直接挑。
+        return auto ? null : (vocabulary, string.Empty);
+    }
+
+    private ScriptPurpose CurrentScriptPurpose =>
+        _currentScript?.Purpose ?? (ScriptPurposeCombo?.SelectedIndex == 1 ? ScriptPurpose.Fixture : ScriptPurpose.Hook);
+
+    private void UpdateScriptCompletion(bool auto)
+    {
+        if (ScriptEditor is null || ScriptCompletionPopup is null || ScriptCompletionList is null) return;
+        var resolved = ResolveScriptCompletion(
+            GetTextBeforeCaret(ScriptEditor, ScriptCompletionLookBehind), CurrentScriptPurpose, auto);
         if (resolved is null)
         {
-            HookCompletionPopup.IsOpen = false;
+            ScriptCompletionPopup.IsOpen = false;
             return;
         }
         var (items, prefix) = resolved.Value;
         var filtered = items.Where(symbol => symbol.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToArray();
-        if (filtered.Length == 0)
+        // 只剩一个候选且已经完整键入，再弹就是纯干扰。
+        if (filtered.Length == 0 ||
+            (auto && filtered.Length == 1 && filtered[0].Name.Equals(prefix, StringComparison.OrdinalIgnoreCase)))
         {
-            HookCompletionPopup.IsOpen = false;
+            ScriptCompletionPopup.IsOpen = false;
             return;
         }
-        _hookCompletionPrefixLength = prefix.Length;
-        HookCompletionList.ItemsSource = filtered;
-        HookCompletionList.SelectedIndex = 0;
-        var caretRect = HookScriptEditor.CaretPosition.GetCharacterRect(LogicalDirection.Forward);
-        HookCompletionPopup.HorizontalOffset = caretRect.Left;
-        HookCompletionPopup.VerticalOffset = caretRect.Bottom + 2;
-        HookCompletionPopup.IsOpen = true;
+        _scriptCompletionPrefixLength = prefix.Length;
+        ScriptCompletionList.ItemsSource = filtered;
+        ScriptCompletionList.SelectedIndex = 0;
+        var caretRect = ScriptEditor.CaretPosition.GetCharacterRect(LogicalDirection.Forward);
+        ScriptCompletionPopup.HorizontalOffset = caretRect.Left;
+        ScriptCompletionPopup.VerticalOffset = caretRect.Bottom + 2;
+        ScriptCompletionPopup.IsOpen = true;
     }
 
-    private void 钩子脚本编辑器_按键(object sender, KeyEventArgs e)
+    private void 脚本编辑器_按键(object sender, KeyEventArgs e)
     {
-        if (HookCompletionPopup is null || HookCompletionList is null) return;
-        if (e.Key == Key.Space && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+        if (ScriptCompletionPopup is null || ScriptCompletionList is null) return;
+        // Alt 组合键到达时 Key 是 System，真实按键在 SystemKey。
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        // 手动唤出提供三个组合键：中文输入法把 Ctrl+空格 用作中英文切换，那个组合根本到不了应用，
+        // 所以 Ctrl+J 才是这里真正可靠的入口，Alt+/ 作为习惯 VS 的用户的备选。
+        var control = (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control;
+        var alt = (Keyboard.Modifiers & ModifierKeys.Alt) == ModifierKeys.Alt;
+        if ((control && key is Key.J or Key.Space) || (alt && key is Key.Oem2 or Key.Divide))
         {
-            UpdateHookCompletion(auto: false);
+            UpdateScriptCompletion(auto: false);
             e.Handled = true;
             return;
         }
-        if (!HookCompletionPopup.IsOpen) return;
-        switch (e.Key)
+        if (!ScriptCompletionPopup.IsOpen) return;
+        switch (key)
         {
             case Key.Escape:
-                HookCompletionPopup.IsOpen = false;
+                ScriptCompletionPopup.IsOpen = false;
                 e.Handled = true;
                 break;
             case Key.Down:
-                HookCompletionList.SelectedIndex = Math.Min(HookCompletionList.SelectedIndex + 1, HookCompletionList.Items.Count - 1);
+                ScriptCompletionList.SelectedIndex = Math.Min(ScriptCompletionList.SelectedIndex + 1, ScriptCompletionList.Items.Count - 1);
+                ScriptCompletionList.ScrollIntoView(ScriptCompletionList.SelectedItem);
                 e.Handled = true;
                 break;
             case Key.Up:
-                HookCompletionList.SelectedIndex = Math.Max(HookCompletionList.SelectedIndex - 1, 0);
+                ScriptCompletionList.SelectedIndex = Math.Max(ScriptCompletionList.SelectedIndex - 1, 0);
+                ScriptCompletionList.ScrollIntoView(ScriptCompletionList.SelectedItem);
                 e.Handled = true;
                 break;
             case Key.Enter:
             case Key.Tab:
-                CommitHookCompletion();
+                CommitScriptCompletion();
                 e.Handled = true;
+                break;
+            case Key.Left:
+            case Key.Right:
+            case Key.Home:
+            case Key.End:
+                // 光标离开了刚才那个词，候选已经失效。
+                ScriptCompletionPopup.IsOpen = false;
                 break;
         }
     }
 
-    private void 钩子补全_点击(object sender, MouseButtonEventArgs e) => CommitHookCompletion();
-
-    private void 钩子脚本编辑器_失焦(object sender, KeyboardFocusChangedEventArgs e)
+    private void 脚本补全_点击(object sender, MouseButtonEventArgs e)
     {
-        if (HookCompletionPopup is not null) HookCompletionPopup.IsOpen = false;
+        CommitScriptCompletion();
+        ScriptEditor?.Focus();
+    }
+
+    private void 脚本编辑器_失焦(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        if (ScriptCompletionPopup is null) return;
+        // 点补全列表时焦点可能短暂落进弹层，那不算离开编辑器，否则会在 MouseUp 前就把列表关掉。
+        if (e.NewFocus is DependencyObject target && ScriptCompletionPopup.Child is DependencyObject popupRoot &&
+            IsVisualDescendant(target, popupRoot)) return;
+        ScriptCompletionPopup.IsOpen = false;
+    }
+
+    private static bool IsVisualDescendant(DependencyObject candidate, DependencyObject ancestor)
+    {
+        for (var current = candidate; current is not null; current = VisualTreeHelper.GetParent(current))
+        {
+            if (ReferenceEquals(current, ancestor)) return true;
+        }
+        return false;
     }
 
     /// <summary>把选中项插入编辑器：先删掉已经键入的前缀，避免出现 "meth" + "method" 这种重复。</summary>
-    private void CommitHookCompletion()
+    private void CommitScriptCompletion()
     {
-        if (HookScriptEditor is null || HookCompletionPopup is null ||
-            HookCompletionList?.SelectedItem is not HookScriptApi.Symbol symbol) return;
-        HookCompletionPopup.IsOpen = false;
-        var caret = HookScriptEditor.CaretPosition;
-        if (_hookCompletionPrefixLength > 0)
+        if (ScriptEditor is null || ScriptCompletionPopup is null ||
+            ScriptCompletionList?.SelectedItem is not HookScriptApi.Symbol symbol) return;
+        ScriptCompletionPopup.IsOpen = false;
+        var caret = ScriptEditor.CaretPosition;
+        if (_scriptCompletionPrefixLength > 0)
         {
-            var start = caret.GetPositionAtOffset(-_hookCompletionPrefixLength, LogicalDirection.Backward);
+            var start = caret.GetPositionAtOffset(-_scriptCompletionPrefixLength, LogicalDirection.Backward);
             if (start is not null) new TextRange(start, caret).Text = string.Empty;
         }
         // 插入文本可能含换行（钩子函数骨架）；RichTextBox 会自行拆段，无需额外处理。
-        HookScriptEditor.CaretPosition.InsertTextInRun(symbol.Insert);
-        HookScriptEditor.CaretPosition = HookScriptEditor.CaretPosition.GetPositionAtOffset(symbol.Insert.Length) ?? HookScriptEditor.CaretPosition;
-        RequestScriptHighlight(HookScriptEditor);
+        ScriptEditor.CaretPosition.InsertTextInRun(symbol.Insert);
+        ScriptEditor.CaretPosition = ScriptEditor.CaretPosition.GetPositionAtOffset(symbol.Insert.Length) ?? ScriptEditor.CaretPosition;
+        RequestScriptHighlight(ScriptEditor);
     }
 
     [GeneratedRegex(@"event(?:\.get\(|\[)\s*['""](?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
-    private static partial Regex HookEventFieldPattern();
+    private static partial Regex ScriptEventFieldPattern();
 
     [GeneratedRegex(@"\bstore\.(?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
-    private static partial Regex HookStoreMemberPattern();
+    private static partial Regex ScriptStoreMemberPattern();
 
     [GeneratedRegex(@"['""]event['""]\s*:\s*['""](?<p>[A-Za-z0-9_.]*)$", RegexOptions.CultureInvariant)]
-    private static partial Regex HookInterceptEventPattern();
-
-    [GeneratedRegex(@"\{[^}]*['""](?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
-    private static partial Regex HookInterceptFieldPattern();
+    private static partial Regex ScriptInterceptEventPattern();
 
     [GeneratedRegex(@"['""](?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
-    private static partial Regex HookQuotedPrefixPattern();
+    private static partial Regex ScriptQuotedPrefixPattern();
+
+    [GeneratedRegex(@"\b(?<base>[A-Za-z_][A-Za-z0-9_]*)\.(?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
+    private static partial Regex ScriptMemberPattern();
+
+    [GeneratedRegex(@"(?<![\w.'""])(?<p>[A-Za-z_][A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
+    private static partial Regex ScriptWordPrefixPattern();
 
     private void RequestScriptHighlight(RichTextBox editor)
     {
@@ -6387,8 +6518,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     }
 
     private void SetScriptText(string text) => SetEditorText(ScriptEditor, text);
-
-    private void SetHookScriptText(string text) => SetEditorText(HookScriptEditor, text);
 
     private void SetEditorText(RichTextBox editor, string text)
     {
@@ -6405,8 +6534,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     }
 
     private string GetScriptText() => GetEditorText(ScriptEditor);
-
-    private string GetHookScriptText() => GetEditorText(HookScriptEditor);
 
     private static string GetEditorText(RichTextBox editor) => new TextRange(editor.Document.ContentStart, editor.Document.ContentEnd)
         .Text.TrimEnd('\r', '\n');
@@ -6494,6 +6621,88 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return result;
     }
 
+    // ==================== 脚本页 ====================
+    // 这一页只有一个编辑器：左侧脚本库决定编辑哪个文件，顶部「保存」是唯一的写入口，
+    // 顶部「运行」按脚本用途分派（钩子脚本隔离试跑 / 验证脚本沙箱执行）。
+
+    /// <summary>新建验证脚本时的默认文件名。</summary>
+    private const string DefaultFixtureScriptFileName = "check.py";
+
+    private const string HookScriptGuideTextContent =
+        "① 挂载点：定义 on_before_send / on_after_send / on_before_write / on_after_deliver，采集期间由隔离工作进程调用。\n" +
+        "② 入参：event 是 dict，字段有 event、txnId、sessionId、hookName、method、url、host、endpoint、statusCode、\n" +
+        "    headers、bodyPreviewBase64、bodyTruncated、bodySha256、bodySize、schema。\n" +
+        "③ 存储：store.save('名称', 值) / store.load('名称') / store.list() / store.delete('名称')，落盘在工作区 scripts/data。\n" +
+        "④ 结论：返回 None 不写审计；返回 dict 形成一条 hooks.finding，可用 txnId 精确关联流量事务。\n" +
+        "⑤ 拦截改写：模块级写 INTERCEPT = [{'event': ..., 'url': r'...'}]，只有命中规则的请求才阻塞等待裁决；\n" +
+        "    命中时返回 {'url'/'method'/'status'/'headers'/'body'/'finding'} 即改写并向下传播，返回 None 原样放行。\n" +
+        "⑥ 边界：可改写的挂载点只有 request.before_send 与 response.before_write；裁决超时、脚本异常或改写超限一律放行。";
+
+    private static readonly ScriptSample[] HookScriptSamples =
+    [
+        new("记录首次出现的 API 端点（只观察）",
+            "# 钩子示例一：跨请求维护端点清单，只在首次出现时形成结论。\n" +
+            "# 只观察不改写，代理不会等待脚本，采集吞吐不受影响。\n\n" +
+            "def on_before_send(event):\n" +
+            "    key = str(event.get('method') or '') + ' ' + str(event.get('endpoint') or '')\n" +
+            "    known = store.load('api-endpoints.txt') or ''\n" +
+            "    if ('\\n' + key + '\\n') in ('\\n' + known):\n" +
+            "        return None\n" +
+            "    store.save('api-endpoints.txt', known + key + '\\n')\n" +
+            "    return {'kind': 'api.endpoint.discovered', 'method': event.get('method'), 'url': event.get('url')}"),
+        new("把错误响应升级为结论（只观察）",
+            "# 钩子示例二：只把 4xx/5xx 响应记成结论，正常响应直接返回 None。\n" +
+            "# txnId 与流量事务一一对应，可在流量探索里回溯到原始证据。\n\n" +
+            "def on_before_write(event):\n" +
+            "    status = event.get('statusCode') or 0\n" +
+            "    if status < 400:\n" +
+            "        return None\n" +
+            "    return {\n" +
+            "        'kind': 'api.response.error', 'status': status, 'url': event.get('url'),\n" +
+            "        'bodySize': event.get('bodySize'), 'bodySha256': event.get('bodySha256')\n" +
+            "    }"),
+        new("拦截改写：删掉签名头再发出去",
+            "# 钩子示例三：验证服务端是否真的校验签名头。\n" +
+            "# 只有命中 INTERCEPT 规则的请求才阻塞等待裁决，其余流量仍是即发即忘。\n" +
+            "# 规则条件全是正则，条件之间是 AND。\n\n" +
+            "INTERCEPT = [\n" +
+            "    {'event': 'request.before_send', 'url': r'/v\\d+/', 'method': r'^(POST|PUT)$'},\n" +
+            "]\n\n" +
+            "def on_before_send(event):\n" +
+            "    headers = event.get('headers') or {}\n" +
+            "    names = [name for name in headers if name.lower() in ('x-sign', 'x-signature')]\n" +
+            "    if not names:\n" +
+            "        return None\n" +
+            "    # 值为 None 表示删除该头；宿主会按实际长度重算 Content-Length。\n" +
+            "    return {\n" +
+            "        'headers': {name: None for name in names},\n" +
+            "        'finding': {'kind': 'probe.sign-removed', 'removed': names},\n" +
+            "    }"),
+        new("拦截改写：替换响应正文与状态码",
+            "# 钩子示例四：把某个接口的响应换成构造数据，观察前端如何处理。\n" +
+            "# 落库记录的是实际上线的字节，改写前的原始内容一并保留，证据链不会因为改写而失真。\n\n" +
+            "INTERCEPT = [\n" +
+            "    {'event': 'response.before_write', 'endpoint': r'/user/profile', 'status': r'^200$'},\n" +
+            "]\n\n" +
+            "def on_before_write(event):\n" +
+            "    return {\n" +
+            "        'status': 200,\n" +
+            "        'headers': {'Content-Type': 'application/json; charset=utf-8'},\n" +
+            "        'body': '{\"role\":\"admin\",\"vip\":true}',\n" +
+            "        'finding': {'kind': 'probe.response-replaced', 'url': event.get('url')},\n" +
+            "    }"),
+        new("按响应头匹配并落盘取证",
+            "# 钩子示例五：按响应头正则匹配（值为空串表示只要求该头存在），把命中的 URL 落盘。\n\n" +
+            "INTERCEPT = [\n" +
+            "    {'event': 'response.before_write', 'headers': {'Set-Cookie': r'HttpOnly'}},\n" +
+            "]\n\n" +
+            "def on_before_write(event):\n" +
+            "    seen = store.load('httponly-cookies.txt') or ''\n" +
+            "    store.save('httponly-cookies.txt', seen + str(event.get('url')) + '\\n')\n" +
+            "    # 返回 None：不改写，只留下一条可回溯的记录。\n" +
+            "    return None")
+    ];
+
     private void 脚本指南_Click(object sender, RoutedEventArgs e)
     {
         if (ScriptGuidePanel.Visibility == Visibility.Visible)
@@ -6501,46 +6710,432 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ScriptGuidePanel.Visibility = Visibility.Collapsed;
             return;
         }
-        ScriptGuideText.Text = ScriptGuideTextContent;
+        var hook = CurrentScriptPurpose == ScriptPurpose.Hook;
+        ScriptGuideTitle.Text = hook ? "脚本指南 · 钩子 API 速查" : "脚本指南 · 验证 API 速查";
+        ScriptGuideText.Text = hook ? HookScriptGuideTextContent : ScriptGuideTextContent;
         ScriptGuidePanel.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>
+    /// 在按钮下方弹出菜单。每次都重建并重新挂上：旧实现在菜单已存在时直接 return，
+    /// 用户点开菜单又点别处关掉后按钮就再也没反应了。
+    /// </summary>
+    private void ShowDropDownMenu(Button anchor, IEnumerable<MenuItem> items)
+    {
+        var menu = new ContextMenu
+        {
+            Style = (Style)FindResource("TrafficContextMenuStyle"),
+            PlacementTarget = anchor,
+            Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom
+        };
+        foreach (var item in items) menu.Items.Add(item);
+        anchor.ContextMenu = menu;
+        menu.IsOpen = true;
+    }
+
+    private MenuItem CreateDropDownItem(string header, object tag, RoutedEventHandler handler)
+    {
+        var item = new MenuItem { Header = header, Style = (Style)FindResource("TrafficMenuItemStyle"), Tag = tag };
+        item.Click += handler;
+        return item;
     }
 
     private void 插入示例_Click(object sender, RoutedEventArgs e)
     {
-        if (InsertSampleButton.ContextMenu is { } menu) return;
-        menu = new ContextMenu { Style = (Style)FindResource("TrafficContextMenuStyle") };
-        foreach (var sample in ScriptSamples)
-        {
-            var item = new MenuItem
-            {
-                Header = sample.Title,
-                Style = (Style)FindResource("TrafficMenuItemStyle"),
-                Tag = sample
-            };
-            item.Click += 示例项_Click;
-            menu.Items.Add(item);
-        }
-        InsertSampleButton.ContextMenu = menu;
-        menu.PlacementTarget = InsertSampleButton;
-        menu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
-        menu.IsOpen = true;
+        var samples = CurrentScriptPurpose == ScriptPurpose.Hook ? HookScriptSamples : ScriptSamples;
+        ShowDropDownMenu(InsertSampleButton, samples.Select(sample => CreateDropDownItem(sample.Title, sample, 示例项_Click)));
     }
 
     private void 示例项_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.Tag is not ScriptSample sample) return;
-        InsertSampleButton.ContextMenu = null;
         SetScriptText(sample.Script);
         ApplyPythonSyntaxHighlighting();
-        SandboxOutput.Foreground = Muted;
-        SandboxOutput.Text = $"已插入示例：{sample.Title}\n\n点击“运行验证”执行脚本；退出码 0 表示验证通过。";
+        MarkScriptDirty();
+        WriteRunOutput($"已插入示例：{sample.Title}\n\n点击「保存」写入脚本文件，或直接点「{RunScriptButton.Content}」执行。", Muted, "已插入示例");
     }
+
+    // ── 脚本库 ────────────────────────────────────────────────────────────────
+
+    /// <summary>读取当前工作区的钩子配置与脚本库并回填界面；空工作区先落一份默认钩子脚本。</summary>
+    private async Task LoadScriptWorkspaceAsync()
+    {
+        var workspacePath = _workspacePath;
+        TrafficHookConfiguration? configuration = null;
+        string? loadError = null;
+        try { configuration = await TrafficHookConfigStore.LoadAsync(workspacePath); }
+        catch (Exception exception) { loadError = exception.Message; }
+        var configured = configuration is not null;
+        configuration ??= new TrafficHookConfiguration(ScriptPath: HookScriptFileName,
+            Hooks: new TrafficHookSwitches(BeforeSend: true, BeforeWrite: true));
+
+        try
+        {
+            // 空脚本库对新用户等于「没有入口」，所以先给一份可直接改的默认钩子脚本。
+            if (ScriptLibraryStore.List(workspacePath).Count == 0)
+                await ScriptLibraryStore.CreateAsync(workspacePath, HookScriptFileName, ScriptPurpose.Hook, DefaultHookScriptTemplate);
+        }
+        catch (Exception exception) { loadError ??= "默认钩子脚本创建失败：" + exception.Message; }
+
+        // 工作区可能在加载期间被切换，禁止旧工作区内容回填新界面。
+        if (!string.Equals(workspacePath, _workspacePath, StringComparison.OrdinalIgnoreCase) || HookEnabledBox is null) return;
+
+        HookEnabledBox.IsChecked = configuration.Enabled;
+        var switches = configuration.Hooks ?? new TrafficHookSwitches();
+        HookBeforeSendBox.IsChecked = switches.BeforeSend;
+        HookAfterSendBox.IsChecked = switches.AfterSend;
+        HookBeforeWriteBox.IsChecked = switches.BeforeWrite;
+        HookAfterDeliverBox.IsChecked = switches.AfterDeliver;
+        _activeHookScriptPath = string.IsNullOrWhiteSpace(configuration.ScriptPath) ? null : configuration.ScriptPath;
+        _activeHookScriptFileName = ResolveActiveHookFileName(workspacePath, _activeHookScriptPath);
+        RefreshScriptLibrary(_activeHookScriptFileName);
+        UpdateHookStatusLine(loadError ?? (configured
+            ? null
+            : "当前工作区尚无钩子配置；改完点顶部「保存」即可写入，下次启动采集生效。"), isError: loadError is not null);
+        if (loadError is null) await RefreshScriptHookRuntimeStatusAsync();
+    }
+
+    /// <summary>
+    /// 把配置里的 scriptPath 还原为脚本库中的文件名。指向 scripts 目录之外的绝对路径无法在库里管理，
+    /// 这时返回 null——但原始 scriptPath 会保留在 <see cref="_activeHookScriptPath"/> 里，保存时原样写回。
+    /// </summary>
+    private static string? ResolveActiveHookFileName(string workspacePath, string? scriptPath)
+    {
+        if (string.IsNullOrWhiteSpace(scriptPath)) return null;
+        try
+        {
+            var full = Path.GetFullPath(TrafficHookConfigStore.ResolveScriptPath(workspacePath, scriptPath));
+            var directory = Path.GetFullPath(TrafficHookConfigStore.GetScriptsDirectory(workspacePath));
+            return string.Equals(Path.GetDirectoryName(full), directory, StringComparison.OrdinalIgnoreCase)
+                ? Path.GetFileName(full)
+                : null;
+        }
+        catch (Exception exception) when (exception is ArgumentException or PathTooLongException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>重新枚举工作区 scripts 目录并回填列表；随后把 <paramref name="selectFileName"/> 载入编辑器。</summary>
+    private void RefreshScriptLibrary(string? selectFileName)
+    {
+        if (ScriptList is null) return;
+        IReadOnlyList<ScriptLibraryItem> items;
+        try { items = ScriptLibraryStore.List(_workspacePath); }
+        catch (Exception exception)
+        {
+            UpdateHookStatusLine("脚本库读取失败：" + exception.Message, isError: true);
+            return;
+        }
+        _suppressScriptListChange = true;
+        Scripts.Clear();
+        foreach (var item in items)
+        {
+            Scripts.Add(new ScriptRow(item)
+            {
+                IsActiveHook = _activeHookScriptFileName is not null &&
+                               string.Equals(item.FileName, _activeHookScriptFileName, StringComparison.OrdinalIgnoreCase)
+            });
+        }
+        ScriptLibraryCountText.Text = Scripts.Count == 0 ? "空" : $"{Scripts.Count} 个";
+        ActiveHookScriptText.Text = _activeHookScriptPath ?? "尚未指定";
+        var target = Scripts.FirstOrDefault(row => string.Equals(row.FileName, selectFileName, StringComparison.OrdinalIgnoreCase))
+                     ?? Scripts.FirstOrDefault(row => row.IsActiveHook)
+                     ?? Scripts.FirstOrDefault();
+        ScriptList.SelectedItem = target;
+        _suppressScriptListChange = false;
+        if (target is null)
+        {
+            _currentScript = null;
+            UpdateScriptHeader();
+            return;
+        }
+        LoadScriptIntoEditor(target);
+    }
+
+    private void LoadScriptIntoEditor(ScriptRow row)
+    {
+        string text;
+        try { text = File.ReadAllText(row.FullPath); }
+        catch (Exception exception)
+        {
+            UpdateHookStatusLine($"脚本 {row.FileName} 读取失败：{exception.Message}", isError: true);
+            return;
+        }
+        _currentScript = row;
+        _loadedScriptText = text;
+        SetScriptText(text);
+        ApplyPythonSyntaxHighlighting();
+        ApplyScriptPurposeCombo(row.Purpose);
+        _scriptDirty = false;
+        UpdateScriptHeader();
+    }
+
+    private void 脚本列表_选择变化(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressScriptListChange || ScriptList.SelectedItem is not ScriptRow row || ReferenceEquals(row, _currentScript)) return;
+        if (_scriptDirty && _currentScript is not null && !ConfirmDiscardScriptChanges(_currentScript))
+        {
+            _suppressScriptListChange = true;
+            ScriptList.SelectedItem = _currentScript;
+            _suppressScriptListChange = false;
+            return;
+        }
+        LoadScriptIntoEditor(row);
+    }
+
+    private bool ConfirmDiscardScriptChanges(ScriptRow row) =>
+        MessageBox.Show(this, $"脚本 {row.FileName} 有未保存的修改，切换后会丢失。\n\n仍要切换吗？",
+            "未保存的修改", MessageBoxButton.OKCancel, MessageBoxImage.Warning) == MessageBoxResult.OK;
+
+    private void ApplyScriptPurposeCombo(ScriptPurpose purpose)
+    {
+        if (ScriptPurposeCombo is null) return;
+        _suppressScriptPurposeChange = true;
+        ScriptPurposeCombo.SelectedIndex = purpose == ScriptPurpose.Fixture ? 1 : 0;
+        _suppressScriptPurposeChange = false;
+    }
+
+    private void 脚本用途_变化(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressScriptPurposeChange) return;
+        var purpose = ScriptPurposeCombo.SelectedIndex == 1 ? ScriptPurpose.Fixture : ScriptPurpose.Hook;
+        // 用途和脚本内容一起在「保存」时落盘，保持这一页只有一个写入口。
+        _currentScript?.SetPurpose(purpose);
+        MarkScriptDirty();
+        UpdateScriptHeader();
+    }
+
+    private void MarkScriptDirty()
+    {
+        if (_scriptDirty) return;
+        _scriptDirty = true;
+        UpdateScriptHeader();
+    }
+
+    private void UpdateScriptHeader()
+    {
+        if (CurrentScriptNameText is null) return;
+        CurrentScriptNameText.Text = _currentScript?.FileName ?? "尚未选择脚本";
+        ScriptDirtyText.Text = _scriptDirty ? "● 未保存" : string.Empty;
+        var hook = CurrentScriptPurpose == ScriptPurpose.Hook;
+        RunScriptButton.Content = hook ? "试跑钩子" : "运行验证";
+        ScriptEditorHintText.Text = hook
+            ? "智能提示：Ctrl+J 唤出（Ctrl+空格 常被中文输入法拦截，Alt+/ 亦可）。输入 event.get('、store.、字典字段或任意标识符前两个字母会自动弹出；Enter/Tab 插入，Esc 关闭。"
+            : "智能提示：Ctrl+J 唤出（Ctrl+空格 常被中文输入法拦截，Alt+/ 亦可）。输入 fixture. 或事务字段前两个字母会自动弹出；Enter/Tab 插入，Esc 关闭。";
+    }
+
+    private void 新建脚本_Click(object sender, RoutedEventArgs e) =>
+        ShowDropDownMenu(NewScriptButton,
+        [
+            CreateDropDownItem("新建钩子脚本（采集期间执行）", ScriptPurpose.Hook, 新建脚本项_Click),
+            CreateDropDownItem("新建验证脚本（对流量快照跑一次）", ScriptPurpose.Fixture, 新建脚本项_Click)
+        ]);
+
+    private async void 新建脚本项_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not ScriptPurpose purpose) return;
+        if (_scriptDirty && _currentScript is not null && !ConfirmDiscardScriptChanges(_currentScript)) return;
+        try
+        {
+            var requested = ScriptNameBox.Text;
+            var baseName = string.IsNullOrWhiteSpace(requested)
+                ? (purpose == ScriptPurpose.Hook ? HookScriptFileName : DefaultFixtureScriptFileName)
+                : requested;
+            var fileName = ScriptLibraryStore.CreateUniqueFileName(_workspacePath, baseName);
+            var template = purpose == ScriptPurpose.Hook ? DefaultHookScriptTemplate : DefaultGuidedScript;
+            await ScriptLibraryStore.CreateAsync(_workspacePath, fileName, purpose, template);
+            ScriptNameBox.Clear();
+            RefreshScriptLibrary(fileName);
+            UpdateHookStatusLine($"已新建 {fileName}。");
+        }
+        catch (Exception exception)
+        {
+            UpdateHookStatusLine("新建脚本失败：" + exception.Message, isError: true);
+        }
+    }
+
+    private async void 重命名脚本_Click(object sender, RoutedEventArgs e)
+    {
+        var row = _currentScript;
+        if (row is null)
+        {
+            UpdateHookStatusLine("请先在脚本库中选择要重命名的脚本。", isError: true);
+            return;
+        }
+        try
+        {
+            var target = await ScriptLibraryStore.RenameAsync(_workspacePath, row.FileName, ScriptNameBox.Text);
+            var notice = $"已重命名为 {target}。";
+            if (row.IsActiveHook)
+            {
+                // 采集钩子的 scriptPath 必须跟着改，否则配置会指向一个已经不存在的文件。
+                _activeHookScriptFileName = target;
+                _activeHookScriptPath = target;
+                await SaveHookConfigurationAsync();
+                notice += "采集钩子配置已同步更新。";
+            }
+            ScriptNameBox.Clear();
+            RefreshScriptLibrary(target);
+            UpdateHookStatusLine(notice);
+        }
+        catch (Exception exception)
+        {
+            UpdateHookStatusLine("重命名失败：" + exception.Message, isError: true);
+        }
+    }
+
+    private async void 删除脚本_Click(object sender, RoutedEventArgs e)
+    {
+        var row = _currentScript;
+        if (row is null)
+        {
+            UpdateHookStatusLine("请先在脚本库中选择要删除的脚本。", isError: true);
+            return;
+        }
+        if (row.IsActiveHook)
+        {
+            UpdateHookStatusLine("该脚本是当前采集钩子，请先把其他脚本设为采集钩子再删除。", isError: true);
+            return;
+        }
+        if (MessageBox.Show(this, $"确定删除脚本 {row.FileName} 吗？\n\n文件会从工作区 scripts 目录中移除，无法撤销。",
+                "删除脚本", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        try
+        {
+            await ScriptLibraryStore.DeleteAsync(_workspacePath, row.FileName);
+            _currentScript = null;
+            _scriptDirty = false;
+            RefreshScriptLibrary(null);
+            UpdateHookStatusLine($"已删除 {row.FileName}。");
+        }
+        catch (Exception exception)
+        {
+            UpdateHookStatusLine("删除失败：" + exception.Message, isError: true);
+        }
+    }
+
+    private async void 刷新脚本库_Click(object sender, RoutedEventArgs e)
+    {
+        if (_scriptDirty && _currentScript is not null && !ConfirmDiscardScriptChanges(_currentScript)) return;
+        _scriptDirty = false;
+        await LoadScriptWorkspaceAsync();
+    }
+
+    private void 设为采集钩子_Click(object sender, RoutedEventArgs e)
+    {
+        var row = _currentScript;
+        if (row is null)
+        {
+            UpdateHookStatusLine("请先在脚本库中选择要用作采集钩子的脚本。", isError: true);
+            return;
+        }
+        if (CurrentScriptPurpose != ScriptPurpose.Hook)
+        {
+            UpdateHookStatusLine("只有钩子脚本能作为采集钩子；请先把上方「用途」改为「钩子脚本」。", isError: true);
+            return;
+        }
+        _activeHookScriptFileName = row.FileName;
+        _activeHookScriptPath = row.FileName;
+        foreach (var item in Scripts)
+            item.IsActiveHook = string.Equals(item.FileName, row.FileName, StringComparison.OrdinalIgnoreCase);
+        ActiveHookScriptText.Text = row.FileName;
+        UpdateHookStatusLine($"已选定 {row.FileName} 为采集钩子，点击顶部「保存」写入工作区。");
+    }
+
+    // ── 保存 ──────────────────────────────────────────────────────────────────
+
+    /// <summary>把编辑器内容与右侧钩子配置一并写入当前工作区：这一页唯一的写入口。</summary>
+    private async void 保存脚本_Click(object sender, RoutedEventArgs e)
+    {
+        SaveScriptButton.IsEnabled = false;
+        try
+        {
+            var purpose = CurrentScriptPurpose;
+            var scriptText = GetScriptText();
+            if (string.IsNullOrWhiteSpace(scriptText)) throw new InvalidOperationException("脚本内容不能为空。");
+            string fileName;
+            if (_currentScript is null)
+            {
+                fileName = ScriptLibraryStore.CreateUniqueFileName(_workspacePath,
+                    purpose == ScriptPurpose.Hook ? HookScriptFileName : DefaultFixtureScriptFileName);
+                await ScriptLibraryStore.CreateAsync(_workspacePath, fileName, purpose, scriptText);
+            }
+            else
+            {
+                fileName = _currentScript.FileName;
+                await TrafficHookConfigStore.SaveScriptToPathAsync(_currentScript.FullPath, scriptText);
+                await ScriptLibraryStore.SetPurposeAsync(_workspacePath, fileName, purpose);
+            }
+            var configurationNotice = await SaveHookConfigurationAsync();
+            _loadedScriptText = scriptText;
+            _scriptDirty = false;
+            RefreshScriptLibrary(fileName);
+            UpdateHookStatusLine($"已保存 {fileName}。{configurationNotice}");
+        }
+        catch (Exception exception)
+        {
+            UpdateHookStatusLine("保存失败：" + exception.Message, isError: true);
+        }
+        finally
+        {
+            SaveScriptButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>写 hook-config.json 并留审计；启用状态下的必要条件在这里集中校验。</summary>
+    private async Task<string> SaveHookConfigurationAsync()
+    {
+        var switches = new TrafficHookSwitches(HookBeforeSendBox.IsChecked == true, HookAfterSendBox.IsChecked == true,
+            HookBeforeWriteBox.IsChecked == true, HookAfterDeliverBox.IsChecked == true);
+        var enabled = HookEnabledBox.IsChecked == true;
+        if (enabled && string.IsNullOrWhiteSpace(_activeHookScriptPath))
+            throw new InvalidOperationException("启用请求钩子前，需要先用「设为采集钩子」指定采集期间执行的脚本。");
+        if (enabled && switches.EnabledCount == 0)
+            throw new InvalidOperationException("启用请求钩子时至少需要勾选一个挂载点。");
+        var configuration = new TrafficHookConfiguration(enabled, _activeHookScriptPath, switches);
+        await TrafficHookConfigStore.SaveConfigAsync(_workspacePath, configuration);
+        await new WorkspaceStore(_workspacePath).AppendAuditAsync(AuditEventHooksConfigSaved, new
+        {
+            enabled = configuration.Enabled,
+            scriptPath = configuration.ScriptPath,
+            hooks = new
+            {
+                beforeSend = switches.BeforeSend,
+                afterSend = switches.AfterSend,
+                beforeWrite = switches.BeforeWrite,
+                afterDeliver = switches.AfterDeliver
+            }
+        });
+        return enabled ? "采集钩子配置已保存，下次启动采集生效。" : "采集钩子配置已保存（未启用）。";
+    }
+
+    // ── 运行 ──────────────────────────────────────────────────────────────────
 
     private async void 运行脚本_Click(object sender, RoutedEventArgs e)
     {
-        RunSandboxButton.IsEnabled = false;
-        SandboxOutput.Foreground = Accent;
-        SandboxOutput.Text = "正在执行静态策略检查与隔离验证…";
+        RunScriptButton.IsEnabled = false;
+        try
+        {
+            if (CurrentScriptPurpose == ScriptPurpose.Hook) await RunHookDryRunAsync();
+            else await RunFixtureValidationAsync();
+        }
+        finally
+        {
+            RunScriptButton.IsEnabled = true;
+        }
+    }
+
+    private void WriteRunOutput(string text, Brush foreground, string state)
+    {
+        SandboxOutput.Foreground = foreground;
+        SandboxOutput.Text = text;
+        ScriptRunStateText.Text = state;
+    }
+
+    /// <summary>验证脚本：把当前流量表投影成脱敏 fixture，交给隔离沙箱执行一次。</summary>
+    private async Task RunFixtureValidationAsync()
+    {
+        WriteRunOutput("正在执行静态策略检查与隔离验证…", Accent, "运行中");
         var jobPath = Path.Combine(Path.GetTempPath(), "netmind-job-" + Guid.NewGuid().ToString("N") + ".json");
         try
         {
@@ -6548,11 +7143,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var hostAssembly = Path.Combine(AppContext.BaseDirectory, SandboxHostDirectoryName, SandboxHostAssemblyName);
             if (!File.Exists(hostExecutable) && !File.Exists(hostAssembly))
                 throw new FileNotFoundException("独立脚本沙箱后台不可用，请重新构建工作台项目。", hostExecutable);
-            var transactions = TrafficRows.Select(item => item.Source);
+            var transactions = TrafficRows.Select(item => item.Source).ToArray();
             var fixtureJson = AiPrivacyFilter.BuildScriptFixture(transactions);
             var job = new SandboxJob(GetScriptText(), JsonSerializer.SerializeToElement(fixtureJson, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
             await File.WriteAllTextAsync(jobPath, JsonSerializer.Serialize(job, new JsonSerializerOptions(JsonSerializerDefaults.Web)), new UTF8Encoding(false));
-            var startInfo = new ProcessStartInfo(File.Exists(hostExecutable) ? hostExecutable : "dotnet")
+            var startInfo = new ProcessStartInfo(File.Exists(hostExecutable) ? hostExecutable : DotnetCommandName)
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -6572,63 +7167,77 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var error = await standardError;
             var result = JsonSerializer.Deserialize<SandboxResult>(json.Trim(), new JsonSerializerOptions(JsonSerializerDefaults.Web));
             if (result is null) throw new InvalidDataException(string.IsNullOrWhiteSpace(error) ? "脚本沙箱返回了无效结果。" : error.Trim());
-            SandboxOutput.Foreground = result.Succeeded ? Green : Red;
+            // 流量表为空是常见状态（刚开始采集），fixture 会是 0 条；先说清楚，免得脚本里的 assert 失败显得莫名其妙。
+            var fixtureNotice = transactions.Length == 0
+                ? "当前流量表为空，fixture.transactions 是 0 条。\n\n"
+                : $"输入：{Math.Min(transactions.Length, AiPrivacyFilter.ScriptFixtureMaximumTransactions)} 条已脱敏事务。\n\n";
             if (result.PolicyViolations.Count > 0)
-                SandboxOutput.Text = "策略拒绝\n\n" + string.Join("\n", result.PolicyViolations.Select(item => "• " + item));
-            else
             {
-                var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
-                var truncatedNotice = result.OutputTruncated ? "\n\n" + OutputTruncatedNotice : string.Empty;
-                SandboxOutput.Text = $"{result.State}\n\n耗时 {result.DurationMilliseconds} 毫秒 · 退出码 {result.ExitCode}\n隔离：{result.Enforcement}\n\n{(string.IsNullOrWhiteSpace(detail) ? "结果对象符合验证规则。" : detail.Trim())}{truncatedNotice}";
+                WriteRunOutput("策略拒绝\n\n" + string.Join("\n", result.PolicyViolations.Select(item => "• " + item)), Red, "策略拒绝");
+                return;
             }
+            var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
+            var truncatedNotice = result.OutputTruncated ? "\n\n" + OutputTruncatedNotice : string.Empty;
+            WriteRunOutput(
+                $"{fixtureNotice}{result.State}\n\n耗时 {result.DurationMilliseconds} 毫秒 · 退出码 {result.ExitCode}\n隔离：{result.Enforcement}\n\n" +
+                $"{(string.IsNullOrWhiteSpace(detail) ? "结果对象符合验证规则。" : detail.Trim())}{truncatedNotice}",
+                result.Succeeded ? Green : Red, result.State);
         }
         catch (Exception exception)
         {
-            SandboxOutput.Foreground = Red;
-            SandboxOutput.Text = "沙箱执行失败\n\n" + exception.Message;
+            WriteRunOutput("沙箱执行失败\n\n" + exception.Message, Red, "执行失败");
         }
         finally
         {
-            RunSandboxButton.IsEnabled = true;
-            try { if (File.Exists(jobPath)) File.Delete(jobPath); } catch { }
+            try { if (File.Exists(jobPath)) File.Delete(jobPath); } catch { /* 临时作业文件删除失败不影响结果展示。 */ }
         }
     }
 
-    // ── 请求钩子（工作区配置读写） ─────────────────────────────────────────────
-
-    /// <summary>以当前编辑器脚本和当前事务快照做隔离试跑；临时脚本与 store 目录在结束后删除。</summary>
-    private async void 试跑钩子脚本_Click(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// 钩子脚本：在临时数据目录里启动隔离工作进程，用一条事务快照走一遍已勾选的挂载点。
+    /// 不修改钩子配置，也不碰正式数据。缺流量、未勾挂载点都不再是错误——试跑本来就应该随时能跑。
+    /// </summary>
+    private async Task RunHookDryRunAsync()
     {
-        if (TestHookScriptButton is null) return;
-        TestHookScriptButton.IsEnabled = false;
         var temporaryRoot = Path.Combine(Path.GetTempPath(), "netmind-hook-dryrun-" + Guid.NewGuid().ToString("N"));
         ScriptHookEngine? engine = null;
         try
         {
-            var script = GetHookScriptText();
-            if (string.IsNullOrWhiteSpace(script)) throw new InvalidOperationException("钩子脚本不能为空。");
+            var script = GetScriptText();
+            if (string.IsNullOrWhiteSpace(script)) throw new InvalidOperationException("脚本内容不能为空。");
             var violations = PythonSandboxPolicy.Validate(script);
             if (violations.Count > 0) throw new InvalidOperationException("静态策略拒绝：" + string.Join("；", violations));
-            var traffic = SelectedTraffic?.Source ?? TrafficRows.LastOrDefault()?.Source
-                ?? throw new InvalidOperationException("当前没有可用于试跑的事务快照。");
+
+            var notices = new List<string>();
+            var traffic = SelectedTraffic?.Source ?? TrafficRows.LastOrDefault()?.Source;
+            if (traffic is null)
+            {
+                traffic = CreateDryRunSampleTraffic();
+                notices.Add("当前没有流量，已用内置示例事务试跑。");
+            }
 
             var enabledEvents = new List<string>();
             if (HookBeforeSendBox.IsChecked == true) enabledEvents.Add(HookEventNames.RequestBeforeSend);
             if (HookAfterSendBox.IsChecked == true) enabledEvents.Add(HookEventNames.RequestAfterSend);
             if (HookBeforeWriteBox.IsChecked == true) enabledEvents.Add(HookEventNames.ResponseBeforeWrite);
             if (HookAfterDeliverBox.IsChecked == true) enabledEvents.Add(HookEventNames.ResponseAfterDeliver);
-            if (enabledEvents.Count == 0) throw new InvalidOperationException("请至少勾选一个钩子点再试跑。");
+            if (enabledEvents.Count == 0)
+            {
+                enabledEvents.AddRange([HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
+                    HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver]);
+                notices.Add("右侧未勾选挂载点，本次按四个挂载点全开试跑（不改动配置）。");
+            }
 
             var hostExecutable = Path.Combine(AppContext.BaseDirectory, SandboxHostDirectoryName, SandboxHostExecutableName);
             var hostAssembly = Path.Combine(AppContext.BaseDirectory, SandboxHostDirectoryName, SandboxHostAssemblyName);
             if (!File.Exists(hostExecutable) && !File.Exists(hostAssembly))
                 throw new FileNotFoundException("独立脚本沙箱后台不可用，请重新构建工作台项目。", hostExecutable);
+            WriteRunOutput("正在隔离试跑当前脚本…", Accent, "试跑中");
             Directory.CreateDirectory(temporaryRoot);
             var scriptPath = Path.Combine(temporaryRoot, HookScriptFileName);
             await File.WriteAllTextAsync(scriptPath, script, new UTF8Encoding(false));
             engine = new ScriptHookEngine(File.Exists(hostExecutable) ? hostExecutable : DotnetCommandName,
                 File.Exists(hostExecutable) ? null : hostAssembly, scriptPath, Path.Combine(temporaryRoot, HookDataDirectoryName), enabledEvents);
-            UpdateHookStatusLine("正在隔离试跑当前脚本…");
             if (!await engine.StartAsync())
             {
                 var failed = engine.GetMetricsSnapshot();
@@ -6646,140 +7255,52 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 await Task.Delay(50);
             var metrics = engine.GetMetricsSnapshot();
             var findings = engine.DrainFindings();
-            var detail = $"隔离试跑完成：投递 {metrics.DeliveredEvents}/{enabledEvents.Count} · 处理 {metrics.ProcessedEvents} · " +
-                         $"结论 {metrics.Findings} · 错误 {metrics.WorkerErrors}";
-            if (metrics.ProcessedEvents < enabledEvents.Count) detail += "\n等待处理完成超时，请检查脚本是否阻塞。";
-            if (!string.IsNullOrWhiteSpace(metrics.LastError)) detail += "\n最近错误：" + metrics.LastError;
+            var builder = new StringBuilder();
+            foreach (var notice in notices) builder.Append(notice).Append('\n');
+            if (notices.Count > 0) builder.Append('\n');
+            builder.Append($"试跑事务：{traffic.Method} {traffic.Url}\n")
+                   .Append($"挂载点：{string.Join('、', enabledEvents)}\n\n")
+                   .Append($"投递 {metrics.DeliveredEvents}/{enabledEvents.Count} · 处理 {metrics.ProcessedEvents} · ")
+                   .Append($"结论 {metrics.Findings} · 错误 {metrics.WorkerErrors}");
+            var failedRun = metrics.WorkerErrors > 0 || metrics.ProcessedEvents < enabledEvents.Count;
+            if (metrics.ProcessedEvents < enabledEvents.Count) builder.Append("\n\n等待处理完成超时，请检查脚本是否阻塞。");
+            if (!string.IsNullOrWhiteSpace(metrics.LastError)) builder.Append("\n\n最近错误：").Append(metrics.LastError);
             if (findings.Count > 0)
             {
                 var preview = string.Join("\n", findings.Take(4).Select(finding =>
                     $"{finding.Event}：{JsonSerializer.Serialize(finding.Data)}"));
-                detail += "\n试跑结论：\n" + (preview.Length > 1600 ? preview[..1600] + "…" : preview);
+                builder.Append("\n\n试跑结论：\n").Append(preview.Length > 1600 ? preview[..1600] + "…" : preview);
             }
-            else if (metrics.WorkerErrors == 0) detail += "\n脚本返回 None 或未定义对应函数，因此没有生成结论。";
-            UpdateHookStatusLine(detail, isError: metrics.WorkerErrors > 0 || metrics.ProcessedEvents < enabledEvents.Count);
+            else if (metrics.WorkerErrors == 0)
+            {
+                builder.Append("\n\n脚本返回 None 或未定义对应函数，因此没有生成结论。");
+            }
+            WriteRunOutput(builder.ToString(), failedRun ? Red : Green, failedRun ? "试跑异常" : "试跑完成");
         }
         catch (Exception exception)
         {
-            UpdateHookStatusLine("隔离试跑失败：" + exception.Message, isError: true);
+            WriteRunOutput("隔离试跑失败\n\n" + exception.Message, Red, "试跑失败");
         }
         finally
         {
             if (engine is not null) await engine.DisposeAsync();
-            TestHookScriptButton.IsEnabled = true;
-            try { if (Directory.Exists(temporaryRoot)) Directory.Delete(temporaryRoot, recursive: true); } catch { }
+            try { if (Directory.Exists(temporaryRoot)) Directory.Delete(temporaryRoot, recursive: true); } catch { /* 临时目录清理失败不影响结果展示。 */ }
         }
     }
 
-    /// <summary>读取当前工作区的钩子配置与脚本并回填界面；缺失时保持默认模板，损坏时中文提示。</summary>
-    private async Task LoadHookConfigurationAsync()
+    /// <summary>流量表为空时的兜底试跑事务：让「运行」在任何时刻都能给出结果，而不是报「没有可用快照」。</summary>
+    private static TrafficRecord CreateDryRunSampleTraffic() => new(
+        Guid.NewGuid(), DateTimeOffset.Now, "POST", "/v1/user/login", 200, 42, 128,
+        "netmind-dryrun", "HTTP/1.1",
+        "{\"username\":\"demo\",\"password\":\"demo\"}",
+        "{\"token\":\"demo-token\",\"expiresIn\":3600}",
+        Url: "https://api.example.com/v1/user/login");
+
+    private void 钩子勾选_Changed(object sender, RoutedEventArgs e)
     {
-        var workspacePath = _workspacePath;
-        TrafficHookConfiguration? configuration = null;
-        var configured = false;
-        string? loadError = null;
-        try
-        {
-            configuration = await TrafficHookConfigStore.LoadAsync(workspacePath);
-            configured = configuration is not null;
-        }
-        catch (Exception exception) { loadError = exception.Message; }
-        configuration ??= new TrafficHookConfiguration(Hooks: new TrafficHookSwitches(BeforeSend: true, BeforeWrite: true));
-
-        var scriptText = DefaultHookScriptTemplate;
-        var scriptFilePath = TrafficHookConfigStore.GetDefaultScriptPath(workspacePath);
-        if (!string.IsNullOrWhiteSpace(configuration.ScriptPath))
-        {
-            var resolvedPath = TrafficHookConfigStore.ResolveScriptPath(workspacePath, configuration.ScriptPath);
-            if (File.Exists(resolvedPath))
-            {
-                try
-                {
-                    scriptText = await File.ReadAllTextAsync(resolvedPath);
-                    scriptFilePath = resolvedPath;
-                }
-                catch (Exception exception) { loadError = "钩子脚本读取失败：" + exception.Message; }
-            }
-        }
-        // 工作区可能在加载期间被切换，禁止旧工作区内容回填新界面。
-        if (!string.Equals(workspacePath, _workspacePath, StringComparison.OrdinalIgnoreCase) || HookEnabledBox is null) return;
-
-        HookEnabledBox.IsChecked = configuration.Enabled;
-        var switches = configuration.Hooks ?? new TrafficHookSwitches();
-        HookBeforeSendBox.IsChecked = switches.BeforeSend;
-        HookAfterSendBox.IsChecked = switches.AfterSend;
-        HookBeforeWriteBox.IsChecked = switches.BeforeWrite;
-        HookAfterDeliverBox.IsChecked = switches.AfterDeliver;
-        _hookScriptFilePath = scriptFilePath;
-        _hookConfigScriptPath = string.IsNullOrWhiteSpace(configuration.ScriptPath) ? null : configuration.ScriptPath;
-        SetHookScriptText(scriptText);
-        ApplyPythonSyntaxHighlighting(HookScriptEditor);
-        UpdateHookStatusLine(loadError ?? (configured
-            ? (configuration.Enabled ? "已加载当前工作区的钩子配置。" : "已加载当前工作区的钩子配置（未启用）。")
-            : "当前工作区尚无钩子配置，上方为默认模板；保存后下次启动采集生效。"),
-            isError: loadError is not null);
-        if (loadError is null) await RefreshScriptHookRuntimeStatusAsync();
+        MarkScriptDirty();
+        UpdateHookStatusLine();
     }
-
-    /// <summary>把界面中的钩子脚本与勾选状态原子写入当前工作区（脚本 + hook-config.json）。</summary>
-    private async void 保存钩子配置_Click(object sender, RoutedEventArgs e)
-    {
-        try
-        {
-            var scriptText = GetHookScriptText();
-            if (string.IsNullOrWhiteSpace(scriptText)) throw new InvalidOperationException("钩子脚本不能为空。");
-            // 当前加载的脚本路径非默认 hook-script.py 时写回原路径并保留配置中的 scriptPath，
-            // 避免静默覆盖自定义脚本路径；仅默认路径场景写 hook-script.py。
-            var defaultScriptPath = TrafficHookConfigStore.GetDefaultScriptPath(_workspacePath);
-            var keepCustomPath = !string.IsNullOrWhiteSpace(_hookConfigScriptPath) &&
-                !string.Equals(_hookConfigScriptPath, HookScriptFileName, StringComparison.OrdinalIgnoreCase);
-            string scriptSavePath;
-            string? configScriptPath;
-            if (keepCustomPath && _hookScriptFilePath is not null &&
-                !string.Equals(_hookScriptFilePath, defaultScriptPath, StringComparison.OrdinalIgnoreCase))
-            {
-                scriptSavePath = _hookScriptFilePath;
-                configScriptPath = _hookConfigScriptPath;
-            }
-            else
-            {
-                scriptSavePath = defaultScriptPath;
-                configScriptPath = HookScriptFileName;
-            }
-            var configuration = new TrafficHookConfiguration(
-                HookEnabledBox.IsChecked == true,
-                configScriptPath,
-                new TrafficHookSwitches(HookBeforeSendBox.IsChecked == true, HookAfterSendBox.IsChecked == true,
-                    HookBeforeWriteBox.IsChecked == true, HookAfterDeliverBox.IsChecked == true));
-            if (configuration.Enabled && configuration.Hooks!.EnabledCount == 0)
-                throw new InvalidOperationException("启用钩子时至少需要勾选一个钩子点。");
-            await TrafficHookConfigStore.SaveScriptToPathAsync(scriptSavePath, scriptText);
-            await TrafficHookConfigStore.SaveConfigAsync(_workspacePath, configuration);
-            _hookScriptFilePath = scriptSavePath;
-            _hookConfigScriptPath = configScriptPath;
-            await new WorkspaceStore(_workspacePath).AppendAuditAsync(AuditEventHooksConfigSaved, new
-            {
-                enabled = configuration.Enabled,
-                scriptPath = configuration.ScriptPath,
-                hooks = new
-                {
-                    beforeSend = configuration.Hooks!.BeforeSend,
-                    afterSend = configuration.Hooks.AfterSend,
-                    beforeWrite = configuration.Hooks.BeforeWrite,
-                    afterDeliver = configuration.Hooks.AfterDeliver
-                }
-            });
-            UpdateHookStatusLine("钩子配置已保存，下次启动采集生效。");
-        }
-        catch (Exception exception)
-        {
-            UpdateHookStatusLine("保存失败：" + exception.Message, isError: true);
-        }
-    }
-
-    private async void 加载钩子配置_Click(object sender, RoutedEventArgs e) => await LoadHookConfigurationAsync();
-
-    private void 钩子勾选_Changed(object sender, RoutedEventArgs e) => UpdateHookStatusLine();
 
     /// <summary>读取采集后台原子发布的脚本 Hook 指标；状态文件仅含计数和脱敏错误摘要。</summary>
     private async Task RefreshScriptHookRuntimeStatusAsync()
@@ -6815,18 +7336,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    /// <summary>刷新钩子区块状态行与折叠头摘要：启用状态、已勾选钩子点数、脚本是否存在。</summary>
+    /// <summary>刷新钩子状态行：启用状态、已勾选挂载点数、当前采集钩子脚本。</summary>
     private void UpdateHookStatusLine(string? notice = null, bool isError = false)
     {
         if (HookStatusText is null || HookEnabledBox is null) return;
         var enabled = HookEnabledBox.IsChecked == true;
         var hookCount = new TrafficHookSwitches(HookBeforeSendBox.IsChecked == true, HookAfterSendBox.IsChecked == true,
             HookBeforeWriteBox.IsChecked == true, HookAfterDeliverBox.IsChecked == true).EnabledCount;
-        var scriptExists = _hookScriptFilePath is not null && File.Exists(_hookScriptFilePath);
-        var summary = $"工作区钩子配置：{(enabled ? "已启用" : "未启用")} · 已勾选 {hookCount}/4 个钩子点 · {(scriptExists ? "钩子脚本已存在" : "钩子脚本尚不存在")}";
-        HookHeaderStatusText.Text = summary;
+        var configured = !string.IsNullOrWhiteSpace(_activeHookScriptPath);
+        var summary = $"{(enabled ? "已启用" : "未启用")} · 挂载点 {hookCount}/4 · " +
+                      (configured ? "钩子脚本 " + _activeHookScriptPath : "尚未指定钩子脚本");
         HookStatusText.Text = notice is null ? summary : summary + "\n" + notice;
-        HookStatusText.Foreground = isError ? Red : enabled && hookCount > 0 && scriptExists ? Green : Muted;
+        HookStatusText.Foreground = isError ? Red : enabled && hookCount > 0 && configured ? Green : Muted;
     }
 }
 
@@ -6966,4 +7487,48 @@ public sealed class SessionRow(CaptureSessionSummary summary)
             return duration.TotalHours >= 1 ? $"{duration.TotalHours:0.0} 小时" : duration.TotalMinutes >= 1 ? $"{duration.TotalMinutes:0.0} 分钟" : $"{Math.Max(0, duration.TotalSeconds):0} 秒";
         }
     }
+}
+
+/// <summary>脚本库列表行。用途与「是否采集钩子」会在界面上原地变化，所以需要变更通知。</summary>
+public sealed class ScriptRow(ScriptLibraryItem item) : INotifyPropertyChanged
+{
+    private ScriptPurpose _purpose = item.Purpose;
+    private bool _isActiveHook;
+
+    public string FileName { get; } = item.FileName;
+    public string FullPath { get; } = item.FullPath;
+    public ScriptPurpose Purpose => _purpose;
+
+    public bool IsActiveHook
+    {
+        get => _isActiveHook;
+        set
+        {
+            if (_isActiveHook == value) return;
+            _isActiveHook = value;
+            OnPropertyChanged(nameof(IsActiveHook));
+            OnPropertyChanged(nameof(StateText));
+        }
+    }
+
+    public string StateText => _isActiveHook ? "采集启用" : string.Empty;
+    public string PurposeText => _purpose == ScriptPurpose.Fixture ? "验证脚本" : "钩子脚本";
+    public string Detail => $"{PurposeText} · {item.UpdatedAt.ToLocalTime():MM-dd HH:mm} · {FormatSize(item.SizeBytes)}";
+
+    public void SetPurpose(ScriptPurpose purpose)
+    {
+        if (_purpose == purpose) return;
+        _purpose = purpose;
+        OnPropertyChanged(nameof(Purpose));
+        OnPropertyChanged(nameof(PurposeText));
+        OnPropertyChanged(nameof(Detail));
+    }
+
+    private static string FormatSize(long bytes) =>
+        bytes >= 1024 ? $"{bytes / 1024.0:0.#} KB" : $"{bytes} B";
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void OnPropertyChanged(string propertyName) =>
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 }

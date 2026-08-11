@@ -146,18 +146,18 @@ public sealed class ProcessPickerWindow : Window
                 new Setter(Control.BorderThicknessProperty, new Thickness(0, 0, 1, 1)),
             }
         };
-        DataGridTextColumn Column(string header, string binding, double? width = null) => new()
+        // 宽度必须用 DataGridLength：它拒绝 NaN 与无穷大（两者都抛「不应允许无限值」），
+        // 因此不能沿用 FrameworkElement.Width 那套「NaN 表示自动」的约定。
+        DataGridTextColumn Column(string header, string binding, DataGridLength width) => new()
         {
             Header = header,
             Binding = new System.Windows.Data.Binding(binding),
-            Width = width ?? double.NaN,
+            Width = width,
             IsReadOnly = true,
         };
-        grid.Columns.Add(Column("进程名", nameof(ProcessRow.Name), 180));
-        grid.Columns.Add(Column("PID", nameof(ProcessRow.Pid), 70));
-        var pathColumn = Column("可执行路径", nameof(ProcessRow.Path));
-        pathColumn.Width = new DataGridLength(1, DataGridLengthUnitType.Star);
-        grid.Columns.Add(pathColumn);
+        grid.Columns.Add(Column("进程名", nameof(ProcessRow.Name), new DataGridLength(180)));
+        grid.Columns.Add(Column("PID", nameof(ProcessRow.Pid), new DataGridLength(70)));
+        grid.Columns.Add(Column("可执行路径", nameof(ProcessRow.Path), new DataGridLength(1, DataGridLengthUnitType.Star)));
         return grid;
     }
 }

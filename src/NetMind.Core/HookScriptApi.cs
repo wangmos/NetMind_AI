@@ -111,4 +111,56 @@ public static class HookScriptApi
         new(HookEventNames.RequestBeforeSend, $"'{HookEventNames.RequestBeforeSend}'", "请求发往上游之前；可改写"),
         new(HookEventNames.ResponseBeforeWrite, $"'{HookEventNames.ResponseBeforeWrite}'", "响应写回浏览器之前；可改写")
     ];
+
+    /// <summary>钩子脚本可见的全部符号，供按词前缀的模糊补全使用。</summary>
+    public static IReadOnlyList<Symbol> HookVocabulary { get; } =
+    [
+        .. HookFunctions,
+        new("INTERCEPT", "INTERCEPT = [\n    {'event': '', 'url': r''},\n]\n", "模块级拦截规则声明；只有命中的流量才阻塞等待裁决"),
+        new("event", "event", "钩子函数入参，字段见 event.get('…')"),
+        new("store", "store", "宿主注入的键值存储，落盘在工作区 scripts/data")
+    ];
+
+    // ── 验证脚本（沙箱 fixture）词表 ─────────────────────────────────────────────
+
+    /// <summary>验证脚本事务字段说明。键必须覆盖 fixture 事务的全部序列化字段。</summary>
+    private static readonly Dictionary<string, string> FixtureFieldDetails = new(StringComparer.Ordinal)
+    {
+        ["method"] = "HTTP 方法",
+        ["url"] = "完整请求 URL（已脱敏）",
+        ["host"] = "主机名",
+        ["endpoint"] = "路径与查询串",
+        ["status"] = "响应状态码",
+        ["latency_ms"] = "耗时（毫秒）",
+        ["size_bytes"] = "响应字节数",
+        ["protocol"] = "协议",
+        ["process"] = "发起请求的进程名",
+        ["request_summary"] = "请求摘要（已脱敏）",
+        ["response_summary"] = "响应摘要（已脱敏）"
+    };
+
+    /// <summary>
+    /// <c>fixture.transactions</c> 中每条事务的字段。名称同样来自反射
+    /// （<see cref="AiPrivacyFilter.RedactedScriptTransaction"/> 上的 JsonPropertyName），不是手抄的常量。
+    /// </summary>
+    public static IReadOnlyList<Symbol> FixtureFields { get; } = BuildFixtureFields();
+
+    private static Symbol[] BuildFixtureFields() =>
+        [.. typeof(AiPrivacyFilter.RedactedScriptTransaction)
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(property => property.GetIndexParameters().Length == 0)
+            .Select(property => property
+                .GetCustomAttribute<System.Text.Json.Serialization.JsonPropertyNameAttribute>()?.Name ?? property.Name)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .Select(name => new Symbol(name, name,
+                FixtureFieldDetails.TryGetValue(name, out var detail) ? detail : "（尚未补充说明）"))];
+
+    /// <summary>验证脚本可见的全部符号，供按词前缀的模糊补全使用。</summary>
+    public static IReadOnlyList<Symbol> FixtureVocabulary { get; } =
+    [
+        new("fixture", "from netmind import fixture\n", "沙箱注入的输入对象；脚本首行导入"),
+        new("transactions", "fixture.transactions", $"最近 {AiPrivacyFilter.ScriptFixtureMaximumTransactions} 条已脱敏事务的列表"),
+        .. FixtureFields
+    ];
 }

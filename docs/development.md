@@ -67,7 +67,7 @@ HTTPS 解密必须保持默认关闭。每个工作区使用独立 CA，私钥�
 
 - `NetMind.Core` 不依赖 WPF，负责领域模型、工作区、内容寻址存储、脱敏审计、AI 完整上下文构建、静默抓包解析与演示数据。
 - `NetMind.CoreHost` 是独立进程，负责显式代理、静默抓包、会话生命周期和流量持久化；运行异常通过中文标准错误和非零退出码报告。
-- `NetMind.SandboxHost` 的 `run` 动词只接收暂存作业 JSON，执行静态能力检查，并在随机临时目录中以隔离参数启动 Python；Python 必须加入 kill-on-close 的 Windows Job Object，限制为单进程、有限内存、CPU 时间和墙钟时间。`hook-worker` 动词则拉起长驻钩子工作进程（只读观察、受控 store 持久化、不改写流量），契约见 `docs/scripting.md` 的请求钩子章节。脚本验证的 fixture 契约、输出契约与资源限制见 `docs/scripting.md`。
+- `NetMind.SandboxHost` 的 `run` 动词只接收暂存作业 JSON，执行静态能力检查，并在随机临时目录中以隔离参数启动 Python；Python 必须加入 kill-on-close 的 Windows Job Object，限制为单进程、有限内存、CPU 时间和墙钟时间。`hook-worker` 动词则拉起长驻钩子工作进程（默认只观察、受控 store 持久化；脚本用模块级 `INTERCEPT` 声明规则后，命中的请求才阻塞等待裁决并可改写向下传播），契约见 `docs/scripting.md` 的请求钩子章节。验证脚本的 fixture 契约、输出契约与资源限制见 `docs/scripting.md`。
 - `NetMind.Workbench` 负责中文桌面界面、交互状态与数据可视化。
 - `NetMind.SmokeTests` 以普通控制台程序验证核心安全不变量，避免引入外部测试包。
 
@@ -110,7 +110,7 @@ dotnet run --project src/NetMind.SmokeTests/NetMind.SmokeTests.csproj --configur
 
 采集浏览器必须使用独立用户数据目录和进程级 `--proxy-server` 参数，不得修改系统代理。Chromium 启动参数必须包含 `--disable-quic`，避免 HTTPS 流量绕过 TCP `CONNECT` 隧道；不得加入忽略证书错误或绕过证书固定的参数。静默抓包模式下还需为浏览器进程注入指向工作区 `keys/sslkeylog.txt` 的 `SSLKEYLOGFILE` 环境变量（仅该进程生效，不触碰全局环境），使采集后台能解密该浏览器的 HTTPS 正文；两端路径由 `SilentKeyLogRelativePath` 常量锁死，缺一端即退化为隧道模式。
 
-Windows 系统代理只在用户于设置页显式开启“无感抓包”后由采集会话接管：接管前必须先写入哨兵快照，停止时按快照还原，异常退出后下次启动依据哨兵恢复，接管与还原均写入审计日志。钩子系统必须保持默认关闭、异步只读、故障无感直通，且不得改写流量字节；加密隧道不可钩。
+Windows 系统代理只在用户于设置页显式开启“无感抓包”后由采集会话接管：接管前必须先写入哨兵快照，停止时按快照还原，异常退出后下次启动依据哨兵恢复，接管与还原均写入审计日志。钩子系统必须保持默认关闭、默认只观察、故障无感直通；只有脚本用模块级 `INTERCEPT` 显式声明规则时，命中的请求才阻塞等待裁决并允许改写，未命中的流量仍是即发即忘。裁决超时、工作进程崩溃或改写超限一律按原样放行，不得阻塞浏览器；落库记录实际上线的字节并保留改写前的原始内容，证据链不因改写而失真。加密隧道不可钩。
 
 ## 底层静默抓包
 
