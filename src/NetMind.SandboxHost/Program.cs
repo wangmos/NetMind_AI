@@ -413,32 +413,45 @@ static string GetHookDriverModuleTemplate() => """"
         _emit({'type': 'error', 'message': '钩子脚本加载失败：' + str(exception)})
         sys.exit(3)
 
-    # 脚本用模块级 INTERCEPT 声明要拦截哪些请求，随 ready 一次性上报给宿主。
+    # 脚本用模块级 INTERCEPT/OBSERVE 声明要拦截/观察哪些流量，随 ready 一次性上报给宿主。
     # 之后每个请求的匹配都在宿主进程内完成：若下推到这里判断，等于所有流量都被
-    # 单线程 worker 串行化，页面会直接卡死。未声明即纯观察，不阻塞任何请求。
-    _intercept_rules = []
-    try:
-        for _rule in (_user_globals.get('INTERCEPT') or [])[:64]:
-            if not isinstance(_rule, dict):
+    # 单线程 worker 串行化，页面会直接卡死。两者的规则形状完全一样，这里只写一份解析。
+    #
+    # OBSERVE 是默认拒绝转发的落地点：没有 OBSERVE 规则命中的事件，宿主根本不会把它
+    # 发过来，这个函数体永远看不到；不像 INTERCEPT 那样"未声明即放行"，未声明 OBSERVE
+    # 就是"未声明即不转发"。两者独立：脚本可以只用 INTERCEPT、只用 OBSERVE，或两者都用。
+    def _parse_rules(declaration_name):
+        rules = []
+        for rule in (_user_globals.get(declaration_name) or [])[:64]:
+            if not isinstance(rule, dict):
                 continue
-            _event = _rule.get('event')
-            if not isinstance(_event, str):
+            event = rule.get('event')
+            if not isinstance(event, str):
                 continue
-            _entry = {'event': _event}
+            entry = {'event': event}
             # 条件全是正则，可同时约束 URL、方法、主机、路径、正文与状态码；给出的条件之间是 AND。
-            for _field in ('url', 'method', 'host', 'endpoint', 'body', 'status'):
-                if isinstance(_rule.get(_field), str):
-                    _entry[_field] = _rule[_field]
+            for field in ('url', 'method', 'host', 'endpoint', 'body', 'status'):
+                if isinstance(rule.get(field), str):
+                    entry[field] = rule[field]
             # headers: {头名: 值正则}；值为空串表示只要求该头存在。
-            if isinstance(_rule.get('headers'), dict):
-                _entry['headers'] = {str(_n): ('' if _v is None else str(_v))
-                                     for _n, _v in list(_rule['headers'].items())[:64]}
-            _intercept_rules.append(_entry)
+            if isinstance(rule.get('headers'), dict):
+                entry['headers'] = {str(name): ('' if value is None else str(value))
+                                     for name, value in list(rule['headers'].items())[:64]}
+            rules.append(entry)
+        return rules
+
+    try:
+        _intercept_rules = _parse_rules('INTERCEPT')
     except Exception as exception:
         _emit({'type': 'error', 'message': 'INTERCEPT 声明无法解析：' + str(exception)})
         _intercept_rules = []
+    try:
+        _observe_rules = _parse_rules('OBSERVE')
+    except Exception as exception:
+        _emit({'type': 'error', 'message': 'OBSERVE 声明无法解析：' + str(exception)})
+        _observe_rules = []
 
-    _emit({'type': 'ready', 'intercept': _intercept_rules})
+    _emit({'type': 'ready', 'intercept': _intercept_rules, 'observe': _observe_rules})
 
 
     # 单个工作线程 + 可丢弃任务槽：任意时刻至多一个 handler 触碰 store；

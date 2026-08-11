@@ -64,6 +64,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "print('验证通过：fixture 可正常读取')";
     private const string DefaultHookScriptTemplate =
         "# NetMind API 逆向观察模板\n" +
+        "#\n" +
+        "# 【默认拒绝转发】定义了下面这些函数不代表它们会被调用：必须先在 OBSERVE（不阻塞）或\n" +
+        "# INTERCEPT（阻塞，仅限发送前/回写前两点）里声明匹配规则，宿主才会把命中的事件转发过来；\n" +
+        "# 没声明的挂载点、没命中的流量一律不转发，函数体永远不会执行——不报错，只是安静地没反应。\n" +
+        "# 这份模板要观察全部端点，所以 OBSERVE 没写 url/host 条件：只写 {'event': 'x'} 表示要这个\n" +
+        "# 挂载点的全部流量。只想看某个接口时，照 INTERCEPT 例子的样子给 OBSERVE 也加一条 url 正则。\n" +
+        "OBSERVE = [\n" +
+        "    {'event': 'request.before_send'},\n" +
+        "    {'event': 'response.before_write'},\n" +
+        "]\n" +
+        "#\n" +
         "# 仅首次发现端点或响应异常时返回 finding；返回 None 不写审计，避免每个请求都产生噪声。\n" +
         "# event 为 dict，字段：event、txnId、sessionId、hookName、method、url、host、endpoint、\n" +
         "#   statusCode、headers、bodyPreviewBase64、bodyTruncated、bodySha256、bodySize。\n" +
@@ -74,9 +85,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "#   store.list() 列出全部键 · store.delete('名称') 删除\n" +
         "# 编辑器：Ctrl+J 智能提示 · Ctrl+/ 切换注释 · Ctrl+[ 折叠当前块 · 右键有整理格式与折叠命令。\n" +
         "#\n" +
-        "# 【拦截改写】默认只观察、不改写，代理不等待脚本。要修改数据并向下传播，\n" +
-        "# 取消下面 INTERCEPT 的注释：只有命中规则的请求才阻塞等待裁决，其余流量仍是即发即忘。\n" +
-        "# 条件全是正则（url/method/host/endpoint/body/status/headers），条件之间是 AND。\n" +
+        "# 【拦截改写】要修改数据并向下传播，取消下面 INTERCEPT 的注释：只有命中规则的请求才阻塞\n" +
+        "# 等待裁决，其余流量仍按 OBSERVE 只读转发或完全不转发。规则条件全是正则\n" +
+        "# （url/method/host/endpoint/body/status/headers），条件之间是 AND。\n" +
         "# 命中时钩子函数的返回值即改写内容，返回 None 原样放行；超时或异常一律放行，不会卡住浏览器。\n" +
         "#\n" +
         "# INTERCEPT = [\n" +
@@ -105,6 +116,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "        'url': event.get('url'), 'headerNames': _header_names(event),\n" +
         "        'bodySize': event.get('bodySize'), 'bodySha256': event.get('bodySha256')\n" +
         "    }\n\n" +
+        "# 未在 OBSERVE/INTERCEPT 中声明的挂载点：定义了也不会被调用，留空占位。\n" +
+        "# 想要它触发，在上面 OBSERVE 里加一条 {'event': 'request.after_send'} 即可。\n" +
         "def on_after_send(event):\n" +
         "    return None\n\n" +
         "def on_before_write(event):\n" +
@@ -116,6 +129,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "        'kind': 'api.response.error', 'status': status, 'url': event.get('url'),\n" +
         "        'bodySize': event.get('bodySize'), 'bodySha256': event.get('bodySha256')\n" +
         "    }\n\n" +
+        "# 同上：未在 OBSERVE 中声明 response.after_deliver，这个函数当前不会被调用。\n" +
         "def on_after_deliver(event):\n" +
         "    return None";
     private sealed record ScriptSample(string Title, string Script);
@@ -6448,13 +6462,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return false;
     }
 
+    /// <summary>字典字面量所属的语义位置——决定光标在里面敲引号时该补哪一套字段。</summary>
+    private enum HookRuleContext { None, Observe, Intercept, Mutation }
+
     /// <summary>
-    /// 判断光标是否在一个未闭合的字典字面量里，并区分它属于 INTERCEPT 规则还是钩子返回值。
-    /// 只在回看窗口内做括号配对，不真的解析 Python——编辑器提示够用，且不会因为语法未写完就失效。
+    /// 判断光标是否在一个未闭合的字典字面量里，并区分它属于 OBSERVE 规则、INTERCEPT 规则，
+    /// 还是钩子函数的返回值（改写字典）。只在回看窗口内做括号配对，不真的解析 Python——
+    /// 编辑器提示够用，且不会因为语法未写完就失效。
     /// </summary>
-    private static bool TryResolveDictionaryContext(string before, out bool interceptRule)
+    private static HookRuleContext ResolveRuleContext(string before)
     {
-        interceptRule = false;
         var depth = 0;
         var openIndex = -1;
         for (var index = before.Length - 1; index >= 0; index--)
@@ -6467,12 +6484,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 depth--;
             }
         }
-        if (openIndex < 0) return false;
+        if (openIndex < 0) return HookRuleContext.None;
         var head = before[..openIndex];
-        // 谁离这个左花括号更近，就按谁解释：INTERCEPT 规则表，还是钩子函数的返回值。
-        interceptRule = head.LastIndexOf("INTERCEPT", StringComparison.Ordinal) >
-                        head.LastIndexOf("return", StringComparison.Ordinal);
-        return true;
+        // 谁离这个左花括号最近，就按谁解释：OBSERVE 规则表、INTERCEPT 规则表，还是函数返回值。
+        var observeIndex = head.LastIndexOf("OBSERVE", StringComparison.Ordinal);
+        var interceptIndex = head.LastIndexOf("INTERCEPT", StringComparison.Ordinal);
+        var returnIndex = head.LastIndexOf("return", StringComparison.Ordinal);
+        var nearest = Math.Max(observeIndex, Math.Max(interceptIndex, returnIndex));
+        if (nearest < 0) return HookRuleContext.None; // 三个关键字都找不到，宁可不补全也不要猜错
+        if (nearest == returnIndex) return HookRuleContext.Mutation;
+        return nearest == observeIndex ? HookRuleContext.Observe : HookRuleContext.Intercept;
     }
 
     /// <summary>
@@ -6498,13 +6519,29 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         // store.xxx
         var storeMatch = ScriptStoreMemberPattern().Match(line);
         if (storeMatch.Success) return (HookScriptApi.StoreMembers, storeMatch.Groups["p"].Value);
-        // INTERCEPT 规则里的 'event': 'xxx
-        var interceptEventMatch = ScriptInterceptEventPattern().Match(line);
-        if (interceptEventMatch.Success) return (HookScriptApi.InterceptEvents, interceptEventMatch.Groups["p"].Value);
-        // 字典字面量里敲引号：按上下文补规则字段或改写字段。
+        // OBSERVE/INTERCEPT 规则里的 'event': 'xxx——按最近声明的是哪一个给出对应的挂载点候选
+        // （OBSERVE 四个都能选，INTERCEPT 只有两个可改写的）。
+        var eventNameMatch = ScriptRuleEventPattern().Match(line);
+        if (eventNameMatch.Success)
+        {
+            var eventContext = ResolveRuleContext(before);
+            return (eventContext == HookRuleContext.Observe ? HookScriptApi.ObserveEvents : HookScriptApi.InterceptEvents,
+                eventNameMatch.Groups["p"].Value);
+        }
+        // 字典字面量里敲引号：按上下文补 OBSERVE 规则字段、INTERCEPT 规则字段，还是改写字段。
         var quoted = ScriptQuotedPrefixPattern().Match(line);
-        if (quoted.Success && TryResolveDictionaryContext(before, out var interceptRule))
-            return (interceptRule ? HookScriptApi.InterceptRuleFields : HookScriptApi.MutationFields, quoted.Groups["p"].Value);
+        if (quoted.Success)
+        {
+            var context = ResolveRuleContext(before);
+            var fields = context switch
+            {
+                HookRuleContext.Observe => HookScriptApi.ObserveRuleFields,
+                HookRuleContext.Intercept => HookScriptApi.InterceptRuleFields,
+                HookRuleContext.Mutation => HookScriptApi.MutationFields,
+                _ => (IReadOnlyList<HookScriptApi.Symbol>?)null
+            };
+            if (fields is not null) return (fields, quoted.Groups["p"].Value);
+        }
         return ResolveVocabularyCompletion(line, HookScriptApi.HookVocabulary, auto);
     }
 
@@ -7036,7 +7073,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private static partial Regex ScriptStoreMemberPattern();
 
     [GeneratedRegex(@"['""]event['""]\s*:\s*['""](?<p>[A-Za-z0-9_.]*)$", RegexOptions.CultureInvariant)]
-    private static partial Regex ScriptInterceptEventPattern();
+    private static partial Regex ScriptRuleEventPattern();
 
     [GeneratedRegex(@"['""](?<p>[A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
     private static partial Regex ScriptQuotedPrefixPattern();
@@ -7190,20 +7227,31 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private const string HookScriptGuideTextContent =
         "① 挂载点：定义 on_before_send / on_after_send / on_before_write / on_after_deliver，采集期间由隔离工作进程调用。\n" +
-        "② 入参：event 是 dict，字段有 event、txnId、sessionId、hookName、method、url、host、endpoint、statusCode、\n" +
+        "② 默认拒绝转发：定义了函数不代表会被调用，必须声明 OBSERVE 或 INTERCEPT 且命中，宿主才会转发事件；\n" +
+        "    未声明的挂载点、未命中的流量，函数体永远不执行——不报错，只是安静地没反应。\n" +
+        "③ 观察：OBSERVE = [{'event': ..., 'url': r'...'}]，四个挂载点都可声明，不阻塞，规则形状与 INTERCEPT 相同\n" +
+        "    （url/method/host/endpoint/body/status/headers 全是正则，条件之间是 AND）。不写任何条件等于要这个挂载点的全部流量。\n" +
+        "④ 拦截改写：模块级写 INTERCEPT = [{'event': ..., 'url': r'...'}]，只能声明在 request.before_send 与\n" +
+        "    response.before_write 两点，命中规则的请求才阻塞等待裁决；命中时返回\n" +
+        "    {'url'/'method'/'status'/'headers'/'body'/'finding'} 即改写并向下传播，返回 None 原样放行，\n" +
+        "    裁决超时、脚本异常或改写超限一律放行。OBSERVE 与 INTERCEPT 相互独立，可以同时用，也可以只用一个。\n" +
+        "⑤ 入参：event 是 dict，字段有 event、txnId、sessionId、hookName、method、url、host、endpoint、statusCode、\n" +
         "    headers、bodyPreviewBase64、bodyTruncated、bodySha256、bodySize、schema。\n" +
         "    正文预览默认不下发（省掉绝大部分事件数据量）：脚本里出现 bodyPreviewBase64 或写 WANT_BODY = True 才带上。\n" +
-        "③ 存储：store.save('名称', 值) / store.load('名称') / store.list() / store.delete('名称')，落盘在工作区 scripts/data。\n" +
-        "④ 结论：返回 None 不写审计；返回 dict 形成一条 hooks.finding，可用 txnId 精确关联流量事务。\n" +
-        "⑤ 拦截改写：模块级写 INTERCEPT = [{'event': ..., 'url': r'...'}]，只有命中规则的请求才阻塞等待裁决；\n" +
-        "    命中时返回 {'url'/'method'/'status'/'headers'/'body'/'finding'} 即改写并向下传播，返回 None 原样放行。\n" +
-        "⑥ 边界：可改写的挂载点只有 request.before_send 与 response.before_write；裁决超时、脚本异常或改写超限一律放行。";
+        "⑥ 存储：store.save('名称', 值) / store.load('名称') / store.list() / store.delete('名称')，落盘在工作区 scripts/data。\n" +
+        "⑦ 结论：返回 None 不写审计；返回 dict 形成一条 hooks.finding，可用 txnId 精确关联流量事务。";
 
     private static readonly ScriptSample[] HookScriptSamples =
     [
         new("记录首次出现的 API 端点（只观察）",
             "# 钩子示例一：跨请求维护端点清单，只在首次出现时形成结论。\n" +
-            "# 只观察不改写，代理不会等待脚本，采集吞吐不受影响。\n\n" +
+            "# 只观察不改写，代理不会等待脚本，采集吞吐不受影响。\n" +
+            "# OBSERVE 没写 url/host 条件：故意要这个挂载点的全部流量，用来梳理站点访问了哪些接口；\n" +
+            "# 只想看某个域名/接口时，照下面注释的样子加一条正则即可收窄范围。\n\n" +
+            "OBSERVE = [\n" +
+            "    {'event': 'request.before_send'},\n" +
+            "    # {'event': 'request.before_send', 'host': r'api\\.example\\.com$'},\n" +
+            "]\n\n" +
             "def on_before_send(event):\n" +
             "    key = str(event.get('method') or '') + ' ' + str(event.get('endpoint') or '')\n" +
             "    known = store.load('api-endpoints.txt') or ''\n" +
@@ -7213,7 +7261,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             "    return {'kind': 'api.endpoint.discovered', 'method': event.get('method'), 'url': event.get('url')}"),
         new("把错误响应升级为结论（只观察）",
             "# 钩子示例二：只把 4xx/5xx 响应记成结论，正常响应直接返回 None。\n" +
-            "# txnId 与流量事务一一对应，可在流量探索里回溯到原始证据。\n\n" +
+            "# txnId 与流量事务一一对应，可在流量探索里回溯到原始证据。\n" +
+            "# 下面按挂载点全量转发、在函数体内判断状态码；也可以直接用 OBSERVE 的 status 正则\n" +
+            "# 在宿主侧先收窄，见注释——两种写法效果一样，后者能省掉不需要的事件序列化开销。\n\n" +
+            "OBSERVE = [\n" +
+            "    {'event': 'response.before_write'},\n" +
+            "    # {'event': 'response.before_write', 'status': r'^[45]\\d\\d$'},\n" +
+            "]\n\n" +
             "def on_before_write(event):\n" +
             "    status = event.get('statusCode') or 0\n" +
             "    if status < 400:\n" +
@@ -7818,8 +7872,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             foreach (var hookEvent in enabledEvents)
                 engine.Emit(hookEvent, snapshot, hookEvent.StartsWith("response.", StringComparison.Ordinal) ? traffic.StatusCode : null);
 
+            // 默认拒绝转发下，勾选的挂载点里可能有一部分（甚至全部）根本没被送去给脚本——
+            // 那部分永远等不到 worker 的 processed 回执。用 Emit 后立刻可读的 NotObservedEvents
+            // 算出真正指望它被处理的条数，只等这些，而不是傻等全部挂载点直到 5 秒超时。
+            var notObserved = (int)engine.GetMetricsSnapshot().NotObservedEvents;
+            var expectedProcessed = Math.Max(0, enabledEvents.Count - notObserved);
             var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
-            while (engine.ProcessedEventCount < enabledEvents.Count && DateTimeOffset.UtcNow < deadline)
+            while (engine.ProcessedEventCount < expectedProcessed && DateTimeOffset.UtcNow < deadline)
                 await Task.Delay(50);
             var metrics = engine.GetMetricsSnapshot();
             var findings = engine.DrainFindings();
@@ -7829,16 +7888,33 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (notices.Count > 0) builder.Append('\n');
             builder.Append($"试跑事务：{traffic.Method} {traffic.Url}\n")
                    .Append($"挂载点：{string.Join('、', enabledEvents)}\n\n")
-                   .Append($"投递 {metrics.DeliveredEvents}/{enabledEvents.Count} · 处理 {metrics.ProcessedEvents} · ")
+                   .Append($"投递 {metrics.DeliveredEvents}/{expectedProcessed} · 处理 {metrics.ProcessedEvents} · ")
                    .Append($"结论 {metrics.Findings} · 错误 {metrics.WorkerErrors}");
-            var failedRun = metrics.WorkerErrors > 0 || metrics.ProcessedEvents < enabledEvents.Count;
-            if (metrics.ProcessedEvents < enabledEvents.Count) builder.Append("\n\n等待处理完成超时，请检查脚本是否阻塞。");
+            if (notObserved > 0)
+                builder.Append($" · 未转发 {notObserved}");
+            var failedRun = metrics.WorkerErrors > 0 || metrics.ProcessedEvents < expectedProcessed;
+            if (metrics.ProcessedEvents < expectedProcessed) builder.Append("\n\n等待处理完成超时，请检查脚本是否阻塞。");
             if (!string.IsNullOrWhiteSpace(metrics.LastError)) builder.Append("\n\n最近错误：").Append(metrics.LastError);
+            if (notObserved == enabledEvents.Count)
+            {
+                // 一条都没转发：多半是压根没写 OBSERVE/INTERCEPT，或者写了但条件没命中这条试跑事务。
+                builder.Append("\n\n未转发任何事件：勾选的挂载点没有被 OBSERVE 或 INTERCEPT 规则命中，")
+                       .Append("函数完全没有被调用（这不是错误，是默认拒绝转发生效）。\n")
+                       .Append("检查脚本里是否声明了 OBSERVE（想只观察）或 INTERCEPT（想修改流量），")
+                       .Append("以及规则的 url/host 等条件是否会命中试跑用的这条事务：")
+                       .Append(traffic.Url);
+            }
+            else if (notObserved > 0)
+            {
+                builder.Append($"\n\n{notObserved} 个挂载点没有被 OBSERVE/INTERCEPT 规则命中，函数未被调用（默认拒绝转发）。");
+            }
             if (findings.Count > 0)
                 builder.Append($"\n\n本次新增 {findings.Count} 条结论，已加入下方「返回数据」列表（点击查看完整内容）。");
-            else if (metrics.WorkerErrors == 0)
-                builder.Append("\n\n脚本返回 None 或未定义对应函数，因此没有生成结论。");
-            WriteRunOutput(builder.ToString(), failedRun ? Red : Green, failedRun ? "试跑异常" : "试跑完成");
+            else if (metrics.WorkerErrors == 0 && notObserved < enabledEvents.Count)
+                builder.Append("\n\n脚本返回 None，因此没有生成结论。");
+            WriteRunOutput(builder.ToString(),
+                notObserved == enabledEvents.Count ? Amber : failedRun ? Red : Green,
+                notObserved == enabledEvents.Count ? "未转发" : failedRun ? "试跑异常" : "试跑完成");
         }
         catch (Exception exception)
         {

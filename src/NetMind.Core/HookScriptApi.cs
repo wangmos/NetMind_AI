@@ -68,23 +68,27 @@ public static class HookScriptApi
         new("delete", "delete('')", "删除指定键")
     ];
 
-    /// <summary>四个挂载点对应的钩子函数。插入文本是完整签名骨架。</summary>
+    /// <summary>
+    /// 四个挂载点对应的钩子函数。插入文本是完整签名骨架。
+    /// 默认拒绝转发：定义了函数不代表会被调用，必须在 OBSERVE（非阻塞）或 INTERCEPT（阻塞、
+    /// 仅限两个可改写挂载点）中声明匹配规则，宿主才会把命中的事件转发过来。
+    /// </summary>
     public static IReadOnlyList<Symbol> HookFunctions { get; } =
     [
         new(HookEventNames.FunctionBeforeSend, $"def {HookEventNames.FunctionBeforeSend}(event):\n    return None\n",
-            "请求发往上游之前触发；可拦截改写"),
+            "请求发往上游之前触发；需在 OBSERVE 或 INTERCEPT 中声明匹配规则才会被调用，INTERCEPT 命中时可拦截改写"),
         new(HookEventNames.FunctionAfterSend, $"def {HookEventNames.FunctionAfterSend}(event):\n    return None\n",
-            "请求已发往上游之后触发；只观察"),
+            "请求已发往上游之后触发；只能通过 OBSERVE 声明（此挂载点不支持 INTERCEPT）"),
         new(HookEventNames.FunctionBeforeWrite, $"def {HookEventNames.FunctionBeforeWrite}(event):\n    return None\n",
-            "响应写回浏览器之前触发；可拦截改写"),
+            "响应写回浏览器之前触发；需在 OBSERVE 或 INTERCEPT 中声明匹配规则才会被调用，INTERCEPT 命中时可拦截改写"),
         new(HookEventNames.FunctionAfterDeliver, $"def {HookEventNames.FunctionAfterDeliver}(event):\n    return None\n",
-            "响应已交付浏览器之后触发；只观察")
+            "响应已交付浏览器之后触发；只能通过 OBSERVE 声明（此挂载点不支持 INTERCEPT）")
     ];
 
-    /// <summary>INTERCEPT 规则可用字段；全部是正则，条件之间是 AND。</summary>
-    public static IReadOnlyList<Symbol> InterceptRuleFields { get; } =
+    /// <summary>规则可用字段（OBSERVE 与 INTERCEPT 共用同一套形状）；全部是正则，条件之间是 AND。</summary>
+    private static IReadOnlyList<Symbol> BuildRuleFields(string eventDetail) =>
     [
-        new("event", "'event': ''", $"挂载点，只能是 {HookEventNames.RequestBeforeSend} 或 {HookEventNames.ResponseBeforeWrite}"),
+        new("event", "'event': ''", eventDetail),
         new("url", "'url': r''", "URL 正则"),
         new("method", "'method': r''", "HTTP 方法正则"),
         new("host", "'host': r''", "主机名正则"),
@@ -93,6 +97,14 @@ public static class HookScriptApi
         new("status", "'status': r''", "状态码正则；仅响应侧有意义"),
         new("headers", "'headers': {'': r''}", "{头名: 值正则}；值为空串表示只要求该头存在")
     ];
+
+    /// <summary>INTERCEPT 规则可用字段。</summary>
+    public static IReadOnlyList<Symbol> InterceptRuleFields { get; } =
+        BuildRuleFields($"挂载点，只能是 {HookEventNames.RequestBeforeSend} 或 {HookEventNames.ResponseBeforeWrite}");
+
+    /// <summary>OBSERVE 规则可用字段；四个挂载点都能声明，字段形状与 INTERCEPT 一致。</summary>
+    public static IReadOnlyList<Symbol> ObserveRuleFields { get; } =
+        BuildRuleFields("挂载点，四个均可，见 on_before_send / on_after_send / on_before_write / on_after_deliver");
 
     /// <summary>拦截命中时钩子函数返回值可用字段；返回 None 表示原样放行。</summary>
     public static IReadOnlyList<Symbol> MutationFields { get; } =
@@ -105,17 +117,27 @@ public static class HookScriptApi
         new("finding", "'finding': {}", "顺带产出的观察结论，写入审计日志")
     ];
 
-    /// <summary>挂载点事件名，供 INTERCEPT 的 event 字段补全。</summary>
+    /// <summary>挂载点事件名，供 INTERCEPT 的 event 字段补全；只有两个可改写挂载点。</summary>
     public static IReadOnlyList<Symbol> InterceptEvents { get; } =
     [
         new(HookEventNames.RequestBeforeSend, $"'{HookEventNames.RequestBeforeSend}'", "请求发往上游之前；可改写"),
         new(HookEventNames.ResponseBeforeWrite, $"'{HookEventNames.ResponseBeforeWrite}'", "响应写回浏览器之前；可改写")
     ];
 
+    /// <summary>挂载点事件名，供 OBSERVE 的 event 字段补全；四个挂载点都可以声明观察。</summary>
+    public static IReadOnlyList<Symbol> ObserveEvents { get; } =
+    [
+        new(HookEventNames.RequestBeforeSend, $"'{HookEventNames.RequestBeforeSend}'", "请求发往上游之前；只观察不改写"),
+        new(HookEventNames.RequestAfterSend, $"'{HookEventNames.RequestAfterSend}'", "请求已发往上游之后"),
+        new(HookEventNames.ResponseBeforeWrite, $"'{HookEventNames.ResponseBeforeWrite}'", "响应写回浏览器之前；只观察不改写"),
+        new(HookEventNames.ResponseAfterDeliver, $"'{HookEventNames.ResponseAfterDeliver}'", "响应已交付浏览器之后")
+    ];
+
     /// <summary>钩子脚本可见的全部符号，供按词前缀的模糊补全使用。</summary>
     public static IReadOnlyList<Symbol> HookVocabulary { get; } =
     [
         .. HookFunctions,
+        new("OBSERVE", "OBSERVE = [\n    {'event': '', 'url': r''},\n]\n", "模块级观察规则声明；未命中的挂载点/流量不会被转发，这是默认行为"),
         new("INTERCEPT", "INTERCEPT = [\n    {'event': '', 'url': r''},\n]\n", "模块级拦截规则声明；只有命中的流量才阻塞等待裁决"),
         new("event", "event", "钩子函数入参，字段见 event.get('…')"),
         new("store", "store", "宿主注入的键值存储，落盘在工作区 scripts/data")
@@ -216,6 +238,30 @@ public static class HookScriptApi
         builder.AppendLine("入参 event 是 dict，用 event.get('字段') 读取：");
         AppendSymbols(builder, EventFields);
         builder.AppendLine();
+        builder.AppendLine("=== 默认拒绝转发：这是最容易写错的地方，必须严格遵守 ===");
+        builder.AppendLine("定义了钩子函数不代表它会被调用。没有 OBSERVE 也没有 INTERCEPT 声明匹配到的挂载点，");
+        builder.AppendLine("宿主根本不会把事件转发过来，函数体永远不会执行——不会报错，只是安静地什么都不发生。");
+        builder.AppendLine("按用户的需求选择声明哪一种，两者可以同时使用，但不要在同一个挂载点上重复声明同一条件");
+        builder.AppendLine("（会导致同一个事件触发两次函数调用）：");
+        builder.AppendLine();
+        builder.AppendLine("① 只想观察/记录特定流量、不修改任何内容 → 用 OBSERVE。四个挂载点都可以声明，非阻塞：");
+        builder.AppendLine("```python");
+        builder.AppendLine("OBSERVE = [");
+        builder.AppendLine("    {'event': 'response.before_write', 'url': r'/api/target'},");
+        builder.AppendLine("]");
+        builder.AppendLine("```");
+        AppendSymbols(builder, ObserveRuleFields);
+        builder.AppendLine("规则一定要按用户描述的目标收窄（写 url/host/endpoint 等条件）：不写任何条件、只写");
+        builder.AppendLine("{'event': '...'} 等于要求转发这个挂载点的全部流量，几乎总不是用户真正想要的，会制造大量噪声。");
+        builder.AppendLine();
+        builder.AppendLine("② 需要修改请求/响应内容 → 用 INTERCEPT。只能声明在两个可改写挂载点上，命中的请求会阻塞");
+        builder.AppendLine("等待脚本裁决，其余流量仍是即发即忘：");
+        AppendSymbols(builder, InterceptRuleFields);
+        builder.AppendLine($"event 只能是 {HookEventNames.RequestBeforeSend} 或 {HookEventNames.ResponseBeforeWrite}，其余挂载点不可改写。");
+        builder.AppendLine("命中时钩子函数的返回值即改写内容：");
+        AppendSymbols(builder, MutationFields);
+        builder.AppendLine("返回 None 表示原样放行。裁决超时、脚本异常或改写超限一律按原样放行，不会阻塞浏览器。");
+        builder.AppendLine();
         builder.AppendLine($"正文预览默认不下发：脚本文本里出现 {NetMindDefaults.HookBodyPreviewFieldName}");
         builder.AppendLine($"（或写一行 {NetMindDefaults.HookWantBodyDeclaration} = True）时宿主才会带上，只用 bodySize/bodySha256 时不必声明。");
         builder.AppendLine();
@@ -225,14 +271,6 @@ public static class HookScriptApi
         builder.AppendLine();
         builder.AppendLine("返回值：返回 None 表示什么都不做（不写审计）；返回 dict 形成一条观察结论写入审计日志。");
         builder.AppendLine("结论上限 4 KB。请只在确有发现时返回，否则每个请求都会产生噪声。");
-        builder.AppendLine();
-        builder.AppendLine("拦截改写（需要修改流量时才用）：写模块级 INTERCEPT 列表声明规则，只有命中的请求才会阻塞等待脚本裁决，");
-        builder.AppendLine("其余流量仍是即发即忘。规则字段全部是正则，条件之间是 AND：");
-        AppendSymbols(builder, InterceptRuleFields);
-        builder.AppendLine($"event 只能是 {HookEventNames.RequestBeforeSend} 或 {HookEventNames.ResponseBeforeWrite}，其余挂载点不可改写。");
-        builder.AppendLine("命中时钩子函数的返回值即改写内容：");
-        AppendSymbols(builder, MutationFields);
-        builder.AppendLine("返回 None 表示原样放行。裁决超时、脚本异常或改写超限一律按原样放行，不会阻塞浏览器。");
         builder.AppendLine();
         builder.AppendLine("性能约束：单个事件有 200 毫秒看门狗，工作进程是单线程串行处理。");
         builder.AppendLine("不要写正则回溯爆炸、长循环或大对象拼接，超时会被跳过并记为错误。");

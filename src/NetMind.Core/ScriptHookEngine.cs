@@ -118,7 +118,13 @@ public sealed record ScriptHookMetricsSnapshot(
     DateTimeOffset? LastProcessedAtUtc,
     string? LastEvent,
     string? LastError,
-    string? DisabledReason);
+    string? DisabledReason,
+    /// <summary>
+    /// 挂载点已启用、但事件没有命中任何 OBSERVE 规则而被就地丢弃的累计条数（默认拒绝转发）。
+    /// 与 DroppedEvents（队列背压丢弃）是完全不同的原因，分开计数：这个数字不断增长通常意味着
+    /// 脚本忘了声明 OBSERVE，而不是队列堆满了。可选尾参数，旧调用点无需改动。
+    /// </summary>
+    long NotObservedEvents = 0);
 
 /// <summary>
 /// 脚本钩子引擎：拉起 SandboxHost hook-worker 隔离子进程，
@@ -146,6 +152,13 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     private readonly HookEventQueue _queue = new();
     /// <summary>脚本在 ready 时上报的拦截规则；热路径只读，整体替换而不就地修改。</summary>
     private IReadOnlyList<HookInterceptRule> _interceptRules = [];
+    /// <summary>
+    /// 脚本在 ready 时上报的观察规则；热路径只读，整体替换而不就地修改。
+    /// 默认拒绝转发：某个挂载点在这里没有任何命中规则，<see cref="Emit"/> 对该挂载点的事件一律不转发，
+    /// 即便脚本定义了对应的钩子函数、即便工作区配置里勾选了这个挂载点。
+    /// </summary>
+    private IReadOnlyList<HookObserveRule> _observeRules = [];
+    private long _notObservedEventCount;
     /// <summary>观察事件是否携带正文预览；启动时按脚本内容判定一次，热路径只读。</summary>
     private volatile bool _includeBodyPreview;
     /// <summary>在途拦截：correlationId → 等待裁决的调用方。</summary>
@@ -225,6 +238,12 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     /// <summary>脚本声明的拦截规则条数（0 表示纯观察，不阻塞任何请求）。</summary>
     public int InterceptRuleCount => Volatile.Read(ref _interceptRules).Count;
 
+    /// <summary>脚本声明的观察规则条数（0 表示没有任何挂载点会被转发，即便脚本定义了钩子函数）。</summary>
+    public int ObserveRuleCount => Volatile.Read(ref _observeRules).Count;
+
+    /// <summary>挂载点已启用、但未命中任何 OBSERVE 规则而被就地丢弃的累计条数（默认拒绝转发生效次数）。</summary>
+    public long NotObservedEventCount => Interlocked.Read(ref _notObservedEventCount);
+
     /// <summary>脚本实际改写的事务累计条数。</summary>
     public long InterceptMutatedCount => Interlocked.Read(ref _interceptMutatedCount);
 
@@ -241,6 +260,12 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     /// </summary>
     internal bool TryDequeuePendingForTest([NotNullWhen(true)] out HookEventEnvelope? envelope) =>
         _queue.TryDequeue(out envelope);
+
+    /// <summary>
+    /// 定向测试专用：直接注入观察规则，绕过需要真实工作进程上报 ready 消息才能设置 <c>_observeRules</c>
+    /// 的正常路径。生产路径只能通过工作进程的 ready 消息设置，不暴露公开 setter。
+    /// </summary>
+    internal void SetObserveRulesForTest(IReadOnlyList<HookObserveRule> rules) => Volatile.Write(ref _observeRules, rules);
 
     /// <summary>返回线程安全的轻量运行指标，不读取或复制任何事务正文。</summary>
     public ScriptHookMetricsSnapshot GetMetricsSnapshot()
@@ -259,12 +284,18 @@ public sealed class ScriptHookEngine : IAsyncDisposable
             ticks <= 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero),
             Volatile.Read(ref _lastProcessedEvent),
             Volatile.Read(ref _lastWorkerError),
-            Volatile.Read(ref _disabledReason));
+            Volatile.Read(ref _disabledReason),
+            NotObservedEventCount);
     }
 
     /// <summary>
     /// 观察事件投递入口：构建信封入队，供代理关键路径单行 fire-and-forget 调用；
     /// 永不阻塞、永不抛出，引擎停用/未勾选/快照缺失时静默忽略。
+    ///
+    /// 默认拒绝转发：必须命中脚本用 <c>OBSERVE</c> 声明的规则才会入队；未声明 <c>OBSERVE</c>
+    /// 的挂载点，即便脚本定义了对应函数、即便工作区勾选了该挂载点，也一概不转发。这不是限制，
+    /// 是消除噪声——此前一个挂载点只要勾选就转发该点全部流量，脚本只能在函数体内自己按 URL
+    /// 过滤，一次疏忽就会把每条响应都存一遍；现在过滤放到宿主侧、事件都不会进队列。
     /// </summary>
     /// <param name="statusCode">该观察点已知的响应状态码（发送前钩子传 null）。</param>
     public void Emit(string hookEvent, HookTransactionSnapshot? snapshot, int? statusCode = null)
@@ -274,6 +305,13 @@ public sealed class ScriptHookEngine : IAsyncDisposable
             if (_stopping || _disabled || snapshot is null) return;
             if (statusCode.HasValue) snapshot.StatusCode = statusCode;
             if (!_enabledEvents.Contains(hookEvent)) return;
+            if (!ShouldObserve(hookEvent, snapshot))
+            {
+                // 挂载点本身是启用的，只是没有 OBSERVE 规则命中——这是默认拒绝转发生效，
+                // 与下面的队列背压丢弃是两种完全不同的原因，分开计数方便 UI/审计区分。
+                Interlocked.Increment(ref _notObservedEventCount);
+                return;
+            }
             if (!HookFunctionNames.TryGetValue(hookEvent, out var hookName)) return;
 
             // 关键路径预检：队列已满或字节接近上限时直接跳过整个信封（含预览与哈希计算），
@@ -778,9 +816,10 @@ public sealed class ScriptHookEngine : IAsyncDisposable
             switch (type)
             {
                 case HookWorkerMessageTypes.Ready:
-                    // 脚本用模块级 INTERCEPT 声明要拦截什么，随 ready 一次性上报；
+                    // 脚本用模块级 INTERCEPT/OBSERVE 声明要拦截/观察什么，随 ready 一次性上报；
                     // 之后每个请求的匹配都在宿主进程内完成，热路径不再问工作进程。
                     Volatile.Write(ref _interceptRules, ReadInterceptRules(document.RootElement));
+                    Volatile.Write(ref _observeRules, ReadObserveRules(document.RootElement));
                     session.ReadySignal.TrySetResult(true);
                     break;
                 case HookWorkerMessageTypes.Pass:
@@ -829,10 +868,18 @@ public sealed class ScriptHookEngine : IAsyncDisposable
         }
     }
 
-    private static IReadOnlyList<HookInterceptRule> ReadInterceptRules(JsonElement element)
+    /// <summary>
+    /// 解析 ready 消息里脚本声明的规则数组（<c>intercept</c> 或 <c>observe</c>）。
+    /// INTERCEPT 与 OBSERVE 的规则形状完全一致，唯一区别是各自的 <c>TryCreate</c> 对事件名的
+    /// 校验不同（前者只认两个可改写挂载点，后者认全部四个）——解析这一层只写一份。
+    /// 任一模式非法则整条规则作废：部分生效会让脚本以为自己限定了范围，实际却在处理别的流量。
+    /// </summary>
+    private static IReadOnlyList<TRule> ReadRules<TRule>(JsonElement element, string propertyName, int maximumCount,
+        Func<string?, string?, string?, string?, string?, string?, string?, IReadOnlyDictionary<string, string>?, TRule?> tryCreate)
+        where TRule : class
     {
-        if (!element.TryGetProperty("intercept", out var array) || array.ValueKind != JsonValueKind.Array) return [];
-        var rules = new List<HookInterceptRule>();
+        if (!element.TryGetProperty(propertyName, out var array) || array.ValueKind != JsonValueKind.Array) return [];
+        var rules = new List<TRule>();
         foreach (var item in array.EnumerateArray())
         {
             if (item.ValueKind != JsonValueKind.Object) continue;
@@ -848,17 +895,21 @@ public sealed class ScriptHookEngine : IAsyncDisposable
                         : string.Empty;
                 }
             }
-            // 任一模式非法则整条规则作废：部分生效会让脚本以为自己限定了范围，实际却在拦截别的流量。
-            var rule = HookInterceptRule.TryCreate(
-                ReadString(item, "event"), ReadString(item, "url"), ReadString(item, "method"),
+            var rule = tryCreate(ReadString(item, "event"), ReadString(item, "url"), ReadString(item, "method"),
                 ReadString(item, "host"), ReadString(item, "endpoint"), ReadString(item, "body"),
                 ReadString(item, "status"), headers);
             if (rule is null) continue;
             rules.Add(rule);
-            if (rules.Count >= NetMindDefaults.HookMaximumInterceptRules) break;
+            if (rules.Count >= maximumCount) break;
         }
         return rules;
     }
+
+    private static IReadOnlyList<HookInterceptRule> ReadInterceptRules(JsonElement element) =>
+        ReadRules(element, "intercept", NetMindDefaults.HookMaximumInterceptRules, HookInterceptRule.TryCreate);
+
+    private static IReadOnlyList<HookObserveRule> ReadObserveRules(JsonElement element) =>
+        ReadRules(element, "observe", NetMindDefaults.HookMaximumObserveRules, HookObserveRule.TryCreate);
 
     /// <summary>
     /// 本次事务是否命中脚本声明的拦截规则。匹配在宿主进程内完成，代理热路径每个请求都会调用；
@@ -868,6 +919,20 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     {
         if (snapshot is null || _stopping || _disabled || !HookInterceptRule.IsMutable(hookEvent)) return false;
         var rules = Volatile.Read(ref _interceptRules);
+        if (rules.Count == 0) return false;
+        for (var index = 0; index < rules.Count; index++)
+            if (rules[index].Matches(hookEvent, snapshot)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// 本次事务是否命中脚本声明的观察规则，决定 <see cref="Emit"/> 要不要把它放进观察队列。
+    /// 未声明任何 OBSERVE 规则时立刻返回 false——这正是默认拒绝转发的落地点：不写 OBSERVE，
+    /// 这个挂载点上的事件就一条都进不来，跟脚本里是否定义了对应函数无关。
+    /// </summary>
+    private bool ShouldObserve(string hookEvent, HookTransactionSnapshot snapshot)
+    {
+        var rules = Volatile.Read(ref _observeRules);
         if (rules.Count == 0) return false;
         for (var index = 0; index < rules.Count; index++)
             if (rules[index].Matches(hookEvent, snapshot)) return true;

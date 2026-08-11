@@ -533,6 +533,9 @@ public static class NetMindDefaults
     /// <summary>脚本可声明的拦截规则条数上限，防止脚本声明出无边界的规则表拖慢热路径匹配。</summary>
     public const int HookMaximumInterceptRules = 64;
 
+    /// <summary>脚本可声明的观察规则条数上限，与拦截规则同一道理：热路径每条流量都要挨个试。</summary>
+    public const int HookMaximumObserveRules = 64;
+
     /// <summary>
     /// 退回普通正则引擎（模式用到反向引用/环视）时的单次匹配超时。
     /// 线性引擎不需要它；这里只是给不得不回退的那部分模式兜底，超时按不命中处理。

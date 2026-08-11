@@ -849,7 +849,7 @@
                                             <Button Grid.Column="1" Content="设为采集钩子" Style="{StaticResource CompactActionButton}" Padding="10,6" MinHeight="0" FontSize="11.5" Margin="8,0,0,0" Click="设为采集钩子_Click" ToolTip="把左侧选中的钩子脚本设为采集期间执行的脚本" />
                                         </Grid>
                                         <CheckBox x:Name="HookEnabledBox" Content="启用请求钩子" Margin="0,13,0,0" AutomationProperties.Name="钩子启用开关" Checked="钩子勾选_Changed" Unchecked="钩子勾选_Changed" ToolTip="钩子的唯一启用来源就是这里：勾选后点顶部「保存」写入当前工作区，下次启动采集即拉起钩子工作进程；没有额外的全局总开关" />
-                                        <TextBlock Text="挂载点" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,11,0,0" />
+                                        <TextBlock Text="挂载点" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,11,0,0" ToolTip="这里只是打开挂载点的总开关；具体转发哪些流量由脚本里的 OBSERVE/INTERCEPT 规则决定——两者都不满足，勾了也不会转发。" />
                                         <WrapPanel Margin="0,6,0,0">
                                             <CheckBox x:Name="HookBeforeSendBox" Content="发送前" Width="150" Margin="0,0,0,7" AutomationProperties.Name="钩子点：发送前" Checked="钩子勾选_Changed" Unchecked="钩子勾选_Changed" ToolTip="request.before_send · 请求发往上游之前；可拦截改写" />
                                             <CheckBox x:Name="HookAfterSendBox" Content="发送后" Width="150" Margin="0,0,0,7" AutomationProperties.Name="钩子点：发送后" Checked="钩子勾选_Changed" Unchecked="钩子勾选_Changed" ToolTip="request.after_send · 请求已发往上游之后；只观察" />

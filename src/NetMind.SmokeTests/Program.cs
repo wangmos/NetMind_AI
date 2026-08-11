@@ -75,6 +75,7 @@ var suites = new SmokeSuite[]
     new("钩子信封正文预览按需下发", "hook-payload-only", VerifyHookBodyPreviewGateAsync),
     new("代理钩子挂载点端到端触发（顺序、txnId、正文、单点开关）", "mountpoint-only", VerifyProxyHookMountPointsAsync),
     new("拦截规则正则匹配（URL/方法/主机/路径/头/正文/状态码）与 fail-open", "intercept-only", VerifyHookInterceptRulesAsync),
+    new("观察规则（四挂载点、默认拒绝转发、词表与 AI 提示词同源）", "observe-only", Sync(VerifyHookObserveRules)),
     new("示例脚本端到端：百度搜索关键字固定为 888（真实 worker + 真实代理）", "baidu-intercept-only", VerifyBaiduSearchInterceptAsync),
     new("采集链路一键自检", "capture-health-only", VerifyCaptureHealthAsync),
     new("HTTPS CONNECT、TLS 解密、正文持久化与 AI 脱敏", "tls-only", VerifyTlsInspectionAsync),
@@ -1246,6 +1247,68 @@ static void VerifyScriptTextTools()
 }
 
 /// <summary>
+/// OBSERVE 规则（<see cref="HookObserveRule"/>）与默认拒绝转发。
+///
+/// 匹配逻辑与 <see cref="HookInterceptRule"/> 共用同一份实现（<c>HookRuleClauses</c>），
+/// 逐位置的正则匹配（URL/方法/主机/路径/头/正文/状态码）已经在 --intercept-only 覆盖过
+/// 15 组用例，这里不重复；只测 OBSERVE 独有的部分——四个挂载点都能声明（INTERCEPT 明确
+/// 拒绝的两个只读点在这里必须能过）、AND 组合抽样、词表补全同源，以及最核心的行为：
+/// 挂载点已启用但没有声明或没有命中 OBSERVE 规则时，事件必须一条都不转发。
+/// 挂载点端到端这一层的默认拒绝转发已经在 --mountpoint-only 测过，这里补的是规则本身。
+/// </summary>
+static void VerifyHookObserveRules()
+{
+    // 四个挂载点都能声明观察，包括 INTERCEPT 明确拒绝的两个只读点——这正是 OBSERVE 存在的意义。
+    foreach (var eventName in new[]
+             {
+                 HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
+                 HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver
+             })
+        Require(HookObserveRule.TryCreate(eventName, null, null, null, null, null, null, null) is not null,
+            $"OBSERVE 必须能声明在挂载点 {eventName} 上");
+    Require(HookObserveRule.TryCreate("not.a.real.event", null, null, null, null, null, null, null) is null,
+        "非法事件名必须让整条 OBSERVE 规则作废");
+    Require(HookObserveRule.TryCreate(HookEventNames.RequestBeforeSend, "([unclosed", null, null, null, null, null, null) is null,
+        "OBSERVE 规则里的非法正则同样必须让整条规则作废");
+
+    var uri = new Uri("https://api.test.local/v2/user/login?lang=zh");
+    var login = new HookTransactionSnapshot(Guid.NewGuid(), Guid.NewGuid(), "POST", uri.ToString(), uri.Host, uri.PathAndQuery,
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["X-Sign"] = "abc" },
+        Encoding.UTF8.GetBytes("{\"password\":\"p\"}"));
+    var matchAll = HookObserveRule.TryCreate(HookEventNames.RequestBeforeSend, null, null, null, null, null, null, null);
+    Require(matchAll is not null && matchAll!.Matches(HookEventNames.RequestBeforeSend, login),
+        "不写任何条件的 OBSERVE 规则必须匹配该挂载点的全部流量（默认模板与示例一就靠这个语义）");
+    Require(!matchAll!.Matches(HookEventNames.RequestAfterSend, login), "规则不得跨挂载点命中");
+    var scoped = HookObserveRule.TryCreate(HookEventNames.RequestBeforeSend, @"/v\d+/user/login", "^POST$", null, null, null, null, null);
+    Require(scoped is not null && scoped!.Matches(HookEventNames.RequestBeforeSend, login), "多条件全部命中时必须匹配");
+    var scopedMiss = HookObserveRule.TryCreate(HookEventNames.RequestBeforeSend, @"/v\d+/user/login", "^GET$", null, null, null, null, null);
+    Require(scopedMiss is not null && !scopedMiss!.Matches(HookEventNames.RequestBeforeSend, login),
+        "多条件之间是 AND：任一不满足即整体不命中");
+
+    // 编辑器补全词表：必须与运行时契约同步，且体现 OBSERVE 独有的四点覆盖。
+    Require(HookScriptApi.ObserveEvents.Count == 4, "OBSERVE 的挂载点补全必须覆盖全部四个点");
+    foreach (var name in new[]
+             {
+                 HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
+                 HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver
+             })
+        Require(HookScriptApi.ObserveEvents.Any(symbol => symbol.Name == name), $"OBSERVE 事件补全必须包含 {name}");
+    foreach (var field in new[] { "url", "method", "host", "endpoint", "body", "status", "headers" })
+        Require(HookScriptApi.ObserveRuleFields.Any(symbol => symbol.Name == field), $"OBSERVE 规则补全必须包含匹配位置 {field}");
+    Require(HookScriptApi.HookVocabulary.Any(symbol => symbol.Name == "OBSERVE"),
+        "钩子词表必须包含 OBSERVE，它是默认拒绝转发下的观察声明入口");
+
+    // AI 代写系统提示词必须教会模型这套默认拒绝转发的规则，否则生成的脚本会重犯同一个错误——
+    // 定义了钩子函数、却没声明 OBSERVE/INTERCEPT，跑起来安安静静地什么都不做。
+    var hookPrompt = HookScriptApi.BuildAuthoringSystemPrompt(ScriptPurpose.Hook);
+    Require(hookPrompt.Contains("OBSERVE", StringComparison.Ordinal) &&
+            hookPrompt.Contains("默认拒绝转发", StringComparison.Ordinal),
+        "钩子代写提示词必须说明 OBSERVE 与默认拒绝转发");
+    Require(!HookScriptApi.BuildAuthoringSystemPrompt(ScriptPurpose.Fixture).Contains("OBSERVE", StringComparison.Ordinal),
+        "验证脚本提示词不应混入钩子专属的 OBSERVE 契约");
+}
+
+/// <summary>
 /// 审计日志尾读（<c>AuditLogReader</c>）：真实抓包时脚本的观察结论只经这条路径落盘，
 /// 工作台脚本页的「返回数据」列表靠它读回真实结果，读错就等于用户永远看不到脚本到底拦没拦到。
 /// </summary>
@@ -1640,6 +1703,13 @@ static async Task VerifyProxyHookMountPointsAsync()
             Path.Combine(workspaceRoot, "hook.py"), Path.Combine(workspaceRoot, "data"),
             [HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
              HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver]);
+        // 这个套件测的是「代理是否在四个位置按序触发」，不是默认拒绝转发本身（后者在
+        // --intercept-only 已有专门断言）；用测试注入口给四个挂载点各配一条无条件观察规则。
+        engine.SetObserveRulesForTest([.. new[]
+        {
+            HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
+            HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver
+        }.Select(name => HookObserveRule.TryCreate(name, null, null, null, null, null, null, null)!)]);
 
         using var archive = new TrafficArchive(workspaceRoot);
         await using var proxy = new ExplicitHttpProxy(new ProxyOptions(IPAddress.Loopback, 0), archive, hookEngine: engine);
@@ -1721,9 +1791,16 @@ static async Task VerifyProxyHookMountPointsAsync()
             "请求挂载点必须携带请求头");
 
         // 未勾选的挂载点不得触发：单点开关在引擎侧判断，这是「只观察我关心的点」的基础。
+        // 四个事件都配了无条件观察规则，所以唯一能挡住另外三个的只有 _enabledEvents 这道闸——
+        // 这样测的才是「单点开关」本身，不会和默认拒绝转发的判断混在一起。
         await using var singleEngine = new ScriptHookEngine("dummy-host.exe", null,
             Path.Combine(workspaceRoot, "hook.py"), Path.Combine(workspaceRoot, "data"),
             [HookEventNames.ResponseBeforeWrite]);
+        singleEngine.SetObserveRulesForTest([.. new[]
+        {
+            HookEventNames.RequestBeforeSend, HookEventNames.RequestAfterSend,
+            HookEventNames.ResponseBeforeWrite, HookEventNames.ResponseAfterDeliver
+        }.Select(name => HookObserveRule.TryCreate(name, null, null, null, null, null, null, null)!)]);
         var snapshot = new HookTransactionSnapshot(Guid.NewGuid(), Guid.NewGuid(), "GET", "http://x.test/", "x.test", "/", null, []);
         foreach (var name in new[]
                  {
@@ -1735,6 +1812,31 @@ static async Task VerifyProxyHookMountPointsAsync()
         while (singleEngine.TryDequeuePendingForTest(out var envelope)) single.Add(envelope);
         Require(single.Count == 1 && single[0].Event == HookEventNames.ResponseBeforeWrite,
             "只勾选一个挂载点时，其余挂载点不得入队");
+
+        // 默认拒绝转发本身：挂载点已勾选，但没有声明任何 OBSERVE 规则——事件必须一条都不入队，
+        // 即便脚本定义了对应的钩子函数。这是本次改动最核心的行为，必须在挂载点端到端这一层也测到，
+        // 不能只信 --intercept-only 里对 HookObserveRule 的单测。
+        await using var undeclaredEngine = new ScriptHookEngine("dummy-host.exe", null,
+            Path.Combine(workspaceRoot, "hook.py"), Path.Combine(workspaceRoot, "data"),
+            [HookEventNames.RequestBeforeSend, HookEventNames.ResponseBeforeWrite]);
+        Require(undeclaredEngine.ObserveRuleCount == 0, "新构造的引擎默认没有任何观察规则");
+        undeclaredEngine.Emit(HookEventNames.RequestBeforeSend, snapshot);
+        undeclaredEngine.Emit(HookEventNames.ResponseBeforeWrite, snapshot, 200);
+        Require(!undeclaredEngine.TryDequeuePendingForTest(out _),
+            "挂载点已勾选但未声明 OBSERVE/INTERCEPT 时，事件必须一条都不转发（默认拒绝转发）");
+        Require(undeclaredEngine.NotObservedEventCount == 2,
+            $"未转发的事件必须计入 NotObservedEventCount，实际 {undeclaredEngine.NotObservedEventCount}");
+
+        // 声明了 OBSERVE 但条件不命中：同样不得转发，且计入同一个计数器。
+        await using var mismatchEngine = new ScriptHookEngine("dummy-host.exe", null,
+            Path.Combine(workspaceRoot, "hook.py"), Path.Combine(workspaceRoot, "data"),
+            [HookEventNames.RequestBeforeSend]);
+        var mismatchRule = HookObserveRule.TryCreate(HookEventNames.RequestBeforeSend, "/does-not-match", null, null, null, null, null, null);
+        Require(mismatchRule is not null, "带 URL 条件的观察规则必须能编译");
+        mismatchEngine.SetObserveRulesForTest([mismatchRule!]);
+        mismatchEngine.Emit(HookEventNames.RequestBeforeSend, snapshot);
+        Require(!mismatchEngine.TryDequeuePendingForTest(out _), "OBSERVE 规则声明了但 URL 不命中时不得转发");
+        Require(mismatchEngine.NotObservedEventCount == 1, "条件不命中同样计入 NotObservedEventCount");
     }
     finally
     {
@@ -3885,10 +3987,15 @@ static async Task VerifyHooksAsync()
 static void VerifyHookEngineEmitBackpressure()
 {
     // 未启动的引擎即可验证关键路径背压：队列满时 Emit 整体跳过信封（含哈希），不入队也不抛出。
+    // 默认拒绝转发下 Emit 还要求命中 OBSERVE 规则才会入队，这里测的是背压这一层，
+    // 用测试专用注入口给一条“匹配一切”的规则，把默认拒绝转发的判断挪到别的用例里单独测。
     using var engineHolder = new ScriptHookEngineDisposer();
     var engine = new ScriptHookEngine("NetMind.SandboxHost.exe", null, "hook-script.py", "data",
         new[] { HookEventNames.RequestBeforeSend });
     engineHolder.Engine = engine;
+    var matchAll = HookObserveRule.TryCreate(HookEventNames.RequestBeforeSend, null, null, null, null, null, null, null);
+    Require(matchAll is not null, "无条件的观察规则必须能编译");
+    engine.SetObserveRulesForTest([matchAll!]);
     var snapshot = new HookTransactionSnapshot(Guid.NewGuid(), Guid.NewGuid(), "GET",
         "http://example.test/backpressure", "example.test", "/backpressure", null, new byte[16]);
     for (var index = 0; index < NetMindDefaults.HookEventQueueCapacity; index++)

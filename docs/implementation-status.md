@@ -1,5 +1,15 @@
 # Implementation status
 
+## 2026-08-11 钩子默认拒绝转发：OBSERVE 显式声明取代"勾选即转发全部"
+
+- **用户报告的症状**：脚本页「返回数据」列表"一大堆根本无法查找"。排查发现真实原因不是列表本身，而是观察路径的转发语义——`INTERCEPT` 只决定"要不要阻塞等裁决"，从不决定"要不要转发"；`ScriptHookEngine.Emit()` 此前对某挂载点只要在 `hook-config.json` 里勾选，就无条件转发该点**全部**流量，脚本只能自己在函数体内按 URL 过滤。用户当时激活的脚本 `on_before_write` 没做这个过滤，于是采集到的每一条 HTTP 响应都被处理、`store.save` 一次：工作区 `scripts/data` 下堆了 65 个文件，真正对应目标接口的只有 4 个。更严重的是：命中 `INTERCEPT` 规则的 URL 还会被**双重处理**——一次经阻塞的 intercept 消息，一次经无条件的 observe 消息，同一个事件调用两次函数。
+- **修法是把过滤的责任从"脚本作者自己记得写 if"搬到宿主强制**：新增脚本模块级 `OBSERVE` 声明（规则形状与 `INTERCEPT` 完全一致——url/method/host/endpoint/body/status/headers 全是正则，条件之间 AND），`ScriptHookEngine.Emit()` 改为默认拒绝转发：挂载点已勾选、但没有 `OBSERVE`/`INTERCEPT` 规则命中的事件，一条都不会送到脚本，函数体不会执行，也不报错。`INTERCEPT` 与 `OBSERVE` 是两条独立路径，互不依赖，同一挂载点只声明一种就不会再有双重调用。
+- `HookInterceptRule` 与新增的 `HookObserveRule` 共用同一份正则子句实现（抽出 `HookRuleClauses`）：两者的匹配逻辑必须永远同步，写两份迟早会在某次改动里悄悄分叉。`HookObserveRule` 唯一的区别是事件名校验允许全部四个挂载点（`INTERCEPT` 只认两个可改写的）。
+- 新增 `ScriptHookEngine.NotObservedEventCount`：挂载点已启用但未命中 OBSERVE 规则而被就地丢弃的计数，与队列背压丢弃（`DroppedEvents`，原因是队列满）分开统计——前者通常意味着脚本忘了声明 OBSERVE，后者意味着流量太大。工作台「试跑」用它算出真正指望被处理的事件数，不会再对着永远不会来的 `processed` 回执傻等 5 秒超时。
+- SandboxHost 的 Python 驱动模板同步：`INTERCEPT`/`OBSERVE` 的解析抽成一个函数复用，`ready` 消息新增 `observe` 字段；宿主侧过滤，worker 端不做转发判断（一贯的设计：单线程 worker 不背匹配逻辑）。
+- 影响面排查：工作区里另外两份脚本（`hook-ip.py`、`hook-script.py`）与随包示例 `docs/samples/hook-baidu-search-888.py` 全部只用 `INTERCEPT`，天然兼容新语义、无需改动；默认钩子模板与两个"只观察"类的插入示例补了 `OBSERVE` 声明。AI 代写系统提示词新增"默认拒绝转发"专节，教模型按需求选择 `OBSERVE`/`INTERCEPT`，避免生成的脚本重犯同一个错误。编辑器补全按最近声明的是 `OBSERVE` 还是 `INTERCEPT` 给出对应的挂载点候选（前者四个，后者两个）。
+- 定向验证：新增 `--observe-only`（四挂载点声明、AND 组合、词表与 AI 提示词同源）；`--mountpoint-only` 补充默认拒绝转发的正面/反面断言（未声明不转发、声明但不命中不转发、两种情况都计入 `NotObservedEventCount`）；`--hooks-only`/`--intercept-only`/`--baidu-intercept-only` 均通过。默认全量 34 个套件通过，Release 构建 0 警告 0 错误。
+
 ## 2026-08-11 设置页孤儿钩子开关清理与百度搜索拦截示例
 
 - **设置页那个「请求钩子」开关是个死控件**：`SettingsHooksBox` 连同它的标题与整块 `Border` 都是 `Visibility="Collapsed"`，用户在设置页根本看不到它。而 CoreHost 早在之前的重构里就改成只认工作区 `hook-config.json`（`TryCreateHookEngineAsync` 注释：「旧版全局 EnableTrafficHooks 字段仅保留配置兼容，不再形成第二道无语义差异的门控」）——也就是说这个开关既看不见，也早就不起作用了。

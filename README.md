@@ -112,13 +112,18 @@ sequenceDiagram
 - **钩子脚本** —— 采集期间由隔离的 Python 工作进程调用，定义 `on_before_send` 等函数
 - **验证脚本** —— 对当前流量快照跑一次，用 `assert` 表达规则，退出码即结论
 
-### 只观察（默认）
+### 默认拒绝转发
+
+定义了钩子函数不代表它会被调用：必须声明 `OBSERVE`（不阻塞）或 `INTERCEPT`（阻塞，仅限两个可改写挂载点）且命中，宿主才会转发事件；未声明的挂载点、未命中的流量，函数体永远不会执行——不报错，只是安静地没反应。这是刻意的默认拒绝，能从根上消除噪声：之前只要挂载点勾选，脚本就会收到该点的每一条流量，只能自己在函数体内按 URL 过滤，一次疏忽就会把无关请求也处理一遍。
 
 ```python
+# 只观察目标接口，不改写；宿主侧按 url 过滤，未命中的流量不占用工作进程
+OBSERVE = [
+    {'event': 'request.before_send', 'url': r'/login'},
+]
+
 def on_before_send(event):
     # 返回 None 什么都不做；返回 dict 形成一条审计结论
-    if 'login' not in (event.get('url') or ''):
-        return None
     return {'kind': 'auth.attempt', 'url': event.get('url')}
 ```
 
@@ -127,7 +132,7 @@ def on_before_send(event):
 ### 拦截改写（需显式声明）
 
 ```python
-# 只有命中规则的请求才阻塞等待裁决，其余流量仍是即发即忘
+# 只有命中规则的请求才阻塞等待裁决，其余流量既不阻塞也不转发给脚本
 INTERCEPT = [
     {'event': 'request.before_send', 'url': r'/v\d+/user/login', 'method': r'^POST$'},
 ]
@@ -140,7 +145,7 @@ def on_before_send(event):
     }
 ```
 
-规则字段全是正则（`url` / `method` / `host` / `endpoint` / `body` / `status` / `headers`），条件之间是 AND。**裁决超时、脚本崩溃、改写超限一律按原样放行**，绝不阻塞浏览器。
+`OBSERVE` 与 `INTERCEPT` 规则字段形状相同、全是正则（`url` / `method` / `host` / `endpoint` / `body` / `status` / `headers`），条件之间是 AND，两者相互独立可同时使用。**裁决超时、脚本崩溃、改写超限一律按原样放行**，绝不阻塞浏览器。
 
 ### 编辑器
 

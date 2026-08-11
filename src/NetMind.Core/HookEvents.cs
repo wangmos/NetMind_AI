@@ -78,21 +78,21 @@ public static class HookWorkerMessageTypes
 }
 
 /// <summary>
-/// 脚本声明的拦截规则（脚本模块级 <c>INTERCEPT</c>，工作进程在 ready 时上报）。
-///
-/// 规则由脚本自己声明，但匹配放在宿主进程内做纯字符串比较：代理热路径上每个请求都要过一遍，
-/// 若下推给 Python 判断，等于所有流量都被单线程 worker 串行化，页面会直接卡死。
+/// 规则子句集合：URL/方法/主机/路径/请求头/正文/状态码的正则匹配逻辑，<see cref="HookInterceptRule"/>
+/// 与 <see cref="HookObserveRule"/> 共用同一份实现——两者的匹配条件形状完全一致，唯一区别是
+/// 前者只能声明在两个可改写的挂载点上、且命中后走阻塞裁决，后者可声明在全部四个挂载点上、
+/// 命中后只是把事件放进观察队列。字段与正则编译只写一份，避免两处各写一遍、后续改动只改中一处。
 /// </summary>
 /// <remarks>
 /// 条件全部是正则，可同时约束 URL、方法、主机、路径、请求/响应头、正文与状态码；
-/// 给出的条件之间是 AND，全部命中才拦截。任一条件均可省略表示不限。
+/// 给出的条件之间是 AND，全部命中才算命中。任一条件均可省略表示不限。
 ///
 /// 正则优先用 <see cref="RegexOptions.NonBacktracking"/> 编译：它由 .NET 保证线性时间，
 /// 脚本里写出病态回溯模式也不会在代理热路径上炸掉。只有用到该引擎不支持的构造
 /// （反向引用、环视）时才退回普通引擎，并强制带上匹配超时兜底。
 /// 模式在 ready 上报时编译一次并缓存，热路径不重复解析。
 /// </remarks>
-public sealed class HookInterceptRule
+internal sealed class HookRuleClauses
 {
     private readonly Regex? _url;
     private readonly Regex? _method;
@@ -102,10 +102,9 @@ public sealed class HookInterceptRule
     private readonly Regex? _status;
     private readonly (string Name, Regex Value)[] _headers;
 
-    private HookInterceptRule(string hookEvent, Regex? url, Regex? method, Regex? host, Regex? endpoint,
+    private HookRuleClauses(Regex? url, Regex? method, Regex? host, Regex? endpoint,
         Regex? body, Regex? status, (string Name, Regex Value)[] headers)
     {
-        Event = hookEvent;
         _url = url;
         _method = method;
         _host = host;
@@ -115,17 +114,10 @@ public sealed class HookInterceptRule
         _headers = headers;
     }
 
-    public string Event { get; }
-
-    /// <summary>只有这两个挂载点在数据尚未发出/写回之前，改写才有意义。</summary>
-    public static bool IsMutable(string hookEvent) =>
-        hookEvent is HookEventNames.RequestBeforeSend or HookEventNames.ResponseBeforeWrite;
-
-    /// <summary>编译一条规则；事件名不可改写或任一模式非法时返回 null（该条规则整体作废，不做部分生效）。</summary>
-    public static HookInterceptRule? TryCreate(string? hookEvent, string? url, string? method, string? host,
+    /// <summary>编译一组子句；任一模式非法时返回 null（整条规则作废，不做部分生效）。</summary>
+    public static HookRuleClauses? TryCreate(string? url, string? method, string? host,
         string? endpoint, string? body, string? status, IReadOnlyDictionary<string, string>? headers)
     {
-        if (hookEvent is null || !IsMutable(hookEvent)) return null;
         if (!TryCompile(url, out var urlRegex) || !TryCompile(method, out var methodRegex) ||
             !TryCompile(host, out var hostRegex) || !TryCompile(endpoint, out var endpointRegex) ||
             !TryCompile(body, out var bodyRegex) || !TryCompile(status, out var statusRegex)) return null;
@@ -141,8 +133,7 @@ public sealed class HookInterceptRule
             }
             compiledHeaders = [.. list];
         }
-        return new HookInterceptRule(hookEvent, urlRegex, methodRegex, hostRegex, endpointRegex,
-            bodyRegex, statusRegex, compiledHeaders);
+        return new HookRuleClauses(urlRegex, methodRegex, hostRegex, endpointRegex, bodyRegex, statusRegex, compiledHeaders);
     }
 
     private static readonly Regex EmptyMatchesAll = new(string.Empty, RegexOptions.NonBacktracking | RegexOptions.CultureInvariant);
@@ -178,9 +169,8 @@ public sealed class HookInterceptRule
     }
 
     /// <summary>本次事务是否命中。任一正则超时都按“不命中”处理，绝不让匹配拖住代理关键路径。</summary>
-    public bool Matches(string hookEvent, HookTransactionSnapshot snapshot)
+    public bool Matches(HookTransactionSnapshot snapshot)
     {
-        if (!string.Equals(Event, hookEvent, StringComparison.Ordinal)) return false;
         try
         {
             if (_method is not null && !_method.IsMatch(snapshot.Method)) return false;
@@ -209,6 +199,82 @@ public sealed class HookInterceptRule
             return false;
         }
     }
+}
+
+/// <summary>
+/// 脚本声明的拦截规则（脚本模块级 <c>INTERCEPT</c>，工作进程在 ready 时上报）。
+/// 匹配放在宿主进程内做纯字符串比较：代理热路径上每个请求都要过一遍，
+/// 若下推给 Python 判断，等于所有流量都被单线程 worker 串行化，页面会直接卡死。
+/// </summary>
+public sealed class HookInterceptRule
+{
+    private readonly HookRuleClauses _clauses;
+
+    private HookInterceptRule(string hookEvent, HookRuleClauses clauses)
+    {
+        Event = hookEvent;
+        _clauses = clauses;
+    }
+
+    public string Event { get; }
+
+    /// <summary>只有这两个挂载点在数据尚未发出/写回之前，改写才有意义。</summary>
+    public static bool IsMutable(string hookEvent) =>
+        hookEvent is HookEventNames.RequestBeforeSend or HookEventNames.ResponseBeforeWrite;
+
+    /// <summary>编译一条规则；事件名不可改写或任一模式非法时返回 null（该条规则整体作废，不做部分生效）。</summary>
+    public static HookInterceptRule? TryCreate(string? hookEvent, string? url, string? method, string? host,
+        string? endpoint, string? body, string? status, IReadOnlyDictionary<string, string>? headers)
+    {
+        if (hookEvent is null || !IsMutable(hookEvent)) return null;
+        var clauses = HookRuleClauses.TryCreate(url, method, host, endpoint, body, status, headers);
+        return clauses is null ? null : new HookInterceptRule(hookEvent, clauses);
+    }
+
+    /// <summary>本次事务是否命中；事件名不匹配直接短路，不进入正则比较。</summary>
+    public bool Matches(string hookEvent, HookTransactionSnapshot snapshot) =>
+        string.Equals(Event, hookEvent, StringComparison.Ordinal) && _clauses.Matches(snapshot);
+}
+
+/// <summary>
+/// 脚本声明的观察规则（脚本模块级 <c>OBSERVE</c>，工作进程在 ready 时上报）。
+///
+/// 观察事件（<see cref="ScriptHookEngine.Emit"/>）默认不转发：只声明了钩子函数、既没写
+/// <c>OBSERVE</c> 也没写 <c>INTERCEPT</c> 的挂载点收不到任何事件。这是刻意的默认拒绝——此前
+/// 只要挂载点在工作区配置里勾选，脚本就会收到该点上的<b>每一条</b>流量，脚本必须自己在函数体内
+/// 判断要不要处理；INTERCEPT 只决定"要不要阻塞等裁决"，从不决定"要不要转发"，两条路径完全独立，
+/// 于是一个只声明了 INTERCEPT 的脚本，对同一条命中的事务会经两条路径各触发一次处理函数。
+/// 现在改为显式声明：脚本自己说清楚要看什么，宿主按声明过滤，未声明的挂载点、未命中的流量
+/// 都不会进入队列，脚本不再需要在函数体内重复判断，也不会再有一条事务触发两次的情况。
+/// </summary>
+public sealed class HookObserveRule
+{
+    private readonly HookRuleClauses _clauses;
+
+    private HookObserveRule(string hookEvent, HookRuleClauses clauses)
+    {
+        Event = hookEvent;
+        _clauses = clauses;
+    }
+
+    public string Event { get; }
+
+    /// <summary>四个挂载点都可以声明观察——它不阻塞、不改写，没有 INTERCEPT 那样的限制。</summary>
+    public static bool IsValidEvent(string hookEvent) => hookEvent is
+        HookEventNames.RequestBeforeSend or HookEventNames.RequestAfterSend or
+        HookEventNames.ResponseBeforeWrite or HookEventNames.ResponseAfterDeliver;
+
+    /// <summary>编译一条规则；事件名非法或任一模式非法时返回 null（该条规则整体作废，不做部分生效）。</summary>
+    public static HookObserveRule? TryCreate(string? hookEvent, string? url, string? method, string? host,
+        string? endpoint, string? body, string? status, IReadOnlyDictionary<string, string>? headers)
+    {
+        if (hookEvent is null || !IsValidEvent(hookEvent)) return null;
+        var clauses = HookRuleClauses.TryCreate(url, method, host, endpoint, body, status, headers);
+        return clauses is null ? null : new HookObserveRule(hookEvent, clauses);
+    }
+
+    public bool Matches(string hookEvent, HookTransactionSnapshot snapshot) =>
+        string.Equals(Event, hookEvent, StringComparison.Ordinal) && _clauses.Matches(snapshot);
 }
 
 /// <summary>
