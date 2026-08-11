@@ -4,8 +4,8 @@
     <Company>NetMind AI</Company>
     <Authors>NetMind AI</Authors>
     <Copyright>Copyright © 2026 NetMind AI</Copyright>
-    <Version>0.8.0</Version>
-    <RepositoryUrl>https://github.com/netmind-ai/netmind-ai</RepositoryUrl>
+    <Version>0.9.0</Version>
+    <RepositoryUrl>https://github.com/wangmos/NetMind_AI</RepositoryUrl>
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <!--
