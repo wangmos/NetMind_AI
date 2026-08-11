@@ -449,13 +449,17 @@
                                     <ListBox x:Name="PageHookList" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" MouseDoubleClick="页内Hook_双击" SelectionChanged="页内Hook_选择变化" Margin="0,0,10,0" ToolTip="双击或选中条目在右侧详情区查看完整参数">
                                         <ListBox.ItemTemplate>
                                             <DataTemplate>
-                                                <Grid>
-                                                    <Grid.ColumnDefinitions><ColumnDefinition Width="86" /><ColumnDefinition Width="64" /><ColumnDefinition Width="180" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                                                    <TextBlock Grid.Column="0" Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="11.5" />
-                                                    <TextBlock Grid.Column="1" Text="{Binding Type}" Foreground="{StaticResource AmberBrush}" FontSize="11.5" />
-                                                    <TextBlock Grid.Column="2" Text="{Binding Function}" Foreground="{StaticResource AccentBrush}" FontSize="11.5" TextTrimming="CharacterEllipsis" />
-                                                    <TextBlock Grid.Column="3" Text="{Binding ArgsSummary}" Foreground="{StaticResource TextBrush}" FontSize="11.5" TextTrimming="CharacterEllipsis" Margin="8,0,0,0" />
-                                                </Grid>
+                                                <StackPanel Margin="0,2">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions><ColumnDefinition Width="72" /><ColumnDefinition Width="56" /><ColumnDefinition Width="130" /><ColumnDefinition Width="120" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                                        <TextBlock Grid.Column="0" Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="11" />
+                                                        <TextBlock Grid.Column="1" Text="{Binding Type}" Foreground="{StaticResource AmberBrush}" FontSize="11" />
+                                                        <TextBlock Grid.Column="2" Text="{Binding Function}" Foreground="{StaticResource AccentBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" />
+                                                        <TextBlock Grid.Column="3" Text="{Binding Host}" Foreground="{StaticResource BlueBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" ToolTip="{Binding Host}" />
+                                                        <TextBlock Grid.Column="4" Text="{Binding Path}" Foreground="{StaticResource TextBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" ToolTip="{Binding Path}" />
+                                                    </Grid>
+                                                    <TextBlock Text="{Binding ArgsSummary}" Foreground="{StaticResource MutedBrush}" FontSize="10.5" TextTrimming="CharacterEllipsis" Margin="72,1,0,0" />
+                                                </StackPanel>
                                             </DataTemplate>
                                         </ListBox.ItemTemplate>
                                     </ListBox>
@@ -852,14 +856,17 @@
                                         <ScrollViewer Grid.Row="1" MaxHeight="160" Margin="0,12,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                                             <TextBlock x:Name="SandboxOutput" Text="脚本尚未运行。&#x0a;&#x0a;点击右上角「运行」：钩子脚本会在临时目录里隔离试跑，验证脚本会在受限沙箱中执行一次。" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
                                         </ScrollViewer>
-                                        <!-- 试跑期间脚本返回的结论累积在这里，而不是只显示最近一次、看完就没了。点条目可在上方查看完整 JSON。 -->
+                                        <!-- 返回数据混合两个来源：「试跑」是工作台内点「运行」产出的；「实时抓包」是真实采集时脚本
+                                             在 CoreHost 里实际命中、经审计日志读回来的——这才是「有没有拦到指定 URL」的真实结果。
+                                             点条目可在上方查看完整 JSON。 -->
                                         <Grid Grid.Row="2" Margin="0,12,0,0">
                                             <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
                                             <Grid>
                                                 <TextBlock Text="返回数据" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
                                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                                                     <TextBlock x:Name="ScriptFindingsCountText" Text="空" Foreground="{StaticResource MutedBrush}" FontSize="10.5" VerticalAlignment="Center" />
-                                                    <Button Content="清空" Style="{StaticResource CompactActionButton}" Padding="8,3" MinHeight="0" FontSize="10" Margin="8,0,0,0" Click="清空脚本结果列表_Click" />
+                                                    <Button Content="刷新实时抓包" Style="{StaticResource CompactActionButton}" Padding="8,3" MinHeight="0" FontSize="10" Margin="8,0,0,0" Click="刷新脚本结果_Click" ToolTip="从工作区审计日志重新读取真实采集时脚本产出的最新结论" />
+                                                    <Button Content="清空" Style="{StaticResource CompactActionButton}" Padding="8,3" MinHeight="0" FontSize="10" Margin="6,0,0,0" Click="清空脚本结果列表_Click" />
                                                 </StackPanel>
                                             </Grid>
                                             <ListBox x:Name="ScriptFindingsList" Grid.Row="1" Margin="0,6,0,0" ItemsSource="{Binding ScriptFindings}" SelectionChanged="脚本结果_选择变化" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" AutomationProperties.Name="脚本返回数据列表">
@@ -867,8 +874,21 @@
                                                     <DataTemplate>
                                                         <StackPanel Margin="0,2">
                                                             <Grid>
-                                                                <TextBlock Text="{Binding Event}" Foreground="{StaticResource AccentBrush}" FontSize="10.5" TextTrimming="CharacterEllipsis" />
-                                                                <TextBlock Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="10" HorizontalAlignment="Right" />
+                                                                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                                                <TextBlock Grid.Column="0" Text="{Binding Source}" FontSize="10" FontWeight="SemiBold" VerticalAlignment="Center">
+                                                                    <TextBlock.Style>
+                                                                        <Style TargetType="TextBlock">
+                                                                            <Setter Property="Foreground" Value="{StaticResource BlueBrush}" />
+                                                                            <Style.Triggers>
+                                                                                <DataTrigger Binding="{Binding Source}" Value="实时抓包">
+                                                                                    <Setter Property="Foreground" Value="{StaticResource GreenBrush}" />
+                                                                                </DataTrigger>
+                                                                            </Style.Triggers>
+                                                                        </Style>
+                                                                    </TextBlock.Style>
+                                                                </TextBlock>
+                                                                <TextBlock Grid.Column="1" Text="{Binding Event}" Foreground="{StaticResource AccentBrush}" FontSize="10.5" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" />
+                                                                <TextBlock Grid.Column="1" Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="10" HorizontalAlignment="Right" />
                                                             </Grid>
                                                             <TextBlock Text="{Binding Summary}" FontSize="11" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" />
                                                         </StackPanel>

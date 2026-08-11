@@ -70,6 +70,7 @@ var suites = new SmokeSuite[]
         await VerifyPageHooksAsync();
     }),
     new("工作区脚本库（命名校验、用途推断、重命名/删除一致性、补全词表同源）", "script-library-only", VerifyScriptLibraryAsync),
+    new("审计日志尾读（按事件名过滤、最近 N 条排序、损坏行容错）", "audit-reader-only", VerifyAuditLogReaderAsync),
     new("编辑器文本变换（注释切换、整理格式、折叠区域、AI 代写提示词）", "script-text-only", Sync(VerifyScriptTextTools)),
     new("钩子信封正文预览按需下发", "hook-payload-only", VerifyHookBodyPreviewGateAsync),
     new("代理钩子挂载点端到端触发（顺序、txnId、正文、单点开关）", "mountpoint-only", VerifyProxyHookMountPointsAsync),
@@ -1242,6 +1243,71 @@ static void VerifyScriptTextTools()
     Require(HookScriptApi.ExtractPythonCode("```\nx = 1\n```") == "x = 1", "无语言标注的围栏同样要能取出");
     Require(HookScriptApi.ExtractPythonCode("x = 1") == "x = 1", "没有围栏时按纯代码处理");
     Require(HookScriptApi.ExtractPythonCode("   ").Length == 0, "空回复必须得到空字符串而不是异常");
+}
+
+/// <summary>
+/// 审计日志尾读（<c>AuditLogReader</c>）：真实抓包时脚本的观察结论只经这条路径落盘，
+/// 工作台脚本页的「返回数据」列表靠它读回真实结果，读错就等于用户永远看不到脚本到底拦没拦到。
+/// </summary>
+static async Task VerifyAuditLogReaderAsync()
+{
+    var root = Path.Combine(Path.GetTempPath(), "netmind-auditreader-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var store = new WorkspaceStore(root);
+        await store.InitializeAsync("审计尾读定向测试工作区");
+
+        Require((await AuditLogReader.ReadRecentAsync(root, NetMindDefaults.AuditEventHooksFinding, 50)).Count == 0,
+            "空日志必须返回空列表，而不是抛异常");
+
+        // 写 3 条目标事件，中间穿插 2 条其他事件——必须按事件名精确过滤，不能把无关审计也算进来。
+        for (var index = 0; index < 3; index++)
+        {
+            await store.AppendAuditAsync("traffic.recorded", new { note = "噪声事件 " + index });
+            await store.AppendAuditAsync(NetMindDefaults.AuditEventHooksFinding, new
+            {
+                @event = "response.before_write",
+                txnId = $"txn-{index}",
+                hookName = "on_before_write",
+                data = new { kind = "probe", ordinal = index },
+                truncated = false
+            });
+        }
+
+        var recent = await AuditLogReader.ReadRecentAsync(root, NetMindDefaults.AuditEventHooksFinding, 50);
+        Require(recent.Count == 3, $"必须只命中 3 条 hooks.finding，实际 {recent.Count}（噪声事件必须被过滤掉）");
+        Require(recent.All(entry => entry.EventName == NetMindDefaults.AuditEventHooksFinding),
+            "返回条目的事件名必须与查询条件一致");
+        Require(recent[0].PayloadJson.Contains("txn-0", StringComparison.Ordinal) &&
+                recent[^1].PayloadJson.Contains("txn-2", StringComparison.Ordinal),
+            "必须按文件中的先后顺序返回（旧的在前、新的在后），调用方按此假设把最新一条插到列表顶部");
+        Require(recent.All(entry => entry.PayloadJson.Contains("\"kind\":\"probe\"", StringComparison.Ordinal)),
+            "payload 必须是可解析的原始 JSON 文本，字段完整");
+
+        // 容量上限：只保留最近 N 条，且必须是真正最近的那几条（不是文件里随便哪 N 条）。
+        var capped = await AuditLogReader.ReadRecentAsync(root, NetMindDefaults.AuditEventHooksFinding, 2);
+        Require(capped.Count == 2, "容量上限必须生效");
+        Require(capped[0].PayloadJson.Contains("txn-1", StringComparison.Ordinal) &&
+                capped[^1].PayloadJson.Contains("txn-2", StringComparison.Ordinal),
+            "容量受限时必须保留最新的那几条，而不是文件里最早出现的几条");
+
+        // 手工在文件末尾追加一行损坏数据：单行损坏不能让其余审计条目读不出来。
+        var auditPath = Path.Combine(root, "logs", "audit.jsonl");
+        await File.AppendAllTextAsync(auditPath, "{ 这不是合法 JSON\n", new UTF8Encoding(false));
+        await store.AppendAuditAsync(NetMindDefaults.AuditEventHooksFinding, new
+        {
+            @event = "response.before_write", txnId = "txn-after-corruption", hookName = "on_before_write",
+            data = new { kind = "probe" }, truncated = false
+        });
+        var afterCorruption = await AuditLogReader.ReadRecentAsync(root, NetMindDefaults.AuditEventHooksFinding, 50);
+        Require(afterCorruption.Count == 4, "损坏行必须被跳过，其余包括损坏行之后写入的条目都必须能读到");
+        Require(afterCorruption[^1].PayloadJson.Contains("txn-after-corruption", StringComparison.Ordinal),
+            "损坏行之后的条目必须能正常读到，不能被前面的坏行拖累整体失败");
+    }
+    finally
+    {
+        if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+    }
 }
 
 /// <summary>

@@ -2845,8 +2845,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         public required string Time { get; init; }
         public required string Type { get; init; }
         public required string Function { get; init; }
+        /// <summary>调用目标的主机名；crypto/encode/storage 等非网络调用没有目标 URL，留空。</summary>
+        public required string Host { get; init; }
+        /// <summary>调用目标的路径与查询串。</summary>
+        public required string Path { get; init; }
         public required string ArgsSummary { get; init; }
         public required PageHookEvent Event { get; init; }
+
+        public static (string Host, string Path) SplitTargetUrl(string targetUrl)
+        {
+            if (string.IsNullOrEmpty(targetUrl)) return (string.Empty, string.Empty);
+            return Uri.TryCreate(targetUrl, UriKind.Absolute, out var uri)
+                ? (uri.IsDefaultPort ? uri.Host : uri.Authority, uri.PathAndQuery)
+                : (string.Empty, targetUrl); // 非绝对 URL（相对路径等）原样放进「路径」列，主机留空好过瞎猜
+        }
     }
 
     private async void 探索子页_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -2909,15 +2921,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 hook.Stack.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
                 hook.ArgsJson.Contains(keyword, StringComparison.OrdinalIgnoreCase));
         }
-        var rows = matches.Select(hook => new PageHookRow
+        var rows = matches.Select(hook =>
         {
-            Time = hook.Timestamp.LocalDateTime.ToString("HH:mm:ss.fff"),
-            Type = hook.Type,
-            Function = hook.Function,
-            ArgsSummary = string.IsNullOrEmpty(hook.TargetUrl)
-                ? (string.IsNullOrEmpty(hook.ArgsJson) ? "（空）" : hook.ArgsJson.Replace('\n', ' '))
-                : hook.TargetUrl + " · " + hook.ArgsJson.Replace('\n', ' '),
-            Event = hook
+            var (host, path) = PageHookRow.SplitTargetUrl(hook.TargetUrl);
+            return new PageHookRow
+            {
+                Time = hook.Timestamp.LocalDateTime.ToString("HH:mm:ss.fff"),
+                Type = hook.Type,
+                Function = hook.Function,
+                Host = host,
+                Path = path,
+                ArgsSummary = string.IsNullOrEmpty(hook.ArgsJson) ? "（空）" : hook.ArgsJson.Replace('\n', ' '),
+                Event = hook
+            };
         }).ToArray();
         // 事件按数据库 rowid 比对：每次轮询都是新对象，但同一条事件的 Id 稳定。
         if (PageHookList.ItemsSource is PageHookRow[] current && current.Length == rows.Length &&
@@ -7333,6 +7349,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ? null
             : "当前工作区尚无钩子配置；改完点顶部「保存」即可写入，下次启动采集生效。"), isError: loadError is not null);
         if (loadError is null) await RefreshScriptHookRuntimeStatusAsync();
+        await LoadRealHookFindingsAsync();
     }
 
     /// <summary>
@@ -7842,6 +7859,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ScriptFindings.Insert(0, new ScriptFindingRow
             {
                 Time = finding.ReceivedAtUtc.ToLocalTime().ToString("HH:mm:ss"),
+                Source = "试跑",
                 Event = finding.Event,
                 Script = scriptName,
                 Summary = json.Length > 90 ? json.Replace('\n', ' ')[..90] + "…" : json.Replace('\n', ' '),
@@ -7852,6 +7870,65 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         UpdateScriptFindingsCount();
     }
 
+    /// <summary>
+    /// 真实采集时脚本产出的结论走的是另一条路：CoreHost（不是工作台进程）每 2 秒把队列里的
+    /// finding 落到工作区审计日志（<c>hooks.finding</c>），工作台之前从不读这份日志——
+    /// 「运行结果」列表此前只在点「运行」做工作台内试跑时才有内容，真实抓包命中了什么，
+    /// 界面上根本看不到。这里把审计日志最近的记录读回来，接入同一个列表。
+    /// </summary>
+    private async Task LoadRealHookFindingsAsync()
+    {
+        var workspacePath = _workspacePath;
+        IReadOnlyList<AuditLogEntry> entries;
+        try
+        {
+            entries = await AuditLogReader.ReadRecentAsync(workspacePath, NetMindDefaults.AuditEventHooksFinding,
+                ScriptFindingsCapacity);
+        }
+        catch (Exception exception)
+        {
+            UpdateHookStatusLine("读取实时抓包结论失败：" + exception.Message, isError: true);
+            return;
+        }
+        if (!string.Equals(workspacePath, _workspacePath, StringComparison.OrdinalIgnoreCase)) return; // 读取期间切换了工作区
+
+        for (var index = ScriptFindings.Count - 1; index >= 0; index--)
+            if (ScriptFindings[index].Source == "实时抓包") ScriptFindings.RemoveAt(index);
+
+        foreach (var entry in entries)
+        {
+            string? eventName = null, txnId = null;
+            JsonElement data = default;
+            try
+            {
+                using var document = JsonDocument.Parse(entry.PayloadJson);
+                var root = document.RootElement;
+                eventName = root.TryGetProperty("event", out var eventElement) ? eventElement.GetString() : null;
+                txnId = root.TryGetProperty("txnId", out var txnElement) ? txnElement.GetString() : null;
+                if (root.TryGetProperty("data", out var dataElement)) data = dataElement.Clone();
+            }
+            catch (JsonException) { continue; } // 单条损坏跳过，不影响其余条目显示
+
+            var json = data.ValueKind == JsonValueKind.Undefined
+                ? "{}"
+                : JsonSerializer.Serialize(data, new JsonSerializerOptions
+                    { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
+            ScriptFindings.Insert(0, new ScriptFindingRow
+            {
+                Time = entry.Timestamp.ToLocalTime().ToString("MM-dd HH:mm:ss"),
+                Source = "实时抓包",
+                Event = eventName ?? "（未知挂载点）",
+                Script = txnId is null ? "实时抓包" : $"事务 {txnId}",
+                Summary = json.Length > 90 ? json.Replace('\n', ' ')[..90] + "…" : json.Replace('\n', ' '),
+                FullJson = json
+            });
+        }
+        while (ScriptFindings.Count > ScriptFindingsCapacity) ScriptFindings.RemoveAt(ScriptFindings.Count - 1);
+        UpdateScriptFindingsCount();
+    }
+
+    private async void 刷新脚本结果_Click(object sender, RoutedEventArgs e) => await LoadRealHookFindingsAsync();
+
     private void UpdateScriptFindingsCount()
     {
         if (ScriptFindingsCountText is not null)
@@ -7861,7 +7938,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void 脚本结果_选择变化(object sender, SelectionChangedEventArgs e)
     {
         if (ScriptFindingsList?.SelectedItem is not ScriptFindingRow row) return;
-        WriteRunOutput($"{row.Script} · {row.Event} · {row.Time}\n\n{row.FullJson}", Green, "查看结论");
+        WriteRunOutput($"[{row.Source}] {row.Script} · {row.Event} · {row.Time}\n\n{row.FullJson}", Green, "查看结论");
     }
 
     private void 清空脚本结果列表_Click(object sender, RoutedEventArgs e)
@@ -8137,6 +8214,8 @@ public sealed class ScriptRow(ScriptLibraryItem item) : INotifyPropertyChanged
 public sealed class ScriptFindingRow
 {
     public required string Time { get; init; }
+    /// <summary>"试跑"（工作台内点「运行」产出）或 "实时抓包"（真实采集时由 CoreHost 经审计日志落盘）。</summary>
+    public required string Source { get; init; }
     public required string Event { get; init; }
     public required string Script { get; init; }
     public required string Summary { get; init; }
