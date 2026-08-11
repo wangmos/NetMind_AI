@@ -2442,8 +2442,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     : "本次采集会话没有记录。\n\n点上方会话徽标旁的清除按钮可查看全部历史记录。";
             return _capturing ? "尚未采集到流量记录。" : "当前工作区还没有流量记录。";
         }
-        // 逐个条件试掉：找出单独放开哪一个就能出现记录，直接点名它。
         var total = TrafficRows.Count;
+        // 最常见也最容易让人误以为"采集坏了"的一种：目标站点是 HTTPS，但没启用解密，
+        // 于是抓到的全是 CONNECT 隧道；而"连接"这一类默认不显示，列表就成了 0 条。
+        // 这种情况下正文看不到、钩子也拦不到，必须把该做什么直接说出来。
+        var tunnelCount = TrafficRows.Count(row => row.ResourceKind == TrafficRow.ResourceKindConnect);
+        if (tunnelCount == total && !enabledResourceTypes.Contains(TrafficRow.ResourceKindConnect))
+        {
+            return $"已加载 {total} 条，全部是 HTTPS 加密隧道（CONNECT），而「连接」类型默认不显示。\n\n" +
+                   "未启用 HTTPS 解密时，HTTPS 请求只留下连接元数据：看不到 URL 与正文，请求钩子也无法拦截（加密隧道不可钩）。\n\n" +
+                   "要抓到真实请求：在「项目与数据」页启用 HTTPS 解密并信任工作区 CA，然后重新开始采集。\n" +
+                   "只想看连接记录：在上方资源类型里勾选「连接」。";
+        }
+
+        // 逐个条件试掉：找出单独放开哪一个就能出现记录，直接点名它。
         var reasons = new List<string>();
         if (_sessionFilterId is not null && TrafficRows.Count(row => row.SessionId == _sessionFilterId) == 0)
             reasons.Add($"会话范围（本次采集 0 条，工作区共 {total} 条）");
@@ -2457,7 +2469,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 status == "成功" ? row.Source.StatusCode < 400 : row.Source.StatusCode >= 400) == 0)
             reasons.Add($"状态筛选「{status}」");
         if (TrafficRows.Count(row => enabledResourceTypes.Contains(row.ResourceKind)) == 0)
-            reasons.Add("资源类型勾选");
+        {
+            var kinds = TrafficRows.Select(row => row.ResourceKind).Distinct()
+                .Where(kind => !enabledResourceTypes.Contains(kind)).Order(StringComparer.Ordinal);
+            reasons.Add($"资源类型勾选（这些记录都属于未勾选的「{string.Join("、", kinds)}」）");
+        }
         return reasons.Count == 0
             ? $"当前筛选条件组合后没有匹配记录（列表共 {total} 条）。"
             : $"已加载 {total} 条，但被以下条件全部挡掉：\n\n• {string.Join("\n• ", reasons)}";
@@ -6488,6 +6504,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             e.Handled = true;
             return;
         }
+        if (control && key == Key.S)
+        {
+            ScriptCompletionPopup.IsOpen = false;
+            保存脚本_Click(sender, e);
+            e.Handled = true;
+            return;
+        }
         // Ctrl+/ 切换注释。斜杠在主键盘区是 Oem2、小键盘是 Divide，两个都收。
         if (control && !shift && key is Key.Oem2 or Key.Divide)
         {
@@ -6839,8 +6862,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _folds.Clear();
             MarkScriptDirty();
             AiScriptRequestBox.Clear();
-            var summary = $"已生成并写入编辑器（{code.Split('\n').Length} 行）。检查无误后点「保存」。\n" +
+            var summary = $"已生成并写入编辑器（{code.Split('\n').Length} 行）。检查无误后按 Ctrl+S 保存。\n" +
                           $"输入 {result.InputTokens} 令牌 · 输出 {result.OutputTokens} 令牌";
+            // 输出令牌远大于代码量时，多半是模型仍在思考。把思考文本长度摆出来，免得只能靠猜。
+            if (result.ReasoningText.Length > 0)
+                summary += $"（其中思考 {result.ReasoningText.Length} 字符，本次请求已要求关闭思考）";
             if (violations.Count > 0)
                 WriteRunOutput(summary + "\n\n注意：生成的脚本未通过静态策略，运行前需要修改：\n" +
                     string.Join("\n", violations.Select(item => "• " + item)), Amber, "需修改");
@@ -7336,9 +7362,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ScriptDirtyText.Text = _scriptDirty ? "● 未保存" : string.Empty;
         var hook = CurrentScriptPurpose == ScriptPurpose.Hook;
         RunScriptButton.Content = hook ? "试跑钩子" : "运行验证";
-        ScriptEditorHintText?.Text = hook
-            ? "智能提示：Ctrl+J 唤出（Ctrl+空格 常被中文输入法拦截，Alt+/ 亦可）。输入 event.get('、store.、字典字段或任意标识符前两个字母会自动弹出；Enter/Tab 插入，Esc 关闭。"
-            : "智能提示：Ctrl+J 唤出（Ctrl+空格 常被中文输入法拦截，Alt+/ 亦可）。输入 fixture. 或事务字段前两个字母会自动弹出；Enter/Tab 插入，Esc 关闭。";
+        if (ScriptEditorHintText is not null)
+        {
+            ScriptEditorHintText.Text =
+                "Ctrl+S 保存 · Ctrl+J 智能提示（Ctrl+空格 常被中文输入法拦截，Alt+/ 亦可）· Ctrl+/ 切换注释 · Ctrl+[ 折叠当前块 · 右键有整理格式与折叠命令。\n" +
+                (hook
+                    ? "输入 event.get('、store.、字典字段或任意标识符前两个字母会自动弹出补全；Enter/Tab 插入，Esc 关闭。"
+                    : "输入 fixture. 或事务字段前两个字母会自动弹出补全；Enter/Tab 插入，Esc 关闭。");
+        }
     }
 
     private void 新建脚本_Click(object sender, RoutedEventArgs e) =>
@@ -7762,8 +7793,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var configured = !string.IsNullOrWhiteSpace(_activeHookScriptPath);
         var summary = $"{(enabled ? "已启用" : "未启用")} · 挂载点 {hookCount}/4 · " +
                       (configured ? "钩子脚本 " + _activeHookScriptPath : "尚未指定钩子脚本");
+        // 加密隧道不可钩：没开 HTTPS 解密时，HTTPS 站点的请求在代理眼里只是 CONNECT，
+        // 钩子一次都不会触发。这一条不说清楚，用户只会以为是脚本写错了。
+        if (enabled && !_tlsInspectionEnabled)
+            summary += "\n未启用 HTTPS 解密：HTTPS 流量是加密隧道，钩子无法触发，只有明文 HTTP 会被钩到。";
         HookStatusText.Text = notice is null ? summary : summary + "\n" + notice;
-        HookStatusText.Foreground = isError ? Red : enabled && hookCount > 0 && configured ? Green : Muted;
+        HookStatusText.Foreground = isError ? Red
+            : enabled && !_tlsInspectionEnabled ? Amber
+            : enabled && hookCount > 0 && configured ? Green : Muted;
         // 设置页只读回显同一份事实，避免用户在设置页找不到钩子状态而以为没有这项功能。
         if (SettingsHookSummaryText is not null)
         {
@@ -7841,9 +7878,12 @@ public sealed class TrafficRow(TrafficRecord source, string dataSource = SourceD
         return "—";
     }
 
+    /// <summary>未解密 HTTPS（CONNECT 隧道）的资源分类名。分类映射只有这一处，别处一律引用它。</summary>
+    public const string ResourceKindConnect = "连接";
+
     private static string ResolveResourceKind(TrafficRecord traffic)
     {
-        if (traffic.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase)) return "连接";
+        if (traffic.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase)) return ResourceKindConnect;
         var contentType = traffic.ResponseHeaders.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
             .Select(line => line.Split(':', 2))
             .Where(parts => parts.Length == 2 && parts[0].Trim().Equals("Content-Type", StringComparison.OrdinalIgnoreCase))

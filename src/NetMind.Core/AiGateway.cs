@@ -186,6 +186,8 @@ public sealed class AiGatewayClient(HttpClient? httpClient = null) : IDisposable
                 if (tools.Count == 0) payload["thinking"] = new { type = "enabled" };
                 payload["reasoning_effort"] = settings.ReasoningEffort is "max" or "xhigh" ? "max" : "high";
             }
+            // 显式关闭，而不是省略字段：混合推理模型默认就在思考，省略等于保持开启。
+            else payload["thinking"] = new { type = "disabled" };
         }
         return JsonSerializer.Serialize(payload, PayloadJsonOptions);
     }
