@@ -3729,7 +3729,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             SettingsAiEvidenceBox.Text = _settings.AiEvidenceMaximumTransactions.ToString();
             SettingsRefreshIntervalBox.Text = _settings.RefreshIntervalMilliseconds.ToString();
             SettingsSystemProxyBox.IsChecked = _settings.SystemProxyAutomation;
-            SettingsHooksBox.IsChecked = _settings.EnableTrafficHooks;
             SettingsSilentCaptureBox.IsChecked = _settings.UseSilentCapture;
             TopSilentBox.IsChecked = _settings.UseSilentCapture;
             TopSystemProxyBox.IsChecked = _settings.SystemProxyAutomation;
@@ -3757,7 +3756,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ReadCountBox(SettingsSessionWindowBox, "会话列表条数"),
             ReadCountBox(SettingsAiEvidenceBox, "AI 证据条数上限"),
             ReadCountBox(SettingsPageHookWindowBox, "页内 Hook 列表条数"),
-            SettingsSystemProxyBox.IsChecked == true, SettingsHooksBox.IsChecked == true,
+            // EnableTrafficHooks 已无界面开关：钩子的唯一启用来源是工作区 hook-config.json。
+            // 这里原样透传旧值而不是写死 false，保证旧设置文件往返不被静默清掉。
+            SettingsSystemProxyBox.IsChecked == true, _settings.EnableTrafficHooks,
             SettingsSilentCaptureBox.IsChecked == true, null, ReadBrowserEnvironmentFromUi(), _workspaceRoot).Validate();
     }
 
@@ -6920,7 +6921,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ScriptDirtyText.Text = _scriptDirty ? "● 未保存" : string.Empty;
         var hook = CurrentScriptPurpose == ScriptPurpose.Hook;
         RunScriptButton.Content = hook ? "试跑钩子" : "运行验证";
-        ScriptEditorHintText.Text = hook
+        ScriptEditorHintText?.Text = hook
             ? "智能提示：Ctrl+J 唤出（Ctrl+空格 常被中文输入法拦截，Alt+/ 亦可）。输入 event.get('、store.、字典字段或任意标识符前两个字母会自动弹出；Enter/Tab 插入，Esc 关闭。"
             : "智能提示：Ctrl+J 唤出（Ctrl+空格 常被中文输入法拦截，Alt+/ 亦可）。输入 fixture. 或事务字段前两个字母会自动弹出；Enter/Tab 插入，Esc 关闭。";
     }
@@ -7348,7 +7349,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                       (configured ? "钩子脚本 " + _activeHookScriptPath : "尚未指定钩子脚本");
         HookStatusText.Text = notice is null ? summary : summary + "\n" + notice;
         HookStatusText.Foreground = isError ? Red : enabled && hookCount > 0 && configured ? Green : Muted;
+        // 设置页只读回显同一份事实，避免用户在设置页找不到钩子状态而以为没有这项功能。
+        if (SettingsHookSummaryText is not null)
+        {
+            SettingsHookSummaryText.Text = "当前工作区：" + summary;
+            SettingsHookSummaryText.Foreground = enabled && hookCount > 0 && configured ? Green : Muted;
+        }
     }
+
+    /// <summary>设置页的钩子入口：跳到脚本页，那里才是钩子的唯一配置处。</summary>
+    private void 前往脚本页配置钩子_Click(object sender, RoutedEventArgs e) => SelectPage(SandboxNav);
 }
 
 public sealed class TrafficRow(TrafficRecord source, string dataSource = SourceDemo, Guid? sessionId = null) : INotifyPropertyChanged

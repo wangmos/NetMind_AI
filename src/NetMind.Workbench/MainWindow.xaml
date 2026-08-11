@@ -788,7 +788,7 @@
                                             </Border>
                                             <Button Grid.Column="1" Content="设为采集钩子" Style="{StaticResource CompactActionButton}" Padding="10,6" MinHeight="0" FontSize="11.5" Margin="8,0,0,0" Click="设为采集钩子_Click" ToolTip="把左侧选中的钩子脚本设为采集期间执行的脚本" />
                                         </Grid>
-                                        <CheckBox x:Name="HookEnabledBox" Content="启用请求钩子" Margin="0,13,0,0" AutomationProperties.Name="钩子启用开关" Checked="钩子勾选_Changed" Unchecked="钩子勾选_Changed" ToolTip="还需在设置页开启「请求钩子」总开关，两者同时满足才会拉起钩子工作进程" />
+                                        <CheckBox x:Name="HookEnabledBox" Content="启用请求钩子" Margin="0,13,0,0" AutomationProperties.Name="钩子启用开关" Checked="钩子勾选_Changed" Unchecked="钩子勾选_Changed" ToolTip="钩子的唯一启用来源就是这里：勾选后点顶部「保存」写入当前工作区，下次启动采集即拉起钩子工作进程；没有额外的全局总开关" />
                                         <TextBlock Text="挂载点" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,11,0,0" />
                                         <WrapPanel Margin="0,6,0,0">
                                             <CheckBox x:Name="HookBeforeSendBox" Content="发送前" Width="150" Margin="0,0,0,7" AutomationProperties.Name="钩子点：发送前" Checked="钩子勾选_Changed" Unchecked="钩子勾选_Changed" ToolTip="request.before_send · 请求发往上游之前；可拦截改写" />
@@ -941,11 +941,18 @@
                                             </StackPanel>
                                         </Border>
                                     </Expander>
-                                    <TextBlock Text="请求钩子（脚本挂接关键路径）" FontSize="15" FontWeight="SemiBold" Margin="0,20,0,0" Visibility="Collapsed" />
-                                    <Border Background="{StaticResource RaisedBrush}" CornerRadius="6" Padding="14" Margin="0,12,0,0" Visibility="Collapsed">
+                                    <TextBlock Text="请求钩子（脚本挂接关键路径）" FontSize="15" FontWeight="SemiBold" Margin="0,20,0,0" />
+                                    <Border Background="{StaticResource RaisedBrush}" CornerRadius="6" Padding="14" Margin="0,12,0,0">
                                         <StackPanel>
-                                            <CheckBox x:Name="SettingsHooksBox" Content="开启请求钩子：采集期间由钩子脚本异步观察每个请求的四个关键路径点" AutomationProperties.Name="请求钩子开关" ToolTip="默认关闭；开启后还需在当前工作区的脚本验证页保存启用状态的钩子配置，两个条件同时满足才会拉起钩子工作进程" />
-                                            <TextBlock Text="默认关闭。开启后，采集期间钩子脚本会在请求发送前、发送后、响应写回前、响应交付后四个关键路径点异步观察流量；还需在“脚本验证 · 请求钩子”区块保存启用状态的工作区配置，两者同时满足才生效。" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,8,0,0" TextWrapping="Wrap" />
+                                            <TextBlock Text="请求钩子按工作区启用，没有全局开关：当前工作区 scripts/hook-config.json 是唯一的启用来源，采集后台只认它。" Foreground="{StaticResource MutedBrush}" FontSize="10.5" TextWrapping="Wrap" />
+                                            <Grid Margin="0,10,0,0">
+                                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                                <Border Background="{StaticResource SurfaceBrush}" CornerRadius="4" Padding="9,7" VerticalAlignment="Center">
+                                                    <TextBlock x:Name="SettingsHookSummaryText" Text="尚未加载钩子配置" FontSize="11.5" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" />
+                                                </Border>
+                                                <Button Grid.Column="1" Content="去脚本页配置" Style="{StaticResource SecondaryButton}" Padding="12,6" Margin="8,0,0,0" Click="前往脚本页配置钩子_Click" ToolTip="在脚本页指定采集钩子脚本、勾选挂载点并启用，点顶部「保存」写入当前工作区" />
+                                            </Grid>
+                                            <TextBlock Text="在脚本页用「设为采集钩子」指定脚本、勾选挂载点、勾选「启用请求钩子」，再点顶部「保存」即可挂载；采集期间钩子会在请求发送前、发送后、响应写回前、响应交付后四个关键路径点观察流量。" Foreground="{StaticResource MutedBrush}" FontSize="10.5" Margin="0,10,0,0" TextWrapping="Wrap" />
                                             <TextBlock Text="注意：钩子脚本故障不影响流量捕获（无感直通）；加密隧道（未解密的 HTTPS）内容不可钩；配置变更在下次启动采集时生效。" Foreground="{StaticResource AmberBrush}" FontSize="10.5" Margin="0,6,0,0" TextWrapping="Wrap" />
                                         </StackPanel>
                                     </Border>

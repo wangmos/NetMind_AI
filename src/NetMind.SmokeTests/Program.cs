@@ -72,6 +72,7 @@ var suites = new SmokeSuite[]
     new("工作区脚本库（命名校验、用途推断、重命名/删除一致性、补全词表同源）", "script-library-only", VerifyScriptLibraryAsync),
     new("代理钩子挂载点端到端触发（顺序、txnId、正文、单点开关）", "mountpoint-only", VerifyProxyHookMountPointsAsync),
     new("拦截规则正则匹配（URL/方法/主机/路径/头/正文/状态码）与 fail-open", "intercept-only", VerifyHookInterceptRulesAsync),
+    new("示例脚本端到端：百度搜索关键字固定为 888（真实 worker + 真实代理）", "baidu-intercept-only", VerifyBaiduSearchInterceptAsync),
     new("采集链路一键自检", "capture-health-only", VerifyCaptureHealthAsync),
     new("HTTPS CONNECT、TLS 解密、正文持久化与 AI 脱敏", "tls-only", VerifyTlsInspectionAsync),
     new("Windows Job Object 沙箱资源限制与真实 Python", "sandbox-only", VerifyWindowsSandboxAsync),
@@ -1525,6 +1526,153 @@ static async Task VerifyProxyHookMountPointsAsync()
         try { upstream.Stop(); } catch (SocketException) { }
         if (Directory.Exists(workspaceRoot)) Directory.Delete(workspaceRoot, recursive: true);
     }
+}
+
+/// <summary>
+/// 示例脚本 docs/samples/hook-baidu-search-888.py 的端到端验证：
+/// 真实 SandboxHost hook-worker + 真实 Python + 真实代理，断言上游实际收到的字节里
+/// 搜索关键字已被固定为 888。
+///
+/// 之所以要走完整链路而不是只测 <see cref="HookInterceptRule"/>：规则匹配、worker 上报、
+/// 代理阻塞裁决、改写回写请求行——这四段里任何一段断了，用户看到的都是「脚本没生效」，
+/// 而单测规则匹配对这四段中的三段一无所知。
+///
+/// 断言用的脚本直接读仓库里那一份，不在测试里另抄一份：抄一份就会漂移，
+/// 漂移之后这个套件验证的就不再是用户真正拿到的脚本。
+/// </summary>
+static async Task VerifyBaiduSearchInterceptAsync()
+{
+    // 与既有钩子端到端子断言一致：本机没有 Python 时跳过，不计失败。
+    var probe = await new PythonSandboxRunner().RunAsync(new SandboxJob(
+        "print('python-ok')", JsonSerializer.SerializeToElement(new { }), TimeoutMilliseconds: 10000));
+    if (!probe.Succeeded && probe.State == "运行时不可用")
+    {
+        Console.WriteLine("百度搜索拦截端到端断言跳过（未找到 Python）。");
+        return;
+    }
+
+    var sandboxHostPath = ResolveSandboxHostForTest();
+    Require(sandboxHostPath is not null, "端到端断言必须能找到同批构建的 NetMind.SandboxHost 可执行文件");
+
+    var samplePath = ResolveRepositoryFileForTest(Path.Combine("docs", "samples", "hook-baidu-search-888.py"));
+    Require(samplePath is not null, "必须能定位仓库中的示例脚本 docs/samples/hook-baidu-search-888.py");
+    var scriptText = await File.ReadAllTextAsync(samplePath!);
+    Require(PythonSandboxPolicy.Validate(scriptText).Count == 0,
+        "示例脚本必须通过静态能力策略，否则用户保存时就会被拒：" +
+        string.Join("、", PythonSandboxPolicy.Validate(scriptText)));
+
+    var workspaceRoot = Path.Combine(Path.GetTempPath(), "netmind-baidu-intercept-" + Guid.NewGuid().ToString("N"));
+    var upstream = new TcpListener(IPAddress.Loopback, 0);
+    upstream.Start();
+    var upstreamPort = ((IPEndPoint)upstream.LocalEndpoint).Port;
+    try
+    {
+        await new WorkspaceStore(workspaceRoot).InitializeAsync("百度拦截测试工作区");
+        var scriptsDirectory = Path.Combine(workspaceRoot, NetMindDefaults.ScriptsDirectoryName);
+        Directory.CreateDirectory(scriptsDirectory);
+        var scriptPath = Path.Combine(scriptsDirectory, "hook-baidu-search-888.py");
+        await File.WriteAllTextAsync(scriptPath, scriptText, new UTF8Encoding(false));
+
+        // 上游只记录收到的请求行：这是「实际上线的字节」，也是唯一有说服力的断言对象。
+        var receivedRequestLines = new List<string>();
+        var upstreamTask = Task.Run(async () =>
+        {
+            for (var index = 0; index < 2; index++)
+            {
+                using var client = await upstream.AcceptTcpClientAsync();
+                using var stream = client.GetStream();
+                var headerText = await ReadHeaderTextAsync(stream);
+                lock (receivedRequestLines)
+                    receivedRequestLines.Add(headerText.Split("\r\n", StringSplitOptions.None)[0]);
+                var body = Encoding.UTF8.GetBytes("{\"ok\":true}");
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                    $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n"));
+                await stream.WriteAsync(body);
+            }
+        });
+
+        await using var engine = new ScriptHookEngine(sandboxHostPath!, null, scriptPath,
+            Path.Combine(scriptsDirectory, NetMindDefaults.HookDataDirectoryName),
+            [HookEventNames.RequestBeforeSend]);
+        Require(await engine.StartAsync(), "钩子工作进程必须能按示例脚本启动");
+
+        // 规则随 ready 一次性上报；上报完成前不得开始断言，否则测的是「还没生效」的时刻。
+        var ruleTimer = Stopwatch.StartNew();
+        while (engine.InterceptRuleCount == 0 && ruleTimer.Elapsed < TimeSpan.FromSeconds(20))
+            await Task.Delay(50);
+        Require(engine.InterceptRuleCount == 1,
+            $"示例脚本必须上报 1 条 INTERCEPT 规则，实际 {engine.InterceptRuleCount} 条");
+
+        using var archive = new TrafficArchive(workspaceRoot);
+        await using var proxy = new ExplicitHttpProxy(new ProxyOptions(IPAddress.Loopback, 0), archive, hookEngine: engine);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var proxyTask = proxy.RunAsync(cancellation.Token);
+        while (proxy.LocalEndpoint is null) await Task.Delay(10, cancellation.Token);
+
+        static async Task SendAsync(ExplicitHttpProxy proxy, string target, CancellationToken cancellationToken)
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(proxy.LocalEndpoint!.Address, proxy.LocalEndpoint.Port, cancellationToken);
+            using var stream = client.GetStream();
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                $"GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"), cancellationToken);
+            using var sink = new MemoryStream();
+            await stream.CopyToAsync(sink, cancellationToken);
+        }
+
+        // ① 命中：百度网页搜索形态 /s?wd=…，关键字必须被固定为 888。
+        await SendAsync(proxy, $"http://127.0.0.1:{upstreamPort}/s?wd=%E5%8E%9F%E5%A7%8B%E5%85%B3%E9%94%AE%E8%AF%8D&rsv_spt=1", cancellation.Token);
+        // ② 不命中：同样带 wd，但不是搜索端点，必须原样透传。
+        await SendAsync(proxy, $"http://127.0.0.1:{upstreamPort}/nosearch?wd=%E5%8E%9F%E5%A7%8B%E5%85%B3%E9%94%AE%E8%AF%8D", cancellation.Token);
+
+        await upstreamTask;
+        cancellation.Cancel();
+        try { await proxyTask; } catch (OperationCanceledException) { }
+
+        Require(receivedRequestLines.Count == 2, $"上游必须收到 2 个请求，实际 {receivedRequestLines.Count} 个");
+        var intercepted = receivedRequestLines[0];
+        Require(intercepted.Contains("wd=888", StringComparison.Ordinal),
+            "命中的搜索请求必须以 wd=888 发往上游，实际请求行：" + intercepted);
+        Require(!intercepted.Contains("%E5%8E%9F%E5%A7%8B", StringComparison.OrdinalIgnoreCase),
+            "原始搜索关键字不得残留在发往上游的请求行里：" + intercepted);
+        // 只改关键字，不得顺手吞掉同一查询串里的其他参数。
+        Require(intercepted.Contains("rsv_spt=1", StringComparison.Ordinal),
+            "改写必须保留查询串中的其他参数，实际请求行：" + intercepted);
+
+        var untouched = receivedRequestLines[1];
+        Require(untouched.Contains("%E5%8E%9F%E5%A7%8B", StringComparison.OrdinalIgnoreCase),
+            "未命中规则的请求必须原样透传，实际请求行：" + untouched);
+    }
+    finally
+    {
+        try { upstream.Stop(); } catch (SocketException) { }
+        if (Directory.Exists(workspaceRoot)) Directory.Delete(workspaceRoot, recursive: true);
+    }
+}
+
+/// <summary>读取并返回完整请求头文本（含结尾 CRLFCRLF 之前的内容），供断言实际上线的请求行。</summary>
+static async Task<string> ReadHeaderTextAsync(Stream stream)
+{
+    var buffer = new List<byte>(1024);
+    var single = new byte[1];
+    while (await stream.ReadAsync(single) > 0)
+    {
+        buffer.Add(single[0]);
+        if (buffer.Count >= 4 && buffer[^4] == 13 && buffer[^3] == 10 && buffer[^2] == 13 && buffer[^1] == 10)
+            return Encoding.UTF8.GetString(buffer.ToArray(), 0, buffer.Count - 4);
+    }
+    throw new EndOfStreamException("上游测试请求头未完整到达。");
+}
+
+/// <summary>
+/// 从测试输出目录回溯到仓库根，定位随仓库交付的文件。
+/// 与 <c>ResolveSandboxHostForTest</c> 用同一套相对布局假设：bin/&lt;cfg&gt;/net10.0 上溯四层即 src。
+/// </summary>
+static string? ResolveRepositoryFileForTest(string relativePath)
+{
+    var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+    var candidate = Path.Combine(repositoryRoot, relativePath);
+    return File.Exists(candidate) ? candidate : null;
 }
 
 /// <summary>

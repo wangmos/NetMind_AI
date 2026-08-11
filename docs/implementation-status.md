@@ -1,5 +1,17 @@
 # Implementation status
 
+## 2026-08-11 设置页孤儿钩子开关清理与百度搜索拦截示例
+
+- **设置页那个「请求钩子」开关是个死控件**：`SettingsHooksBox` 连同它的标题与整块 `Border` 都是 `Visibility="Collapsed"`，用户在设置页根本看不到它。而 CoreHost 早在之前的重构里就改成只认工作区 `hook-config.json`（`TryCreateHookEngineAsync` 注释：「旧版全局 EnableTrafficHooks 字段仅保留配置兼容，不再形成第二道无语义差异的门控」）——也就是说这个开关既看不见，也早就不起作用了。
+- 真正有害的不是控件本身，而是**没跟着改的文案**：脚本页 `HookEnabledBox` 的 ToolTip 仍写着「还需在设置页开启『请求钩子』总开关，两者同时满足才会拉起钩子工作进程」。用户照着去设置页找，找不到，于是合理地得出「挂载不了脚本」的结论。挂载链路其实一直是通的。
+- 处理：删掉死控件与那段陈述第二道门控的说明，设置页改为**可见的只读入口**——一行「当前工作区：已启用 · 挂载点 N/4 · 钩子脚本 X」状态回显加一个「去脚本页配置」按钮。状态由 `UpdateHookStatusLine` 一处产出，脚本页与设置页共用同一份事实，不会出现两处各说各话。
+- `EnableTrafficHooks` 字段在 `WorkbenchSettings` 中保留（旧设置文件 JSON 兼容），但界面不再读写；`ReadWorkbenchSettingsFromUi` 原样透传 `_settings.EnableTrafficHooks` 而不是写死 `false`，否则用户旧文件里的 `true` 会在下次保存时被静默清掉。
+- 新增示例脚本 `docs/samples/hook-baidu-search-888.py`：用模块级 `INTERCEPT` 命中百度网页搜索（`method ^GET$` + `endpoint ^/s\?` + `url [?&](wd|word)=`），在 `on_before_send` 里把关键字参数固定为 `888`，其余查询参数逐项原样保留；关键字已经是 888 时返回 `None` 不改写。刻意不加 `host` 条件，好处是同一份脚本对 `www.baidu.com`、`m.baidu.com` 与本地回环测试都成立，脚本头部注明了想收窄时该加哪一条。
+- 新增定向套件 `--baidu-intercept-only`：**真实** SandboxHost `hook-worker` + **真实** Python + **真实** `ExplicitHttpProxy` + 本地上游，断言上游实际收到的请求行是 `GET /s?wd=888&rsv_spt=1`。只测 `HookInterceptRule` 是不够的——规则匹配、worker 上报、代理阻塞裁决、改写回写请求行这四段里断任何一段，用户看到的都是「脚本没生效」，而单测规则匹配对其中三段一无所知。套件直接读仓库里那一份示例脚本，不另抄副本，抄一份就会漂移。
+- 套件同时断言：未命中的 `/nosearch?wd=…` 原样透传、改写不得吞掉同查询串里的其他参数、示例脚本能通过 `PythonSandboxPolicy` 静态策略（否则用户保存时就会被拒）。本机无 Python 时跳过不计失败，与既有钩子端到端子断言一致。
+- 反向验证过套件确实会红：把示例里的 `FIXED_KEYWORD` 改成 `777`，套件失败并打印实际请求行 `GET /s?wd=777&rsv_spt=1`——证明断言跑的是真实链路而不是恒真。
+- 定向验证：`--baidu-intercept-only`（新增）、`--intercept-only`、`--hooks-only`、`--mountpoint-only`、`--settings-only`、`--script-library-only` 全部通过。
+
 ## 2026-08-11 脚本页重做、多脚本管理与按进程采集崩溃修复
 
 - **按进程采集必崩**：`ProcessPickerWindow` 用 `Width = width ?? double.NaN` 给 DataGrid 列设宽，而 `DataGridLength` 对 NaN 与无穷大都抛「不应允许无限值」。这条路径**从写下那天起就没成功过**——不是偶发，是每次点击都在窗口构造函数里抛。列宽改用 `DataGridLength`（`Auto` / 固定值 / `1*`），不再借用 `FrameworkElement.Width` 那套「NaN 表示自动」的约定。定位靠的是上一轮加的全局异常兜底写出的 `workbench-crash.log`：完整栈直接指到行号，没有它只能看到工作台弹一个框。
