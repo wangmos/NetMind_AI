@@ -269,8 +269,14 @@ public static class HookScriptApi
         AppendSymbols(builder, StoreMembers);
         builder.AppendLine("store 落盘在工作区 scripts/data；单文件上限 1 MB，目录总量 64 MB。");
         builder.AppendLine();
-        builder.AppendLine("返回值：返回 None 表示什么都不做（不写审计）；返回 dict 形成一条观察结论写入审计日志。");
-        builder.AppendLine("结论上限 4 KB。请只在确有发现时返回，否则每个请求都会产生噪声。");
+        builder.AppendLine("=== 返回值含义看触发路径，不是看函数名：这是第二容易写错的地方 ===");
+        builder.AppendLine("被 OBSERVE 触发时：返回 None 表示什么都不做（不写审计）；返回 dict 本身就是一条观察结论，直接写入审计日志。");
+        builder.AppendLine("被 INTERCEPT 触发时：返回值只按上面 MutationFields 列出的字段解析，其余字段一律忽略、不会自动变成结论——");
+        builder.AppendLine("想同时留一条结论必须嵌套在 finding 键下，例如：");
+        builder.AppendLine("  return {'finding': {'kind': '...'}}  # 只想记录不改写：headers/body/status/url/method 都不要给");
+        builder.AppendLine("千万不要把业务字段直接摊平在顶层 return（尤其字段名恰好撞上 url/status 等改写字段名时），");
+        builder.AppendLine("会被当成改写指令静默处理掉，结论也不会被记录，且没有任何报错提示。只想观察不改写时优先用");
+        builder.AppendLine("OBSERVE 而不是 INTERCEPT，能从根上避免这个混淆。结论上限 4 KB，请只在确有发现时返回，否则每个请求都会产生噪声。");
         builder.AppendLine();
         builder.AppendLine("性能约束：单个事件有 200 毫秒看门狗，工作进程是单线程串行处理。");
         builder.AppendLine("不要写正则回溯爆炸、长循环或大对象拼接，超时会被跳过并记为错误。");

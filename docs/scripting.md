@@ -258,7 +258,7 @@ def on_before_write(event):
 | `bodySha256` | 字符串/空 | 完整正文 SHA-256（十六进制小写） |
 | `bodySize` | 整数 | 完整正文字节数 |
 
-钩子函数返回值会作为 `finding`（观察结论）回传采集后台，由后台周期性以 `hooks.finding` 审计事件落盘（payload 含 event/txnId/hookName/data/truncated，与其他审计事件走同一脱敏通道），工作台可在工作区审计日志中查看；单条结论上限 4 KB，超限截断。事件信封属于工作区本地所有者视图：原始观察只送达本机隔离工作进程，任何跨边界（AI 上下文、导出）的使用仍必须先经 `AiPrivacyFilter` 脱敏。
+**返回值的含义取决于触发路径，两者不通用**：被 `OBSERVE` 触发时，返回 `dict` 本身就是一条 `finding`（观察结论），直接回传采集后台，由后台以 `hooks.finding` 审计事件落盘（payload 含 event/txnId/hookName/data/truncated，与其他审计事件走同一脱敏通道），工作台可在工作区审计日志中查看；单条结论上限 4 KB，超限截断。被 `INTERCEPT` 触发时规则不同：返回值只按下文 [拦截改写](#拦截改写intercept) 列出的字段（`url`/`method`/`status`/`headers`/`body`/`finding`）解析，**其余字段一律被忽略、不会自动变成结论**——想同时留一条结论必须显式嵌套在 `finding` 键下（`return {'finding': {...}}`），把业务字段直接摊平在顶层 return（尤其是字段名恰好撞上 `url`/`status` 等改写字段时）会被误当成改写指令静默处理掉，且没有任何报错提示。同一个函数如果被 `OBSERVE` 与 `INTERCEPT` 两条路径同时触发（声明了不同匹配条件），必须按触发路径分别处理返回值。事件信封属于工作区本地所有者视图：原始观察只送达本机隔离工作进程，任何跨边界（AI 上下文、导出）的使用仍必须先经 `AiPrivacyFilter` 脱敏。
 
 ### 正文预览按需下发
 

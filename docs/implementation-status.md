@@ -1,5 +1,20 @@
 # Implementation status
 
+## 2026-08-11 脚本结果按当前抓包会话过滤，避免跨会话累积到无法查找
+
+- **症状**：脚本页「返回数据」列表随着反复采集越攒越多（截图里已有 125 条，跨了 08-11 20:13 到 23:15 好几个小时），用户明确担心"以后成千上万条了，怎么看得了"。
+- **原因**：`LoadRealHookFindingsAsync` 读的是工作区 `logs/audit.jsonl` 里最近 N 条 `hooks.finding`，这份日志是跨会话累加写入的，从来没有按"这次抓包"做过范围收窄——流量表早就有同样的问题并且已经解决（`_sessionFilterId` + `SessionFilterBadge`，开始新采集自动把范围收窄到本次会话），但这套过滤没有接到脚本结果列表上，两个列表的"当前范围"语义不一致。
+- **修法**：复用流量表现成的 `_sessionFilterId`，不新造一套范围概念。`ScriptFindingRow` 新增 `SessionId`，「实时抓包」来源的结论按 `txnId` 反查 `_storedTraffic` 解析出所属会话（查不到就按不属于当前会话处理，宁可保守隐藏）；「试跑」来源的结论没有真实会话，恒不受这条过滤影响。新增 `ApplyScriptFindingsFilter()` 统一套用"搜索关键字 AND 会话范围"两个条件，在 `_sessionFilterId` 的每个赋值点（开始采集、双击会话下钻、右键快速过滤、清除会话筛选）都调用它重新套用——`CollectionView.Filter` 是个闭包，字段变了不会自己重新触发。
+- 列表里"命中数 / 总数"的计数沿用了原有的搜索过滤同一套展示逻辑，不需要新增会话徽标：总数仍是真实累计条数，命中数会随会话范围收窄，用户点「清除会话筛选」（流量表已有的入口）就能看到跨会话的全部历史结论。
+- 定向验证：`--audit-reader-only --observe-only --intercept-only` 通过；`NetMind.Core`/`SandboxHost`/`CoreHost`/`SmokeTests` Release 编译无警告无错误，`NetMind.Workbench` 因用户本地正在跑着旧构建占用 DLL 未能完成产物复制，但 csc 编译阶段本身无 CS 错误。
+
+## 2026-08-11 INTERCEPT 命中时返回值被当改写指令解析，导致结论从未落盘
+
+- **症状**：用户反馈"最后一轮脚本拦截结果……都没有抓到"，而工作区 `scripts/data` 下确实已经落了上百个 `captcha_*.txt`，原始数据没丢，只是「脚本结果」列表里的「实时抓包」一直是空的，能看到的旧记录时间戳对不上，明显是本次采集之前的残留。
+- **根因**：用户脚本 `catch-qq-code.py` 用 `INTERCEPT` 声明 `response.before_write`，`on_before_write` 却直接 `return` 一个扁平字典（`kind`/`txnId`/`url`/`status`/…）当结论。但 `INTERCEPT` 命中时的返回值契约是"改写指令"：SandboxHost 驱动只认 `url`/`method`/`status`/`headers`/`body`/`finding` 这几个键，其余字段一律丢弃；只有嵌在 `finding` 键下的内容才会生成 `hooks.finding`。这个字典恰好有个 `url` 字段（值等于抓到的 URL），被误判成"要把 URL 改写成它自己"，产生一次空转的 `mutate`，结论则从未被记录——且没有任何报错提示。用编译好的 `NetMind.SandboxHost.exe hook-worker` 实测复现：旧脚本收到 `{"type": "mutate", ...}`，改成 `OBSERVE` 后收到 `{"type": "finding", "data": {...}}`。
+- **两处修**：脚本本身（用户工作区文件，不在仓库内）把声明从 `INTERCEPT` 改成 `OBSERVE`——它只读不改，本来就不该用会阻塞代理的 `INTERCEPT`，改用 `OBSERVE` 后同一份返回值直接就是结论，不需要额外包一层。更重要的是文档/提示词侧的同步：`docs/scripting.md`、`HookScriptApi.BuildAuthoringSystemPrompt`（AI 代写系统提示词）、脚本页内置指南第⑦条，此前都写着一句笼统的"返回 dict 就形成结论"，对 `INTERCEPT` 触发的调用是错的——这正是这个 bug 的源头。三处都改成按触发路径分别说明，并给出"业务字段撞上改写字段名会被静默吞掉"的反面提醒，避免 AI 代写或照着指南写的脚本重犯同一个错误。
+- 定向验证：`--observe-only --intercept-only` 通过（含 AI 提示词内容断言）；`NetMind.Core` Release 编译无警告无错误。
+
 ## 2026-08-11 钩子默认拒绝转发：OBSERVE 显式声明取代"勾选即转发全部"
 
 - **用户报告的症状**：脚本页「返回数据」列表"一大堆根本无法查找"。排查发现真实原因不是列表本身，而是观察路径的转发语义——`INTERCEPT` 只决定"要不要阻塞等裁决"，从不决定"要不要转发"；`ScriptHookEngine.Emit()` 此前对某挂载点只要在 `hook-config.json` 里勾选，就无条件转发该点**全部**流量，脚本只能自己在函数体内按 URL 过滤。用户当时激活的脚本 `on_before_write` 没做这个过滤，于是采集到的每一条 HTTP 响应都被处理、`store.save` 一次：工作区 `scripts/data` 下堆了 65 个文件，真正对应目标接口的只有 4 个。更严重的是：命中 `INTERCEPT` 规则的 URL 还会被**双重处理**——一次经阻塞的 intercept 消息，一次经无条件的 observe 消息，同一个事件调用两次函数。

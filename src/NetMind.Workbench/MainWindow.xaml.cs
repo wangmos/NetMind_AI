@@ -1747,6 +1747,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         UpdateRefreshPauseUi();
         ApplyFilter(selectFallback: false);
+        ApplyScriptFindingsFilter();
     }
 
     private void ReplaceTraffic(IEnumerable<TrafficRecord> source, long count,
@@ -2329,6 +2330,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void ResetSessionScopeForQuickFilter()
     {
         _sessionFilterId = _capturing ? _liveCaptureSessionId : null;
+        ApplyScriptFindingsFilter();
         if (SessionFilterBadge is null) return;
         SessionFilterBadge.Visibility = _sessionFilterId is null ? Visibility.Collapsed : Visibility.Visible;
     }
@@ -2593,6 +2595,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         // 否则下钻较早的会话时最近窗口里可能一条都没有。
         await RefreshStoredTrafficAsync();
         ApplyFilter();
+        ApplyScriptFindingsFilter();
     }
 
     private async void 清除会话筛选_Click(object sender, RoutedEventArgs e)
@@ -2601,6 +2604,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         SessionFilterBadge.Visibility = Visibility.Collapsed;
         await RefreshStoredTrafficAsync();
         ApplyFilter();
+        ApplyScriptFindingsFilter();
     }
 
     private async void 流量选择_Changed(object sender, SelectionChangedEventArgs e)
@@ -7239,7 +7243,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "    headers、bodyPreviewBase64、bodyTruncated、bodySha256、bodySize、schema。\n" +
         "    正文预览默认不下发（省掉绝大部分事件数据量）：脚本里出现 bodyPreviewBase64 或写 WANT_BODY = True 才带上。\n" +
         "⑥ 存储：store.save('名称', 值) / store.load('名称') / store.list() / store.delete('名称')，落盘在工作区 scripts/data。\n" +
-        "⑦ 结论：返回 None 不写审计；返回 dict 形成一条 hooks.finding，可用 txnId 精确关联流量事务。";
+        "⑦ 结论：返回值含义看触发路径——被 OBSERVE 触发时返回 None 不写审计，返回 dict 本身就是一条 hooks.finding；\n" +
+        "    被 INTERCEPT 触发时返回值只按④的改写字段解析，其余字段一律忽略，想留结论必须嵌套写 {'finding': {...}}，\n" +
+        "    直接把业务字段摊平在顶层 return 会被当成改写指令静默吞掉、不产生任何结论。可用 txnId 精确关联流量事务。";
 
     private static readonly ScriptSample[] HookScriptSamples =
     [
@@ -7948,7 +7954,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             });
         }
         while (ScriptFindings.Count > ScriptFindingsCapacity) ScriptFindings.RemoveAt(ScriptFindings.Count - 1);
-        UpdateScriptFindingsCount();
+        ApplyScriptFindingsFilter();
     }
 
     /// <summary>
@@ -7994,6 +8000,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 ? "{}"
                 : JsonSerializer.Serialize(data, new JsonSerializerOptions
                     { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
+            // 按 txnId 反查该事务归属的抓包会话，供下面的会话范围过滤使用；查不到（事务尚未进入
+            // _storedTraffic，或 txnId 缺失/格式不对）时按“不属于当前会话”处理，宁可保守隐藏。
+            Guid? sessionId = null;
+            if (txnId is not null && Guid.TryParse(txnId, out var txnGuid) &&
+                _storedTraffic.TryGetValue(txnGuid, out var stored))
+                sessionId = stored.SessionId;
             ScriptFindings.Insert(0, new ScriptFindingRow
             {
                 Time = entry.Timestamp.ToLocalTime().ToString("MM-dd HH:mm:ss"),
@@ -8001,11 +8013,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 Event = eventName ?? "（未知挂载点）",
                 Script = txnId is null ? "实时抓包" : $"事务 {txnId}",
                 Summary = json.Length > 90 ? json.Replace('\n', ' ')[..90] + "…" : json.Replace('\n', ' '),
-                FullJson = json
+                FullJson = json,
+                SessionId = sessionId
             });
         }
         while (ScriptFindings.Count > ScriptFindingsCapacity) ScriptFindings.RemoveAt(ScriptFindings.Count - 1);
-        UpdateScriptFindingsCount();
+        ApplyScriptFindingsFilter();
     }
 
     private async void 刷新脚本结果_Click(object sender, RoutedEventArgs e) => await LoadRealHookFindingsAsync();
@@ -8015,18 +8028,30 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     /// 列表会越攒越多；没有搜索框根本找不到某个特定 URL 的那一条。用 WPF 默认视图的 Filter
     /// 而不是另建一个过滤后的集合——新结论插入时会自动重新套用当前过滤条件，不需要手动刷新。
     /// </summary>
-    private void 脚本结果搜索_Changed(object sender, TextChangedEventArgs e)
+    private void 脚本结果搜索_Changed(object sender, TextChangedEventArgs e) => ApplyScriptFindingsFilter();
+
+    /// <summary>
+    /// 统一套用「搜索关键字」与「会话范围」两个条件（AND）。会话范围只约束 Source == "实时抓包" 的行——
+    /// 未开启会话筛选（_sessionFilterId 为 null，即流量表的“清除会话筛选”状态）时不生效；开启时只留下
+    /// 与当前抓包会话同一 SessionId 的实时抓包结论，避免跨会话的历史结论把列表越攒越多、找不到当次抓到的数据。
+    /// 试跑结果没有真实会话，不受这条约束。_sessionFilterId 的每个赋值点都要调这个方法重新套用过滤——
+    /// WPF 的 CollectionView.Filter 不会自己感知闭包外这个字段发生了变化。
+    /// </summary>
+    private void ApplyScriptFindingsFilter()
     {
         if (ScriptFindingsSearchBox is null) return;
         var view = CollectionViewSource.GetDefaultView(ScriptFindings);
         var keyword = ScriptFindingsSearchBox.Text.Trim();
-        view.Filter = keyword.Length == 0
-            ? null
-            : item => item is ScriptFindingRow row &&
-                      (row.Event.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
-                       row.Script.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
-                       row.Source.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
-                       row.FullJson.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+        view.Filter = item =>
+        {
+            if (item is not ScriptFindingRow row) return false;
+            if (_sessionFilterId is not null && row.Source == "实时抓包" && row.SessionId != _sessionFilterId) return false;
+            return keyword.Length == 0 ||
+                   row.Event.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                   row.Script.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                   row.Source.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                   row.FullJson.Contains(keyword, StringComparison.OrdinalIgnoreCase);
+        };
         UpdateScriptFindingsCount();
     }
 
@@ -8326,4 +8351,9 @@ public sealed class ScriptFindingRow
     public required string Script { get; init; }
     public required string Summary { get; init; }
     public required string FullJson { get; init; }
+    /// <summary>
+    /// 该结论关联事务所属的抓包会话；只有 Source == "实时抓包" 时才会解析（按 txnId 反查 _storedTraffic）。
+    /// 试跑结果不产生真实事务，恒为 null，也因此不受会话范围筛选影响。
+    /// </summary>
+    public Guid? SessionId { get; init; }
 }
