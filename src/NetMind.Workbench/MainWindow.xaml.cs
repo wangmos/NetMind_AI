@@ -307,6 +307,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     /// <summary>采集钩子脚本在脚本库中的文件名；scriptPath 指向 scripts 目录之外时为 null。</summary>
     private string? _activeHookScriptFileName;
     private CancellationTokenSource? _evidenceLoadCts;
+    /// <summary>选中行到真正读盘之间的等待。快速连点时中途路过的行不该各读一次正文。</summary>
+    private const int EvidenceLoadDebounceMilliseconds = 120;
 
     /// <summary>停止采集时系统代理还原结果，决定状态栏提示文案。</summary>
     private enum SystemProxyRestoreOutcome { NotTaken, Restored, Failed }
@@ -2419,9 +2421,46 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             SelectedTraffic = next;
             if (next is null)
             {
-                ClearTrafficEvidencePanel("没有符合条件的流量记录");
+                ClearTrafficEvidencePanel(DescribeEmptyTrafficList(query, source, status, excludes, enabledResourceTypes));
             }
         }
+    }
+
+    /// <summary>
+    /// 列表为空时说清楚是被哪一层挡掉的。
+    /// "什么都没有" 有好几种完全不同的原因（还没采到 / 被会话范围限定 / 被筛选条件挡掉），
+    /// 只显示一句"没有符合条件的流量记录"会让人怀疑是采集坏了。
+    /// </summary>
+    private string DescribeEmptyTrafficList(string query, string source, string status, string[] excludes,
+        IReadOnlyCollection<string> enabledResourceTypes)
+    {
+        if (TrafficRows.Count == 0)
+        {
+            if (_sessionFilterId is not null)
+                return _capturing
+                    ? "本次采集会话还没有产生流量记录。\n\n列表只显示本次会话，历史记录已隐藏；把目标应用的代理指向监听地址后即会出现。"
+                    : "本次采集会话没有记录。\n\n点上方会话徽标旁的清除按钮可查看全部历史记录。";
+            return _capturing ? "尚未采集到流量记录。" : "当前工作区还没有流量记录。";
+        }
+        // 逐个条件试掉：找出单独放开哪一个就能出现记录，直接点名它。
+        var total = TrafficRows.Count;
+        var reasons = new List<string>();
+        if (_sessionFilterId is not null && TrafficRows.Count(row => row.SessionId == _sessionFilterId) == 0)
+            reasons.Add($"会话范围（本次采集 0 条，工作区共 {total} 条）");
+        if (query.Length > 0 && TrafficRows.Count(row => TrafficFilterExpression.Compile(query)(row.SearchText)) == 0)
+            reasons.Add($"搜索关键字「{query}」");
+        if (excludes.Length > 0 && TrafficRows.All(row => IsExcludedRow(row, excludes)))
+            reasons.Add($"排除关键字「{string.Join('、', excludes)}」");
+        if (source != "全部来源" && TrafficRows.Count(row => row.DataSource == source) == 0)
+            reasons.Add($"来源筛选「{source}」");
+        if (status != "全部状态" && TrafficRows.Count(row =>
+                status == "成功" ? row.Source.StatusCode < 400 : row.Source.StatusCode >= 400) == 0)
+            reasons.Add($"状态筛选「{status}」");
+        if (TrafficRows.Count(row => enabledResourceTypes.Contains(row.ResourceKind)) == 0)
+            reasons.Add("资源类型勾选");
+        return reasons.Count == 0
+            ? $"当前筛选条件组合后没有匹配记录（列表共 {total} 条）。"
+            : $"已加载 {total} 条，但被以下条件全部挡掉：\n\n• {string.Join("\n• ", reasons)}";
     }
 
     /// <summary>按当前列表顺序重新编序号（升序排列下即时间顺序），供序号列与 AI 取数对照。</summary>
@@ -3224,6 +3263,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         TrafficResponseBody.Text = "正在读取内容寻址存储…";
         try
         {
+            // 快速连点/按住方向键连翻时，先等一小会儿再真正读盘。
+            // 上一次的令牌在方法开头已被取消，所以中途路过的行只花一次取消，不会去读它的正文。
+            await Task.Delay(EvidenceLoadDebounceMilliseconds, token);
             var workspace = new WorkspaceStore(_workspacePath);
             var requestTask = workspace.ReadBlobAsync(stored.RequestBlobHash, cancellationToken: token);
             var responseTask = workspace.ReadBlobAsync(stored.ResponseBlobHash, BlobPreviewMaximumBytes, token);
@@ -3231,13 +3273,27 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (token.IsCancellationRequested || SelectedTraffic?.Source.Id != traffic.Id) return;
             var requestBlob = await requestTask;
             var responseBlob = await responseTask;
-            TrafficRequestBody.Text = FormatBlob(requestBlob);
-            TrafficResponseBody.Text = FormatBlob(responseBlob);
-            TryShowBodyJsonTree(traffic.RequestHeaders, requestBlob, stored.RequestBlobHash, TrafficRequestJsonTree, TrafficRequestBody, 请求正文视图切换);
-            TryShowBodyJsonTree(traffic.ResponseHeaders, responseBlob, stored.ResponseBlobHash, TrafficResponseJsonTree, TrafficResponseBody, 响应正文视图切换);
-            UpdateResponsePreview(traffic, responseBlob, stored.ResponseBlobHash);
-            // 正文加载完成后重试内容搜索定位的待高亮关键字（若当前为树视图会自动切回原始正文）。
-            TryApplyPendingHighlight();
+            // 正文可能有数 MB，格式化（含二进制判定与十六进制预览）不能占着界面线程做。
+            var requestText = await Task.Run(() => FormatBlob(requestBlob), token);
+            var responseText = await Task.Run(() => FormatBlob(responseBlob), token);
+            if (token.IsCancellationRequested || SelectedTraffic?.Source.Id != traffic.Id) return;
+            TrafficRequestBody.Text = requestText;
+            TrafficResponseBody.Text = responseText;
+            // JSON 树构建与响应预览（图片解码/HTML 取文本）都是重活，降到后台优先级排队；
+            // 期间用户又点了别的行，令牌一取消它们就不会执行，界面不会被上一条的渲染拖住。
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (token.IsCancellationRequested || SelectedTraffic?.Source.Id != traffic.Id) return;
+                TryShowBodyJsonTree(traffic.RequestHeaders, requestBlob, stored.RequestBlobHash, TrafficRequestJsonTree, TrafficRequestBody, 请求正文视图切换);
+                TryShowBodyJsonTree(traffic.ResponseHeaders, responseBlob, stored.ResponseBlobHash, TrafficResponseJsonTree, TrafficResponseBody, 响应正文视图切换);
+                UpdateResponsePreview(traffic, responseBlob, stored.ResponseBlobHash);
+                // 正文加载完成后重试内容搜索定位的待高亮关键字（若当前为树视图会自动切回原始正文）。
+                TryApplyPendingHighlight();
+            }, DispatcherPriority.Background);
+        }
+        catch (OperationCanceledException)
+        {
+            // 用户已经切到别的记录：这一条的证据不必再渲染。
         }
         catch (Exception exception)
         {
@@ -6521,17 +6577,52 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return text.Count(character => character == '\n');
     }
 
+    /// <summary>
+    /// 切换选中行的注释。
+    ///
+    /// 只改动涉及的那几个段落，不重建整篇文档——整体替换会让滚动条跳回顶部、
+    /// 丢掉撤销粒度，也会把着色重来一遍。改完只对这几行重新着色。
+    /// </summary>
     private void ToggleSelectedLinesComment()
     {
         if (ScriptEditor is null) return;
-        var text = GetScriptText();
+        var paragraphs = ScriptEditor.Document.Blocks.OfType<Paragraph>().ToArray();
+        if (paragraphs.Length == 0) return;
         var selection = ScriptEditor.Selection;
         var startLine = new TextRange(ScriptEditor.Document.ContentStart, selection.Start).Text.Count(c => c == '\n');
         var endLine = new TextRange(ScriptEditor.Document.ContentStart, selection.End).Text.Count(c => c == '\n');
-        var updated = ScriptTextTools.ToggleComment(text, startLine, endLine);
-        if (string.Equals(updated, text, StringComparison.Ordinal)) return;
-        ReplaceScriptTextPreservingLine(updated, startLine);
+        startLine = Math.Clamp(startLine, 0, paragraphs.Length - 1);
+        endLine = Math.Clamp(endLine, startLine, paragraphs.Length - 1);
+
+        // 折叠占位段落不是真代码，落在选区里就先展开，避免把占位文字也注释掉。
+        if (_folds.Count > 0 &&
+            paragraphs[startLine..(endLine + 1)].Any(item => _folds.Any(fold => ReferenceEquals(fold.Placeholder, item))))
+        {
+            ExpandAllFolds();
+            paragraphs = ScriptEditor.Document.Blocks.OfType<Paragraph>().ToArray();
+            endLine = Math.Clamp(endLine, startLine, paragraphs.Length - 1);
+        }
+
+        var target = paragraphs[startLine..(endLine + 1)];
+        var original = string.Join('\n', target.Select(ParagraphText));
+        var toggled = ScriptTextTools.ToggleComment(original, 0, target.Length - 1);
+        if (string.Equals(toggled, original, StringComparison.Ordinal)) return;
+        var lines = toggled.Split('\n');
+        if (lines.Length != target.Length) return; // 行数必须一一对应，否则宁可不动
+
+        _highlightingScript = true;
+        try
+        {
+            for (var index = 0; index < target.Length; index++)
+                new TextRange(target[index].ContentStart, target[index].ContentEnd).Text = lines[index];
+        }
+        finally { _highlightingScript = false; }
+        foreach (var paragraph in target) HighlightParagraph(paragraph);
+        MarkScriptDirty();
     }
+
+    private static string ParagraphText(Paragraph paragraph) =>
+        new TextRange(paragraph.ContentStart, paragraph.ContentEnd).Text;
 
     private void 切换注释_Click(object sender, RoutedEventArgs e) => ToggleSelectedLinesComment();
 
@@ -6734,7 +6825,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             };
 
             using var gateway = new AiGatewayClient();
-            var result = await gateway.AnalyzeConversationAsync(settings, apiKey, messages, []);
+            // 关掉扩展思考：这是一次性代码生成，思考令牌会吃掉绝大部分输出预算却毫无用处
+            // （开着时生成 30 行脚本花了 13,000 输出令牌）。
+            var result = await gateway.AnalyzeConversationAsync(settings, apiKey, messages, [],
+                enableReasoning: false);
             var code = HookScriptApi.ExtractPythonCode(result.Text);
             if (code.Length == 0) throw new InvalidDataException("模型没有返回可用的 Python 代码块。");
 
@@ -6858,39 +6952,47 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_highlightingScript || editor is null) return;
         _highlightingScript = true;
-        try
-        {
-            var document = editor.Document;
-            var range = new TextRange(document.ContentStart, document.ContentEnd);
-            var text = range.Text;
-            range.ApplyPropertyValue(TextElement.ForegroundProperty, FindResource("TextBrush"));
-            range.ApplyPropertyValue(TextElement.FontWeightProperty, FontWeights.Normal);
-            ApplyPythonMatches(document, text, PythonKeywordPattern, PythonKeyword, FontWeights.SemiBold);
-            ApplyPythonMatches(document, text, PythonBuiltinPattern, PythonBuiltin, FontWeights.SemiBold);
-            ApplyPythonMatches(document, text, PythonNumberPattern, PythonNumber, FontWeights.Normal);
-            ApplyPythonMatches(document, text, PythonStringPattern, PythonString, FontWeights.Normal);
-            ApplyPythonMatches(document, text, PythonCommentPattern, PythonComment, FontWeights.Normal);
-        }
-        finally
-        {
-            _highlightingScript = false;
-        }
+        try { HighlightRange(editor.Document.ContentStart, editor.Document.ContentEnd); }
+        finally { _highlightingScript = false; }
     }
 
-    private static void ApplyPythonMatches(FlowDocument document, string text, Regex pattern, Brush foreground, FontWeight weight)
+    /// <summary>只给一个段落重新着色。改动局限在几行时不必整篇重来（整篇重来会让滚动位置和撤销栈受牵连）。</summary>
+    private void HighlightParagraph(Paragraph paragraph)
+    {
+        if (_highlightingScript) return;
+        _highlightingScript = true;
+        try { HighlightRange(paragraph.ContentStart, paragraph.ContentEnd); }
+        finally { _highlightingScript = false; }
+    }
+
+    private void HighlightRange(TextPointer start, TextPointer end)
+    {
+        var range = new TextRange(start, end);
+        var text = range.Text;
+        range.ApplyPropertyValue(TextElement.ForegroundProperty, FindResource("TextBrush"));
+        range.ApplyPropertyValue(TextElement.FontWeightProperty, FontWeights.Normal);
+        ApplyPythonMatches(start, end, text, PythonKeywordPattern, PythonKeyword, FontWeights.SemiBold);
+        ApplyPythonMatches(start, end, text, PythonBuiltinPattern, PythonBuiltin, FontWeights.SemiBold);
+        ApplyPythonMatches(start, end, text, PythonNumberPattern, PythonNumber, FontWeights.Normal);
+        ApplyPythonMatches(start, end, text, PythonStringPattern, PythonString, FontWeights.Normal);
+        ApplyPythonMatches(start, end, text, PythonCommentPattern, PythonComment, FontWeights.Normal);
+    }
+
+    private static void ApplyPythonMatches(TextPointer start, TextPointer end, string text, Regex pattern,
+        Brush foreground, FontWeight weight)
     {
         var matches = pattern.Matches(text).Cast<Match>()
             .Where(match => match.Length > 0)
             .ToArray();
         if (matches.Length == 0) return;
-        var pointers = GetTextPointersAtCharacterOffsets(document,
+        var pointers = GetTextPointersAtCharacterOffsets(start, end,
             matches.SelectMany(match => new[] { match.Index, match.Index + match.Length }));
         foreach (var match in matches)
         {
-            if (!pointers.TryGetValue(match.Index, out var start) ||
-                !pointers.TryGetValue(match.Index + match.Length, out var end) ||
-                start.CompareTo(end) >= 0) continue;
-            var range = new TextRange(start, end);
+            if (!pointers.TryGetValue(match.Index, out var matchStart) ||
+                !pointers.TryGetValue(match.Index + match.Length, out var matchEnd) ||
+                matchStart.CompareTo(matchEnd) >= 0) continue;
+            var range = new TextRange(matchStart, matchEnd);
             range.ApplyPropertyValue(TextElement.ForegroundProperty, foreground);
             range.ApplyPropertyValue(TextElement.FontWeightProperty, weight);
         }
@@ -6901,13 +7003,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     /// 代码越长、命中越多越接近 O(n²)；这里每类 token 只遍历文档一次。
     /// </summary>
     private static IReadOnlyDictionary<int, TextPointer> GetTextPointersAtCharacterOffsets(
-        FlowDocument document, IEnumerable<int> targetOffsets)
+        TextPointer start, TextPointer end, IEnumerable<int> targetOffsets)
     {
         var targets = targetOffsets.Where(offset => offset >= 0).Distinct().Order().ToArray();
         var result = new Dictionary<int, TextPointer>(targets.Length);
         if (targets.Length == 0) return result;
-        var navigator = document.ContentStart;
-        var end = document.ContentEnd;
+        var navigator = start;
         var consumed = 0;
         var targetIndex = 0;
         while (targetIndex < targets.Length && targets[targetIndex] == 0)

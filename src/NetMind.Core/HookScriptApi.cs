@@ -177,9 +177,10 @@ public static class HookScriptApi
         var builder = new System.Text.StringBuilder();
         builder.AppendLine("你是 NetMind AI 工作台的 Python 脚本助手。用户描述需求，你直接产出可运行的脚本。");
         builder.AppendLine();
-        builder.AppendLine("输出要求：");
-        builder.AppendLine("- 只输出一个 ```python 代码块，块外不要有任何解释文字。");
-        builder.AppendLine("- 代码内用中文注释说明意图，注释要能让人看懂为什么这么写。");
+        builder.AppendLine("输出要求（严格遵守）：");
+        builder.AppendLine("- 直接输出一个 ```python 代码块，块外不要有任何文字。");
+        builder.AppendLine("- 不要输出思考过程、方案对比、注意事项、使用说明或任何前后缀，一个字都不要。");
+        builder.AppendLine("- 需要解释的内容一律写成代码里的中文注释，注释要能让人看懂为什么这么写。");
         builder.AppendLine("- 不要臆造 API：只能使用下面列出的字段与函数。");
         builder.AppendLine();
         builder.AppendLine("运行环境（沙箱强制，违反会被静态策略直接拒绝，不会启动 Python）：");

@@ -87,9 +87,15 @@ public sealed class AiGatewayClient(HttpClient? httpClient = null) : IDisposable
     /// 发送完整消息历史与工具声明执行一轮对话。流式返回时经 <paramref name="callbacks"/> 实时上送增量；
     /// 模型要求调用工具时结果放在 <see cref="AiTurnResult.ToolCalls"/>，由会话引擎执行后追加 tool 消息再次调用。
     /// </summary>
+    /// <param name="enableReasoning">
+    /// 是否启用模型的扩展思考。取证分析需要它；一次性代码生成不需要——
+    /// 思考令牌会占掉输出预算的绝大部分（实测生成 30 行脚本花掉 13,000 输出令牌），
+    /// 而且思考内容对这类任务没有任何用处。
+    /// </param>
     public async Task<AiTurnResult> AnalyzeConversationAsync(AiGatewaySettings settings, string? apiKey,
         IReadOnlyList<AiChatMessage> messages, IReadOnlyList<AiToolSchema> tools,
-        AiStreamCallbacks? callbacks = null, CancellationToken cancellationToken = default)
+        AiStreamCallbacks? callbacks = null, CancellationToken cancellationToken = default,
+        bool enableReasoning = true)
     {
         settings = settings.Validate();
         if (messages.Count == 0) throw new InvalidOperationException("没有可发送的对话消息。");
@@ -98,8 +104,8 @@ public sealed class AiGatewayClient(HttpClient? httpClient = null) : IDisposable
             throw new InvalidOperationException("远程模型网关需要 API 密钥。");
 
         var payload = settings.ApiStyle == "chat_completions"
-            ? BuildChatCompletionsPayload(settings, messages, tools)
-            : BuildResponsesPayload(settings, messages, tools);
+            ? BuildChatCompletionsPayload(settings, messages, tools, enableReasoning)
+            : BuildResponsesPayload(settings, messages, tools, enableReasoning);
         using var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
         {
             Content = new StringContent(payload, Encoding.UTF8, "application/json")
@@ -151,7 +157,8 @@ public sealed class AiGatewayClient(HttpClient? httpClient = null) : IDisposable
 
     private static string TruncateForDisplay(string value) => value.Length <= 60_000 ? value : value[..60_000] + "…";
 
-    private static string BuildChatCompletionsPayload(AiGatewaySettings settings, IReadOnlyList<AiChatMessage> messages, IReadOnlyList<AiToolSchema> tools)
+    private static string BuildChatCompletionsPayload(AiGatewaySettings settings, IReadOnlyList<AiChatMessage> messages,
+        IReadOnlyList<AiToolSchema> tools, bool enableReasoning)
     {
         var payload = new Dictionary<string, object?>
         {
@@ -173,8 +180,12 @@ public sealed class AiGatewayClient(HttpClient? httpClient = null) : IDisposable
         if (settings.Model.StartsWith("deepseek-", StringComparison.OrdinalIgnoreCase))
         {
             // DeepSeek 官方文档：thinking 与 function calling 不可同时使用；携带 tools 时不启用 thinking，reasoning_effort 保留。
-            if (tools.Count == 0) payload["thinking"] = new { type = "enabled" };
-            payload["reasoning_effort"] = settings.ReasoningEffort is "max" or "xhigh" ? "max" : "high";
+            // 调用方显式关闭思考时两个字段都不下发——否则「无工具」这一条会把一次性代码生成也带进思考模式。
+            if (enableReasoning)
+            {
+                if (tools.Count == 0) payload["thinking"] = new { type = "enabled" };
+                payload["reasoning_effort"] = settings.ReasoningEffort is "max" or "xhigh" ? "max" : "high";
+            }
         }
         return JsonSerializer.Serialize(payload, PayloadJsonOptions);
     }
@@ -195,7 +206,8 @@ public sealed class AiGatewayClient(HttpClient? httpClient = null) : IDisposable
         return result;
     }
 
-    private static string BuildResponsesPayload(AiGatewaySettings settings, IReadOnlyList<AiChatMessage> messages, IReadOnlyList<AiToolSchema> tools)
+    private static string BuildResponsesPayload(AiGatewaySettings settings, IReadOnlyList<AiChatMessage> messages,
+        IReadOnlyList<AiToolSchema> tools, bool enableReasoning)
     {
         var input = new List<object>();
         foreach (var message in messages)
@@ -224,7 +236,7 @@ public sealed class AiGatewayClient(HttpClient? httpClient = null) : IDisposable
             ["store"] = false,
             ["stream"] = true,
             ["max_output_tokens"] = settings.MaxOutputTokens,
-            ["reasoning"] = new { effort = settings.ReasoningEffort },
+            ["reasoning"] = new { effort = enableReasoning ? settings.ReasoningEffort : "minimal" },
             ["text"] = new { verbosity = "medium" },
             ["input"] = input.ToArray()
         };
