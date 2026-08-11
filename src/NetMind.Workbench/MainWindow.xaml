@@ -752,7 +752,31 @@
                                             </StackPanel>
                                         </Grid>
                                     </Border>
-                                    <RichTextBox x:Name="ScriptEditor" Grid.Row="1" Style="{StaticResource PythonCodeEditor}" BorderThickness="0" TextChanged="脚本编辑器_TextChanged" PreviewKeyDown="脚本编辑器_按键" LostKeyboardFocus="脚本编辑器_失焦" AutomationProperties.Name="Python 脚本编辑器"><FlowDocument PagePadding="0" LineHeight="18" LineStackingStrategy="BlockLineHeight"><Paragraph Margin="0" /></FlowDocument></RichTextBox>
+                                    <RichTextBox x:Name="ScriptEditor" Grid.Row="1" Style="{StaticResource PythonCodeEditor}" BorderThickness="0" TextChanged="脚本编辑器_TextChanged" PreviewKeyDown="脚本编辑器_按键" LostKeyboardFocus="脚本编辑器_失焦" PreviewMouseLeftButtonDown="脚本编辑器_鼠标按下" AutomationProperties.Name="Python 脚本编辑器">
+                                        <RichTextBox.ContextMenu>
+                                            <ContextMenu Style="{StaticResource TrafficContextMenuStyle}">
+                                                <ContextMenu.Resources>
+                                                    <Style TargetType="MenuItem" BasedOn="{StaticResource TrafficMenuItemStyle}" />
+                                                </ContextMenu.Resources>
+                                                <MenuItem Header="撤销" InputGestureText="Ctrl+Z" Command="{x:Static ApplicationCommands.Undo}" CommandTarget="{Binding PlacementTarget, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                                <MenuItem Header="重做" InputGestureText="Ctrl+Y" Command="{x:Static ApplicationCommands.Redo}" CommandTarget="{Binding PlacementTarget, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                                <Separator />
+                                                <MenuItem Header="剪切" InputGestureText="Ctrl+X" Command="{x:Static ApplicationCommands.Cut}" CommandTarget="{Binding PlacementTarget, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                                <MenuItem Header="复制" InputGestureText="Ctrl+C" Command="{x:Static ApplicationCommands.Copy}" CommandTarget="{Binding PlacementTarget, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                                <MenuItem Header="粘贴" InputGestureText="Ctrl+V" Command="{x:Static ApplicationCommands.Paste}" CommandTarget="{Binding PlacementTarget, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                                <MenuItem Header="全选" InputGestureText="Ctrl+A" Command="{x:Static ApplicationCommands.SelectAll}" CommandTarget="{Binding PlacementTarget, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                                                <Separator />
+                                                <MenuItem Header="切换注释" InputGestureText="Ctrl+/" Click="切换注释_Click" ToolTip="按行注释或取消注释；选中多行时整体切换，注释符插在这批行的最小缩进处" />
+                                                <MenuItem Header="整理格式" Click="整理格式_Click" ToolTip="只做不改变语义的整理：行首制表符转空格、去行尾空白、压缩连续空行；三引号字符串内部原样保留" />
+                                                <MenuItem Header="智能提示" InputGestureText="Ctrl+J" Click="唤出补全_Click" />
+                                                <Separator />
+                                                <MenuItem Header="折叠当前块" InputGestureText="Ctrl+[" Click="折叠当前_Click" />
+                                                <MenuItem Header="折叠全部" InputGestureText="Ctrl+Shift+[" Click="折叠全部_Click" />
+                                                <MenuItem Header="展开全部" InputGestureText="Ctrl+Shift+]" Click="展开全部_Click" />
+                                            </ContextMenu>
+                                        </RichTextBox.ContextMenu>
+                                        <FlowDocument PagePadding="0" LineHeight="18" LineStackingStrategy="BlockLineHeight"><Paragraph Margin="0" /></FlowDocument>
+                                    </RichTextBox>
                                     <!-- 补全弹层：词表来自 NetMind.Core 的 HookScriptApi，与运行时契约同源，不会和真实字段漂移 -->
                                     <Popup x:Name="ScriptCompletionPopup" Grid.Row="1" Placement="RelativePoint" PlacementTarget="{Binding ElementName=ScriptEditor}" AllowsTransparency="True" StaysOpen="True" PopupAnimation="None" Focusable="False">
                                         <Border Background="{StaticResource RaisedBrush}" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="4" MaxWidth="520">
@@ -768,8 +792,18 @@
                                             </ListBox>
                                         </Border>
                                     </Popup>
-                                    <Border Grid.Row="2" Background="{StaticResource RaisedBrush}" CornerRadius="0,0,7,7" Padding="14,7">
-                                        <TextBlock x:Name="ScriptEditorHintText" Foreground="{StaticResource MutedBrush}" FontSize="10.5" TextWrapping="Wrap" />
+                                    <Border Grid.Row="2" Background="{StaticResource RaisedBrush}" CornerRadius="0,0,7,7" Padding="14,9">
+                                        <Grid>
+                                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                                            <!-- 让 AI 接手写脚本：系统提示词由 HookScriptApi 按当前用途生成，与编辑器补全、运行时同源 -->
+                                            <Grid>
+                                                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                                <TextBlock Text="让 AI 写" Foreground="{StaticResource PurpleBrush}" FontSize="11.5" FontWeight="SemiBold" VerticalAlignment="Center" />
+                                                <TextBox x:Name="AiScriptRequestBox" Grid.Column="1" Margin="9,0,8,0" MinHeight="30" Padding="9,5" FontSize="11.5" MaxLength="800" KeyDown="AI写脚本_按键" AutomationProperties.Name="AI 脚本需求" ToolTip="用中文描述你要的脚本，例如：拦截登录请求，删掉签名头并把密码字段改掉，同时记录原始正文的 SHA-256。回车即生成" />
+                                                <Button x:Name="AiWriteScriptButton" Grid.Column="2" Content="生成脚本" Style="{StaticResource CompactActionButton}" Padding="12,6" MinHeight="30" FontSize="11.5" Click="AI写脚本_Click" ToolTip="把脚本规范作为系统提示词发给模型，生成结果直接写入编辑器（会覆盖当前内容，可 Ctrl+Z 撤销）" />
+                                            </Grid>
+                                            <TextBlock x:Name="ScriptEditorHintText" Grid.Row="1" Margin="0,8,0,0" Foreground="{StaticResource MutedBrush}" FontSize="10.5" TextWrapping="Wrap" />
+                                        </Grid>
                                     </Border>
                                 </Grid>
                             </Border>

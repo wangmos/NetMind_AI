@@ -17,6 +17,8 @@
         <SolidColorBrush x:Key="GreenBrush" Color="#82B89B" />
         <SolidColorBrush x:Key="AmberBrush" Color="#C7AA72" />
         <SolidColorBrush x:Key="RedBrush" Color="#D8868F" />
+        <!-- 紫＝AI（配色约定：青绿=主操作/安全，蓝=读取，紫=AI，黄=警告，红=失败） -->
+        <SolidColorBrush x:Key="PurpleBrush" Color="#A99AC4" />
         <SolidColorBrush x:Key="ResourceImageBrush" Color="#82B8B4" />
         <SolidColorBrush x:Key="ResourceApiBrush" Color="#88B99D" />
         <SolidColorBrush x:Key="ResourceScriptBrush" Color="#C4AD78" />

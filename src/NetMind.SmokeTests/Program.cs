@@ -70,6 +70,8 @@ var suites = new SmokeSuite[]
         await VerifyPageHooksAsync();
     }),
     new("工作区脚本库（命名校验、用途推断、重命名/删除一致性、补全词表同源）", "script-library-only", VerifyScriptLibraryAsync),
+    new("编辑器文本变换（注释切换、整理格式、折叠区域、AI 代写提示词）", "script-text-only", Sync(VerifyScriptTextTools)),
+    new("钩子信封正文预览按需下发", "hook-payload-only", VerifyHookBodyPreviewGateAsync),
     new("代理钩子挂载点端到端触发（顺序、txnId、正文、单点开关）", "mountpoint-only", VerifyProxyHookMountPointsAsync),
     new("拦截规则正则匹配（URL/方法/主机/路径/头/正文/状态码）与 fail-open", "intercept-only", VerifyHookInterceptRulesAsync),
     new("示例脚本端到端：百度搜索关键字固定为 888（真实 worker + 真实代理）", "baidu-intercept-only", VerifyBaiduSearchInterceptAsync),
@@ -1151,6 +1153,140 @@ static void Require(bool condition, string message)
 }
 
 /// <summary>
+/// 编辑器文本变换：注释切换、整理格式、折叠区域识别，以及 AI 代写提示词与回复解析。
+///
+/// 这些函数直接改用户写了一半的脚本，改坏就是数据损坏，所以断言重点是
+/// 「不该动的一个字符都别动」——尤其是三引号字符串内部与行首之后的空白。
+/// </summary>
+static void VerifyScriptTextTools()
+{
+    // ── 注释切换 ──
+    var block = "def probe(event):\n    url = event.get('url')\n    return None";
+    var commented = ScriptTextTools.ToggleComment(block, 1, 2);
+    Require(commented == "def probe(event):\n    # url = event.get('url')\n    # return None",
+        "注释符必须插在这批行的最小缩进处，而不是行首，否则 Python 缩进结构会被破坏：\n" + commented);
+    Require(ScriptTextTools.ToggleComment(commented, 1, 2) == block, "再切换一次必须精确还原原文");
+
+    var mixedIndent = "if a:\n        deep = 1\n    shallow = 2";
+    var mixed = ScriptTextTools.ToggleComment(mixedIndent, 1, 2);
+    Require(mixed == "if a:\n    #     deep = 1\n    # shallow = 2",
+        "缩进不一致时注释符必须统一插在最小缩进列，保持相对缩进不变：\n" + mixed);
+    Require(ScriptTextTools.ToggleComment(mixed, 1, 2) == mixedIndent, "不同缩进的整体取消注释必须还原原文");
+
+    var withBlank = "a = 1\n\nb = 2";
+    Require(ScriptTextTools.ToggleComment(withBlank, 0, 2) == "# a = 1\n\n# b = 2", "空行不得被加上注释符");
+
+    var partial = "# already\nnot_yet = 1";
+    Require(ScriptTextTools.ToggleComment(partial, 0, 1) == "# # already\n# not_yet = 1",
+        "只要有一行未注释就整体注释（与主流编辑器一致），而不是逐行反转");
+    Require(ScriptTextTools.ToggleComment("#no space", 0, 0) == "no space", "取消注释只吃掉一个紧跟的空格");
+    Require(ScriptTextTools.ToggleComment("    #   对齐注释", 0, 0) == "    #   对齐注释".Replace("#   ", "  ", StringComparison.Ordinal),
+        "取消注释不得吞掉用于对齐的多余空格");
+
+    // ── 整理格式：只做不改变语义的事 ──
+    Require(ScriptTextTools.Format("\tx = 1") == "    x = 1", "行首制表符必须展开为 4 空格");
+    Require(ScriptTextTools.Format("x = 1   ") == "x = 1", "行尾空白必须去掉");
+    Require(ScriptTextTools.Format("a = 1\n\n\n\n\nb = 2") == "a = 1\n\n\nb = 2", "连续空行必须压到最多两行");
+    Require(ScriptTextTools.Format("\n\n\na = 1\n\n\n") == "a = 1", "首尾空行必须清掉，结尾不留多余换行");
+    Require(ScriptTextTools.Format("s = 'a\tb'") == "s = 'a\tb'", "行首之后的制表符属于数据，绝不能改");
+    Require(ScriptTextTools.Format("x = 1 + 1") == "x = 1 + 1", "整理格式不得重排运算符空格");
+
+    const string docstring = "def f():\n    \"\"\"说明   \n\ttab 开头   \n\n\n\n    仍在字符串里   \n    \"\"\"\n    return 1";
+    Require(ScriptTextTools.Format(docstring) == docstring,
+        "三引号字符串内部是数据，行尾空白/制表符/连续空行一律不得改动：\n" + ScriptTextTools.Format(docstring));
+    Require(ScriptTextTools.Format(ScriptTextTools.Format(docstring)) == ScriptTextTools.Format(docstring),
+        "整理格式必须幂等");
+
+    // ── 折叠区域 ──
+    const string foldable = "import json\n\ndef outer(event):\n    if event:\n        value = 1\n        return value\n    return None\n\nx = 2";
+    var regions = ScriptTextTools.FindFoldRegions(foldable);
+    Require(regions.Any(region => region.Header == 2 && region.End == 6),
+        "def 区域必须覆盖到最后一行缩进体（不含其后的空行与顶层语句）");
+    Require(regions.Any(region => region.Header == 3 && region.End == 5), "嵌套 if 也应识别为可折叠区域");
+    Require(ScriptTextTools.FindFoldRegions("def f():\n    return 1").Count == 0,
+        "只有一行体的区域不值得折叠，必须不返回");
+    Require(ScriptTextTools.FindFoldRegions("# def fake():\n    x = 1").Count == 0, "注释掉的行不得识别为折叠头");
+    var innermost = ScriptTextTools.FindFoldRegionAt(foldable, 4);
+    Require(innermost is { Header: 3 }, "定位折叠区域必须取包含该行的最内层区域");
+
+    // 折叠还原必须无损：把区域体摘掉再拼回去要与原文逐字节一致。
+    foreach (var region in regions)
+    {
+        var lines = foldable.Split('\n');
+        var hidden = string.Join('\n', lines.Skip(region.Header + 1).Take(region.End - region.Header));
+        var restored = string.Join('\n', lines.Take(region.Header + 1).Append(hidden).Concat(lines.Skip(region.End + 1)));
+        Require(restored == foldable, $"折叠区域 [{region.Header},{region.End}] 还原后与原文不一致");
+    }
+
+    // ── AI 代写：提示词与回复解析 ──
+    var hookPrompt = HookScriptApi.BuildAuthoringSystemPrompt(ScriptPurpose.Hook);
+    foreach (var required in new[]
+             {
+                 HookEventNames.FunctionBeforeSend, HookEventNames.RequestBeforeSend, "INTERCEPT",
+                 "subprocess", "open()", NetMindDefaults.HookBodyPreviewFieldName,
+                 NetMindDefaults.HookEventTimeoutMilliseconds.ToString(System.Globalization.CultureInfo.InvariantCulture)
+             })
+        Require(hookPrompt.Contains(required, StringComparison.Ordinal), $"钩子代写提示词缺少关键约束 {required}");
+    foreach (var field in HookScriptApi.EventFields)
+        Require(hookPrompt.Contains(field.Name, StringComparison.Ordinal),
+            $"钩子代写提示词必须列出信封字段 {field.Name}，否则模型会臆造字段名");
+
+    var fixturePrompt = HookScriptApi.BuildAuthoringSystemPrompt(ScriptPurpose.Fixture);
+    Require(fixturePrompt.Contains("fixture.transactions", StringComparison.Ordinal), "验证脚本提示词必须说明输入来源");
+    Require(!fixturePrompt.Contains("INTERCEPT", StringComparison.Ordinal), "验证脚本提示词不应混入钩子专属的拦截契约");
+    foreach (var field in HookScriptApi.FixtureFields)
+        Require(fixturePrompt.Contains(field.Name, StringComparison.Ordinal), $"验证脚本提示词必须列出事务字段 {field.Name}");
+
+    Require(HookScriptApi.ExtractPythonCode("说明文字\n```python\ndef f():\n    return 1\n```\n收尾") == "def f():\n    return 1",
+        "必须能从模型回复里取出 ```python 围栏内的代码");
+    Require(HookScriptApi.ExtractPythonCode("```\nx = 1\n```") == "x = 1", "无语言标注的围栏同样要能取出");
+    Require(HookScriptApi.ExtractPythonCode("x = 1") == "x = 1", "没有围栏时按纯代码处理");
+    Require(HookScriptApi.ExtractPythonCode("   ").Length == 0, "空回复必须得到空字符串而不是异常");
+}
+
+/// <summary>
+/// 钩子信封的正文预览按需下发。
+///
+/// 实测一次 100 个资源的页面加载，带预览要往单线程 Python worker 推约 18.5 MB NDJSON，
+/// 而多数观察脚本只用 bodySize/bodySha256。这里断言判定规则本身，防止有人"顺手"改回全量下发。
+/// </summary>
+static async Task VerifyHookBodyPreviewGateAsync()
+{
+    var root = Path.Combine(Path.GetTempPath(), "netmind-preview-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try
+    {
+        async Task<bool> WantsAsync(string script)
+        {
+            var path = Path.Combine(root, "s-" + Guid.NewGuid().ToString("N") + ".py");
+            await File.WriteAllTextAsync(path, script, new UTF8Encoding(false));
+            return ScriptHookEngine.ScriptWantsBodyPreview(path);
+        }
+
+        Require(!await WantsAsync("def on_before_send(event):\n    return {'size': event.get('bodySize')}"),
+            "只用 bodySize 的观察脚本不应触发正文预览下发");
+        Require(!await WantsAsync("def on_before_write(event):\n    return {'h': event.get('bodySha256')}"),
+            "只用 bodySha256 的脚本不应触发正文预览下发");
+        Require(await WantsAsync("def on_before_write(event):\n    return {'b': event.get('bodyPreviewBase64')}"),
+            "脚本读取 bodyPreviewBase64 时必须下发正文预览");
+        Require(await WantsAsync("WANT_BODY = True\ndef on_before_send(event):\n    key = 'body' + 'Preview' + 'Base64'\n    return None"),
+            "键名拼接时文本扫不到字段名，显式声明 WANT_BODY 必须生效");
+        Require(ScriptHookEngine.ScriptWantsBodyPreview(Path.Combine(root, "不存在.py")),
+            "读不到脚本时必须按需要正文处理——宁可多带也不能让脚本拿到空正文");
+
+        // 默认模板不碰正文预览：新用户开箱即是省流量的那条路径。
+        var templatePath = Path.Combine(root, "default.py");
+        await File.WriteAllTextAsync(templatePath,
+            "def on_before_send(event):\n    return {'kind': 'x', 'bodySize': event.get('bodySize')}\n", new UTF8Encoding(false));
+        Require(!ScriptHookEngine.ScriptWantsBodyPreview(templatePath), "默认观察模板不应触发正文预览下发");
+    }
+    finally
+    {
+        if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+    }
+}
+
+/// <summary>
 /// 工作区脚本库：命名校验（唯一的路径穿越防线）、用途推断与 sidecar 往返、
 /// 重命名/删除的目录一致性，以及编辑器补全词表与运行时契约的一致性。
 ///
@@ -1494,14 +1630,27 @@ static async Task VerifyProxyHookMountPointsAsync()
         Require(fired.Skip(1).All(item => item.StatusCode == 201), "发送后的三个挂载点必须携带上游真实状态码");
 
         // 请求侧挂载点带请求正文，响应侧带响应正文——这是脚本能读到正确数据的前提。
-        static string Decode(HookEventEnvelope envelope) =>
-            envelope.BodyPreviewBase64 is null ? string.Empty : Encoding.UTF8.GetString(Convert.FromBase64String(envelope.BodyPreviewBase64));
-        Require(Decode(fired[0]).Contains("请求正文", StringComparison.Ordinal) &&
-                Decode(fired[1]).Contains("请求正文", StringComparison.Ordinal),
+        // 正文预览是在泵线程序列化前才补齐的（且按脚本是否需要决定带不带），
+        // 所以这里必须断言「实际下发的那一份」，而不是刚入队时的信封。
+        static string Decode(HookEventEnvelope envelope, bool includeBodyPreview)
+        {
+            var delivered = ScriptHookEngine.MaterializeForDelivery(envelope, includeBodyPreview);
+            return delivered.BodyPreviewBase64 is null
+                ? string.Empty
+                : Encoding.UTF8.GetString(Convert.FromBase64String(delivered.BodyPreviewBase64));
+        }
+        Require(Decode(fired[0], true).Contains("请求正文", StringComparison.Ordinal) &&
+                Decode(fired[1], true).Contains("请求正文", StringComparison.Ordinal),
             "请求侧两个挂载点必须携带请求正文");
-        Require(Decode(fired[2]).Contains("上游响应正文", StringComparison.Ordinal) &&
-                Decode(fired[3]).Contains("上游响应正文", StringComparison.Ordinal),
+        Require(Decode(fired[2], true).Contains("上游响应正文", StringComparison.Ordinal) &&
+                Decode(fired[3], true).Contains("上游响应正文", StringComparison.Ordinal),
             "响应侧两个挂载点必须携带响应正文");
+        // 脚本不需要正文时一律不下发，但大小与哈希必须仍然可用，否则观察脚本会失去判据。
+        Require(fired.All(item => Decode(item, false).Length == 0),
+            "脚本不使用正文预览时，观察事件不得携带正文");
+        Require(fired.All(item => ScriptHookEngine.MaterializeForDelivery(item, false) is
+                { BodySha256.Length: 64, BodySize: > 0 }),
+            "不下发正文预览时，bodySize 与 bodySha256 必须照常补齐");
         Require(fired[0].Headers is not null && fired[0].Headers!.Keys.Any(name => name.Equals("X-Probe", StringComparison.OrdinalIgnoreCase)),
             "请求挂载点必须携带请求头");
 

@@ -16,6 +16,7 @@ namespace NetMind.Core;
 public sealed class HookTransactionSnapshot
 {
     private string? _bodySha256;
+    private string? _bodyPreviewBase64;
 
     public HookTransactionSnapshot(Guid txnId, Guid sessionId, string method, string url, string host, string endpoint,
         IReadOnlyDictionary<string, string>? headers, byte[] body)
@@ -76,11 +77,22 @@ public sealed class HookTransactionSnapshot
         Endpoint = endpoint;
         Headers = headers;
         Body = body;
-        _bodySha256 = null; // 正文已变，缓存哈希必须作废
+        _bodySha256 = null; // 正文已变，缓存哈希与预览必须作废
+        _bodyPreviewBase64 = null;
     }
 
     /// <summary>正文完整 SHA-256（十六进制小写），惰性计算并缓存。</summary>
     public string GetBodySha256() => _bodySha256 ??= Convert.ToHexString(SHA256.HashData(Body)).ToLowerInvariant();
+
+    /// <summary>
+    /// 正文预览（Base64，最多 <see cref="NetMindDefaults.HookBodyPreviewBytes"/> 字节），惰性计算并缓存。
+    /// 同一事务的多个挂载点共用一份快照，因此响应侧两个观察点只会编码一次。
+    /// </summary>
+    public string GetBodyPreviewBase64() => _bodyPreviewBase64 ??=
+        Convert.ToBase64String(Body, 0, Math.Min(Body.Length, NetMindDefaults.HookBodyPreviewBytes));
+
+    /// <summary>正文是否超出预览上限。</summary>
+    public bool BodyTruncated => Body.Length > NetMindDefaults.HookBodyPreviewBytes;
 }
 
 /// <summary>钩子工作进程产出的一条观察结论（stdout finding NDJSON 解析结果）。</summary>
@@ -134,6 +146,8 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     private readonly HookEventQueue _queue = new();
     /// <summary>脚本在 ready 时上报的拦截规则；热路径只读，整体替换而不就地修改。</summary>
     private IReadOnlyList<HookInterceptRule> _interceptRules = [];
+    /// <summary>观察事件是否携带正文预览；启动时按脚本内容判定一次，热路径只读。</summary>
+    private volatile bool _includeBodyPreview;
     /// <summary>在途拦截：correlationId → 等待裁决的调用方。</summary>
     private readonly ConcurrentDictionary<string, TaskCompletionSource<HookInterceptVerdict?>> _pendingIntercepts = new(StringComparer.Ordinal);
     private long _interceptMutatedCount;
@@ -271,8 +285,7 @@ public sealed class ScriptHookEngine : IAsyncDisposable
                 return;
             }
 
-            var envelope = BuildEnvelope(hookEvent, hookName, snapshot);
-            if (envelope is not null) _queue.TryEnqueue(envelope);
+            _queue.TryEnqueue(BuildEnvelope(hookEvent, hookName, snapshot));
         }
         catch
         {
@@ -281,19 +294,13 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     }
 
     /// <summary>构建事件信封。观察投递与阻塞拦截共用同一份构建逻辑，避免两条路径的字段语义漂移。</summary>
-    private static HookEventEnvelope? BuildEnvelope(string hookEvent, string hookName, HookTransactionSnapshot snapshot)
-    {
-        var body = snapshot.Body;
-        string? preview = null;
-        var truncated = false;
-        if (body.Length > 0)
-        {
-            var previewLength = Math.Min(body.Length, NetMindDefaults.HookBodyPreviewBytes);
-            preview = Convert.ToBase64String(body, 0, previewLength);
-            truncated = body.Length > NetMindDefaults.HookBodyPreviewBytes;
-        }
-        return new HookEventEnvelope(
-            hookEvent,
+    /// <summary>
+    /// 构造事件信封。正文预览与 SHA-256 都不在这里算：这段代码跑在代理关键路径上
+    /// （<c>response.before_write</c> 甚至发生在把响应字节写回浏览器之前），
+    /// 编码与哈希一律推迟到泵线程序列化时按需补齐，见 <see cref="MaterializeForDelivery"/>。
+    /// </summary>
+    private static HookEventEnvelope BuildEnvelope(string hookEvent, string hookName, HookTransactionSnapshot snapshot) =>
+        new(hookEvent,
             snapshot.TxnId.ToString(),
             snapshot.SessionId.ToString(),
             hookName,
@@ -303,12 +310,33 @@ public sealed class ScriptHookEngine : IAsyncDisposable
             snapshot.Endpoint,
             snapshot.StatusCode,
             snapshot.Headers,
-            preview,
-            truncated,
-            null, // 正文 SHA-256 推迟到泵线程序列化时惰性计算，不在关键路径同步哈希
+            null,
+            snapshot.Body.Length > 0 && snapshot.BodyTruncated,
+            null,
             snapshot.BodySize)
         {
             Snapshot = snapshot
+        };
+
+    /// <summary>
+    /// 序列化前补齐惰性字段并摘掉快照引用。
+    ///
+    /// 正文预览按需下发：实测一次 100 个资源的页面加载，带预览时要往单线程 Python
+    /// 工作进程的 stdin 推约 18.5 MB NDJSON（正文本身只有 7.7 MB，Base64 后更大），
+    /// 光是宿主侧 JSON 序列化就上百毫秒，还会产生大量大对象堆分配拖累整个进程；
+    /// 而绝大多数观察脚本只用 bodySize / bodySha256，根本不碰预览。
+    /// 因此只有脚本确实要用正文时才带上，其余情况只送元数据。
+    /// </summary>
+    internal static HookEventEnvelope MaterializeForDelivery(HookEventEnvelope envelope, bool includeBodyPreview)
+    {
+        if (envelope.Snapshot is not { } source) return envelope;
+        var hasBody = source.Body.Length > 0;
+        return envelope with
+        {
+            BodyPreviewBase64 = includeBodyPreview && hasBody ? source.GetBodyPreviewBase64() : null,
+            BodyTruncated = includeBodyPreview && hasBody && source.BodyTruncated,
+            BodySha256 = hasBody ? source.GetBodySha256() : null,
+            Snapshot = null
         };
     }
 
@@ -328,7 +356,9 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     public async Task<bool> StartAsync(CancellationToken cancellationToken = default)
     {
         if (_stopping || _disabled) return false;
-        await AuditSafeAsync(NetMindDefaults.AuditEventHooksEnabled, $"计划启用钩子点 {_enabledEvents.Count} 个");
+        _includeBodyPreview = ScriptWantsBodyPreview(_scriptPath);
+        await AuditSafeAsync(NetMindDefaults.AuditEventHooksEnabled,
+            $"计划启用钩子点 {_enabledEvents.Count} 个 · 正文预览{(_includeBodyPreview ? "随观察事件下发" : "按需（本脚本未使用）")}");
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _engineCancellation.Token);
@@ -391,7 +421,8 @@ public sealed class ScriptHookEngine : IAsyncDisposable
                             while (_queue.TryDequeue(out _)) droppedOnFlush++;
                             break;
                         }
-                        var line = JsonSerializer.Serialize(envelope, HookEventEnvelope.JsonOptions);
+                        var line = JsonSerializer.Serialize(
+                            MaterializeForDelivery(envelope, _includeBodyPreview), HookEventEnvelope.JsonOptions);
                         await session.Process.StandardInput.WriteLineAsync(line.AsMemory(), flushDeadline.Token);
                         flushedCount++;
                     }
@@ -620,11 +651,9 @@ public sealed class ScriptHookEngine : IAsyncDisposable
             {
                 while (_queue.TryDequeue(out var envelope))
                 {
-                    // 惰性哈希：信封携带快照引用，序列化前才在泵线程补齐 SHA-256（快照内缓存复用）。
-                    var serialized = envelope.Snapshot is { } source && envelope.BodySha256 is null
-                        ? envelope with { BodySha256 = source.Body.Length > 0 ? source.GetBodySha256() : null, Snapshot = null }
-                        : envelope;
-                    var line = JsonSerializer.Serialize(serialized, HookEventEnvelope.JsonOptions);
+                    // 惰性补齐：信封携带快照引用，序列化前才在泵线程算 SHA-256 与（按需的）正文预览。
+                    var line = JsonSerializer.Serialize(
+                        MaterializeForDelivery(envelope, _includeBodyPreview), HookEventEnvelope.JsonOptions);
                     await WriteRawLineAsync(session, line, session.Cancellation.Token);
                     Interlocked.Increment(ref _deliveredEventCount);
                 }
@@ -780,6 +809,26 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     }
 
     /// <summary>解析 ready 消息里脚本声明的拦截规则；缺失、格式错误或声明了不可改写的挂载点都按“不拦截”处理。</summary>
+    /// <summary>
+    /// 脚本是否需要观察事件携带正文预览：文本里出现 <c>bodyPreviewBase64</c>，
+    /// 或显式声明 <c>WANT_BODY</c>（键名是拼出来的、文本扫不到时的显式开关）。
+    ///
+    /// 与静态策略同样是文本匹配——宁可多带也不能漏带，因此读不到脚本时按“需要”处理。
+    /// </summary>
+    internal static bool ScriptWantsBodyPreview(string scriptPath)
+    {
+        try
+        {
+            var text = File.ReadAllText(scriptPath);
+            return text.Contains(NetMindDefaults.HookBodyPreviewFieldName, StringComparison.Ordinal) ||
+                   text.Contains(NetMindDefaults.HookWantBodyDeclaration, StringComparison.Ordinal);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
     private static IReadOnlyList<HookInterceptRule> ReadInterceptRules(JsonElement element)
     {
         if (!element.TryGetProperty("intercept", out var array) || array.ValueKind != JsonValueKind.Array) return [];
@@ -844,8 +893,8 @@ public sealed class ScriptHookEngine : IAsyncDisposable
         if (!_pendingIntercepts.TryAdd(correlationId, pending)) return null;
         try
         {
-            var envelope = BuildEnvelope(hookEvent, hookName, snapshot);
-            if (envelope is null) return null;
+            // 拦截是脚本主动声明规则换来的阻塞路径，正文一定要给全：脚本就是冲着改它来的。
+            var envelope = MaterializeForDelivery(BuildEnvelope(hookEvent, hookName, snapshot), includeBodyPreview: true);
             var line = JsonSerializer.Serialize(new
             {
                 type = HookWorkerMessageTypes.Intercept,

@@ -67,10 +67,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "# 仅首次发现端点或响应异常时返回 finding；返回 None 不写审计，避免每个请求都产生噪声。\n" +
         "# event 为 dict，字段：event、txnId、sessionId、hookName、method、url、host、endpoint、\n" +
         "#   statusCode、headers、bodyPreviewBase64、bodyTruncated、bodySha256、bodySize。\n" +
+        "# 正文预览（bodyPreviewBase64）默认不下发：脚本里出现这个字段名，或写一行 WANT_BODY = True，\n" +
+        "#   宿主才会带上。只用 bodySize / bodySha256 时不必声明，可省掉绝大部分事件数据量。\n" +
         "# store 为宿主注入的键值存储（落盘在工作区 scripts/data 目录，直接使用，无需导入）：\n" +
         "#   store.save('名称', 文本或对象) 写入 · store.load('名称') 读取（不存在返回 None）\n" +
         "#   store.list() 列出全部键 · store.delete('名称') 删除\n" +
-        "# 编辑器支持智能提示：Ctrl+空格 唤出；输入 event.get('、store. 或在 INTERCEPT 规则内自动弹出。\n" +
+        "# 编辑器：Ctrl+J 智能提示 · Ctrl+/ 切换注释 · Ctrl+[ 折叠当前块 · 右键有整理格式与折叠命令。\n" +
         "#\n" +
         "# 【拦截改写】默认只观察、不改写，代理不等待脚本。要修改数据并向下传播，\n" +
         "# 取消下面 INTERCEPT 的注释：只有命中规则的请求才阻塞等待裁决，其余流量仍是即发即忘。\n" +
@@ -2784,6 +2786,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     /// <summary>关键字本地过滤（函数名/页面 URL/参数）并渲染列表；无事件时显示空态说明。</summary>
     private void ApplyPageHookFilter()
     {
+        // 这个方法随采集定时器每 1.5 秒被调一次。旧实现无条件重建 ItemsSource：
+        // 页面没有新 Hook 事件时也整表重排，还会把用户当前选中的那一行清掉。
+        // 与流量表同一套约定——内容没变就什么都不做。
         var keyword = PageHookSearch.Text?.Trim() ?? string.Empty;
         IEnumerable<PageHookEvent> matches = _pageHookEvents;
         if (keyword.Length > 0)
@@ -2805,7 +2810,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 : hook.TargetUrl + " · " + hook.ArgsJson.Replace('\n', ' '),
             Event = hook
         }).ToArray();
+        // 事件按数据库 rowid 比对：每次轮询都是新对象，但同一条事件的 Id 稳定。
+        if (PageHookList.ItemsSource is PageHookRow[] current && current.Length == rows.Length &&
+            !current.Where((row, index) => row.Event.Id != rows[index].Event.Id).Any())
+            return;
+        var selectedId = (PageHookList.SelectedItem as PageHookRow)?.Event.Id;
         PageHookList.ItemsSource = rows;
+        if (selectedId.HasValue)
+            PageHookList.SelectedItem = rows.FirstOrDefault(row => row.Event.Id == selectedId.Value);
         PageHookEmptyHint.Visibility = rows.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
         PageHookStatusText.Text = $"共 {rows.Length} 条";
         PageHookStatusText.Foreground = Muted;
@@ -6413,9 +6425,29 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         // 所以 Ctrl+J 才是这里真正可靠的入口，Alt+/ 作为习惯 VS 的用户的备选。
         var control = (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control;
         var alt = (Keyboard.Modifiers & ModifierKeys.Alt) == ModifierKeys.Alt;
+        var shift = (Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift;
         if ((control && key is Key.J or Key.Space) || (alt && key is Key.Oem2 or Key.Divide))
         {
             UpdateScriptCompletion(auto: false);
+            e.Handled = true;
+            return;
+        }
+        // Ctrl+/ 切换注释。斜杠在主键盘区是 Oem2、小键盘是 Divide，两个都收。
+        if (control && !shift && key is Key.Oem2 or Key.Divide)
+        {
+            ToggleSelectedLinesComment();
+            e.Handled = true;
+            return;
+        }
+        if (control && key is Key.OemOpenBrackets)
+        {
+            if (shift) CollapseAllFolds(); else FoldAtCaret();
+            e.Handled = true;
+            return;
+        }
+        if (control && shift && key is Key.OemCloseBrackets)
+        {
+            ExpandAllFolds();
             e.Handled = true;
             return;
         }
@@ -6464,6 +6496,271 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (e.NewFocus is DependencyObject target && ScriptCompletionPopup.Child is DependencyObject popupRoot &&
             IsVisualDescendant(target, popupRoot)) return;
         ScriptCompletionPopup.IsOpen = false;
+    }
+
+    // ==================== 编辑器：注释切换 / 整理格式 / 代码折叠 ====================
+    //
+    // 折叠模型：把被折叠的行从文档里摘掉，原地留一个占位段落，隐藏文本挂在 _folds 上。
+    // GetEditorText 遍历 Blocks 时遇到占位段落就还原隐藏文本，因此「折叠状态下保存」
+    // 拿到的仍是完整脚本——这是这套实现唯一不能出错的地方。
+    // 用户若直接删掉占位段落，等于删掉整个折叠块，语义合理，不需要额外兜底。
+
+    private sealed class FoldedRegion
+    {
+        public required Paragraph Placeholder { get; init; }
+        public required string HiddenText { get; init; }
+    }
+
+    private readonly List<FoldedRegion> _folds = [];
+
+    /// <summary>光标所在行在整篇文本中的行号（0 起）。</summary>
+    private static int GetCaretLineIndex(RichTextBox editor)
+    {
+        var caret = editor.CaretPosition;
+        var text = new TextRange(editor.Document.ContentStart, caret).Text;
+        return text.Count(character => character == '\n');
+    }
+
+    private void ToggleSelectedLinesComment()
+    {
+        if (ScriptEditor is null) return;
+        var text = GetScriptText();
+        var selection = ScriptEditor.Selection;
+        var startLine = new TextRange(ScriptEditor.Document.ContentStart, selection.Start).Text.Count(c => c == '\n');
+        var endLine = new TextRange(ScriptEditor.Document.ContentStart, selection.End).Text.Count(c => c == '\n');
+        var updated = ScriptTextTools.ToggleComment(text, startLine, endLine);
+        if (string.Equals(updated, text, StringComparison.Ordinal)) return;
+        ReplaceScriptTextPreservingLine(updated, startLine);
+    }
+
+    private void 切换注释_Click(object sender, RoutedEventArgs e) => ToggleSelectedLinesComment();
+
+    private void 唤出补全_Click(object sender, RoutedEventArgs e)
+    {
+        ScriptEditor?.Focus();
+        UpdateScriptCompletion(auto: false);
+    }
+
+    private void 整理格式_Click(object sender, RoutedEventArgs e)
+    {
+        if (ScriptEditor is null) return;
+        var line = GetCaretLineIndex(ScriptEditor);
+        var text = GetScriptText();
+        var formatted = ScriptTextTools.Format(text);
+        if (string.Equals(formatted, text, StringComparison.Ordinal))
+        {
+            UpdateHookStatusLine("格式已经是整理过的，没有需要改动的地方。");
+            return;
+        }
+        ReplaceScriptTextPreservingLine(formatted, line);
+        UpdateHookStatusLine("已整理格式：行首制表符转空格、去行尾空白、压缩连续空行；三引号字符串内部未改动。");
+    }
+
+    /// <summary>整体替换编辑器内容并把光标放回指定行；折叠状态一并作废（文本已经变了）。</summary>
+    private void ReplaceScriptTextPreservingLine(string text, int line)
+    {
+        _folds.Clear();
+        SetScriptText(text);
+        ApplyPythonSyntaxHighlighting();
+        MarkScriptDirty();
+        var target = ScriptEditor.Document.ContentStart;
+        for (var index = 0; index < line; index++)
+            target = target.GetLineStartPosition(1) ?? target;
+        ScriptEditor.CaretPosition = target;
+        ScriptEditor.Focus();
+    }
+
+    private void 折叠当前_Click(object sender, RoutedEventArgs e) => FoldAtCaret();
+
+    private void 折叠全部_Click(object sender, RoutedEventArgs e) => CollapseAllFolds();
+
+    private void 展开全部_Click(object sender, RoutedEventArgs e) => ExpandAllFolds();
+
+    /// <summary>单击占位段落即展开——折叠后最自然的还原动作就是点它一下。</summary>
+    private void 脚本编辑器_鼠标按下(object sender, MouseButtonEventArgs e)
+    {
+        if (_folds.Count == 0 || ScriptEditor is null) return;
+        var position = ScriptEditor.GetPositionFromPoint(e.GetPosition(ScriptEditor), snapToText: false);
+        if (position?.Paragraph is not { } paragraph) return;
+        var fold = _folds.FirstOrDefault(item => ReferenceEquals(item.Placeholder, paragraph));
+        if (fold is null) return;
+        ExpandFold(fold);
+        e.Handled = true;
+    }
+
+    private void FoldAtCaret()
+    {
+        if (ScriptEditor is null) return;
+        var region = ScriptTextTools.FindFoldRegionAt(GetScriptText(), GetCaretLineIndex(ScriptEditor));
+        if (region is null)
+        {
+            UpdateHookStatusLine("光标所在位置没有可折叠的代码块（需要以冒号结尾的行加至少一行缩进体）。");
+            return;
+        }
+        ApplyFolds([region.Value]);
+    }
+
+    private void CollapseAllFolds()
+    {
+        if (ScriptEditor is null) return;
+        var regions = ScriptTextTools.FindFoldRegions(GetScriptText());
+        // 只折最外层：嵌套区域会互相包含，逐层折叠没有意义也不好还原。
+        var outermost = regions.Where(region => !regions.Any(other =>
+            !other.Equals(region) && other.Header < region.Header && other.End >= region.End)).ToArray();
+        if (outermost.Length == 0)
+        {
+            UpdateHookStatusLine("当前脚本没有可折叠的代码块。");
+            return;
+        }
+        ApplyFolds(outermost);
+    }
+
+    /// <summary>
+    /// 按区域重建文档：先取全文，再按「保留行 / 折叠占位」逐段写回。
+    /// 一次性重建比在文档上做增量删除简单得多，也不会留下悬空的 TextPointer。
+    /// </summary>
+    private void ApplyFolds(IReadOnlyList<ScriptTextTools.FoldRegion> regions)
+    {
+        var lines = GetScriptText().Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+        var ordered = regions.OrderBy(region => region.Header).ToArray();
+        var document = ScriptEditor.Document;
+        _highlightingScript = true;
+        try
+        {
+            _folds.Clear();
+            document.Blocks.Clear();
+            var index = 0;
+            var next = 0;
+            while (index < lines.Length)
+            {
+                if (next < ordered.Length && index == ordered[next].Header)
+                {
+                    var region = ordered[next++];
+                    document.Blocks.Add(NewLineParagraph(lines[region.Header]));
+                    var hidden = string.Join('\n', lines.Skip(region.Header + 1).Take(region.End - region.Header));
+                    var placeholder = NewLineParagraph(
+                        new string(' ', LeadingSpaces(lines[region.Header]) + ScriptTextTools.IndentSpaces) +
+                        $"⋯ 已折叠 {region.HiddenLineCount} 行（单击展开）");
+                    placeholder.Foreground = Muted;
+                    document.Blocks.Add(placeholder);
+                    _folds.Add(new FoldedRegion { Placeholder = placeholder, HiddenText = hidden });
+                    index = region.End + 1;
+                    continue;
+                }
+                document.Blocks.Add(NewLineParagraph(lines[index]));
+                index++;
+            }
+        }
+        finally { _highlightingScript = false; }
+        ApplyPythonSyntaxHighlighting();
+        UpdateHookStatusLine($"已折叠 {_folds.Count} 个代码块；单击折叠行或按 Ctrl+Shift+] 展开全部。保存与运行读取的始终是完整脚本。");
+    }
+
+    private void ExpandAllFolds()
+    {
+        if (_folds.Count == 0) return;
+        foreach (var fold in _folds.ToArray()) ExpandFold(fold);
+        UpdateHookStatusLine("已展开全部折叠块。");
+    }
+
+    private void ExpandFold(FoldedRegion fold)
+    {
+        var document = ScriptEditor.Document;
+        _highlightingScript = true;
+        try
+        {
+            _folds.Remove(fold);
+            Block anchor = fold.Placeholder;
+            foreach (var line in fold.HiddenText.Split('\n'))
+            {
+                var paragraph = NewLineParagraph(line);
+                document.Blocks.InsertAfter(anchor, paragraph);
+                anchor = paragraph;
+            }
+            document.Blocks.Remove(fold.Placeholder);
+        }
+        finally { _highlightingScript = false; }
+        ApplyPythonSyntaxHighlighting();
+    }
+
+    private static Paragraph NewLineParagraph(string text) =>
+        new(new Run(text)) { Margin = new Thickness(0) };
+
+    private static int LeadingSpaces(string line) => line.Length - line.TrimStart().Length;
+
+    // ==================== 让 AI 写脚本 ====================
+
+    private void AI写脚本_按键(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter) return;
+        e.Handled = true;
+        AI写脚本_Click(sender, e);
+    }
+
+    /// <summary>
+    /// 把脚本规范作为系统提示词、用户需求作为提问发一次模型调用，回复里的代码块写进编辑器。
+    /// 不带任何工具，也不进 AI 会话历史：这是一次性的代码生成，不是取证分析。
+    /// </summary>
+    private async void AI写脚本_Click(object sender, RoutedEventArgs e)
+    {
+        if (AiWriteScriptButton is null || AiScriptRequestBox is null) return;
+        var request = AiScriptRequestBox.Text?.Trim() ?? string.Empty;
+        if (request.Length == 0)
+        {
+            UpdateHookStatusLine("请先描述你要的脚本，例如「拦截登录请求并删掉签名头」。", isError: true);
+            return;
+        }
+        AiWriteScriptButton.IsEnabled = false;
+        var purpose = CurrentScriptPurpose;
+        try
+        {
+            var settings = await new AiGatewaySettingsStore(_aiSettingsPath).LoadAsync();
+            var enteredKey = AiApiKeyBox.Password;
+            var apiKey = string.IsNullOrWhiteSpace(enteredKey) ? WindowsCredentialStore.ReadApiKey() : enteredKey;
+            WriteRunOutput($"正在请求模型生成{(purpose == ScriptPurpose.Hook ? "钩子" : "验证")}脚本…", Accent, "生成中");
+
+            var current = GetScriptText();
+            var userPrompt = new StringBuilder(request);
+            if (!string.IsNullOrWhiteSpace(current))
+            {
+                userPrompt.Append("\n\n当前编辑器里的脚本如下，若与需求相关请在它基础上修改，否则整体重写：\n```python\n")
+                          .Append(current.Length > 6000 ? current[..6000] + "\n# …（已截断）" : current)
+                          .Append("\n```");
+            }
+            var messages = new List<AiChatMessage>
+            {
+                new("system", HookScriptApi.BuildAuthoringSystemPrompt(purpose)),
+                new("user", userPrompt.ToString())
+            };
+
+            using var gateway = new AiGatewayClient();
+            var result = await gateway.AnalyzeConversationAsync(settings, apiKey, messages, []);
+            var code = HookScriptApi.ExtractPythonCode(result.Text);
+            if (code.Length == 0) throw new InvalidDataException("模型没有返回可用的 Python 代码块。");
+
+            // 静态策略先过一遍：与其让用户点了运行才看到「策略拒绝」，不如当场说清楚。
+            var violations = PythonSandboxPolicy.Validate(code);
+            SetScriptText(code);
+            ApplyPythonSyntaxHighlighting();
+            _folds.Clear();
+            MarkScriptDirty();
+            AiScriptRequestBox.Clear();
+            var summary = $"已生成并写入编辑器（{code.Split('\n').Length} 行）。检查无误后点「保存」。\n" +
+                          $"输入 {result.InputTokens} 令牌 · 输出 {result.OutputTokens} 令牌";
+            if (violations.Count > 0)
+                WriteRunOutput(summary + "\n\n注意：生成的脚本未通过静态策略，运行前需要修改：\n" +
+                    string.Join("\n", violations.Select(item => "• " + item)), Amber, "需修改");
+            else
+                WriteRunOutput(summary, Green, "已生成");
+        }
+        catch (Exception exception)
+        {
+            WriteRunOutput("AI 生成脚本失败\n\n" + exception.Message, Red, "生成失败");
+        }
+        finally
+        {
+            AiWriteScriptButton.IsEnabled = true;
+        }
     }
 
     private static bool IsVisualDescendant(DependencyObject candidate, DependencyObject ancestor)
@@ -6525,6 +6822,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _highlightingScript = true;
         try
         {
+            _folds.Clear(); // 整体替换内容后旧的折叠占位段落已不存在
             var range = new TextRange(editor.Document.ContentStart, editor.Document.ContentEnd);
             range.Text = text.Replace("\r\n", "\n", StringComparison.Ordinal);
         }
@@ -6534,7 +6832,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private string GetScriptText() => GetEditorText(ScriptEditor);
+    /// <summary>
+    /// 取编辑器中的完整脚本。存在折叠时逐段还原：占位段落输出它藏起来的原文，
+    /// 因此「折叠着保存/运行」拿到的与展开时完全一致——折叠只是视图状态。
+    /// </summary>
+    private string GetScriptText()
+    {
+        if (_folds.Count == 0) return GetEditorText(ScriptEditor);
+        var builder = new StringBuilder();
+        foreach (var block in ScriptEditor.Document.Blocks)
+        {
+            if (block is not Paragraph paragraph) continue;
+            var fold = _folds.FirstOrDefault(item => ReferenceEquals(item.Placeholder, paragraph));
+            builder.Append(fold?.HiddenText ?? new TextRange(paragraph.ContentStart, paragraph.ContentEnd).Text).Append('\n');
+        }
+        return builder.ToString().TrimEnd('\r', '\n');
+    }
 
     private static string GetEditorText(RichTextBox editor) => new TextRange(editor.Document.ContentStart, editor.Document.ContentEnd)
         .Text.TrimEnd('\r', '\n');
@@ -6633,6 +6946,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         "① 挂载点：定义 on_before_send / on_after_send / on_before_write / on_after_deliver，采集期间由隔离工作进程调用。\n" +
         "② 入参：event 是 dict，字段有 event、txnId、sessionId、hookName、method、url、host、endpoint、statusCode、\n" +
         "    headers、bodyPreviewBase64、bodyTruncated、bodySha256、bodySize、schema。\n" +
+        "    正文预览默认不下发（省掉绝大部分事件数据量）：脚本里出现 bodyPreviewBase64 或写 WANT_BODY = True 才带上。\n" +
         "③ 存储：store.save('名称', 值) / store.load('名称') / store.list() / store.delete('名称')，落盘在工作区 scripts/data。\n" +
         "④ 结论：返回 None 不写审计；返回 dict 形成一条 hooks.finding，可用 txnId 精确关联流量事务。\n" +
         "⑤ 拦截改写：模块级写 INTERCEPT = [{'event': ..., 'url': r'...'}]，只有命中规则的请求才阻塞等待裁决；\n" +

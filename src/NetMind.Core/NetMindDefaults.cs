@@ -456,6 +456,12 @@ public static class NetMindDefaults
     /// <summary>钩子工作进程处理单个事件的看门狗超时（毫秒），超时记错并继续下一事件。</summary>
     public const int HookEventTimeoutMilliseconds = 200;
 
+    /// <summary>信封中正文预览的字段名；宿主据此判断脚本是否真的要用正文，决定观察事件带不带预览。</summary>
+    public const string HookBodyPreviewFieldName = "bodyPreviewBase64";
+
+    /// <summary>脚本显式索取正文预览的模块级声明；键名拼接等文本扫不到的场景用它兜底。</summary>
+    public const string HookWantBodyDeclaration = "WANT_BODY";
+
     /// <summary>钩子工作进程心跳上报间隔（毫秒）。</summary>
     public const int HookHeartbeatIntervalMilliseconds = 5000;
 
