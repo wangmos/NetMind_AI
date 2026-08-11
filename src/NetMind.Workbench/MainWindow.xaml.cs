@@ -2852,6 +2852,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         public required string ArgsSummary { get; init; }
         public required PageHookEvent Event { get; init; }
 
+        // 空值显示为"—"而不是空白：空白单元格和"这一列压根不存在"在视觉上没有区别，
+        // 用户第一反应是列丢了，而不是"这条事件没有 URL"。
+        public string HostDisplay => Host.Length == 0 ? "—" : Host;
+        public string PathDisplay => Path.Length == 0 ? "—" : Path;
+
         public static (string Host, string Path) SplitTargetUrl(string targetUrl)
         {
             if (string.IsNullOrEmpty(targetUrl)) return (string.Empty, string.Empty);
@@ -7929,10 +7934,34 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void 刷新脚本结果_Click(object sender, RoutedEventArgs e) => await LoadRealHookFindingsAsync();
 
+    /// <summary>
+    /// 观察型脚本可能对每个响应都产出一条结论（比如 <c>on_before_write</c> 没有按 URL 过滤时），
+    /// 列表会越攒越多；没有搜索框根本找不到某个特定 URL 的那一条。用 WPF 默认视图的 Filter
+    /// 而不是另建一个过滤后的集合——新结论插入时会自动重新套用当前过滤条件，不需要手动刷新。
+    /// </summary>
+    private void 脚本结果搜索_Changed(object sender, TextChangedEventArgs e)
+    {
+        if (ScriptFindingsSearchBox is null) return;
+        var view = CollectionViewSource.GetDefaultView(ScriptFindings);
+        var keyword = ScriptFindingsSearchBox.Text.Trim();
+        view.Filter = keyword.Length == 0
+            ? null
+            : item => item is ScriptFindingRow row &&
+                      (row.Event.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                       row.Script.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                       row.Source.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                       row.FullJson.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+        UpdateScriptFindingsCount();
+    }
+
     private void UpdateScriptFindingsCount()
     {
-        if (ScriptFindingsCountText is not null)
-            ScriptFindingsCountText.Text = ScriptFindings.Count == 0 ? "空" : $"{ScriptFindings.Count} 条";
+        if (ScriptFindingsCountText is null) return;
+        var view = CollectionViewSource.GetDefaultView(ScriptFindings);
+        var visible = view.Cast<object>().Count();
+        ScriptFindingsCountText.Text = ScriptFindings.Count == 0 ? "空"
+            : visible == ScriptFindings.Count ? $"{ScriptFindings.Count} 条"
+            : $"{visible} / {ScriptFindings.Count} 条";
     }
 
     private void 脚本结果_选择变化(object sender, SelectionChangedEventArgs e)
@@ -7944,6 +7973,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void 清空脚本结果列表_Click(object sender, RoutedEventArgs e)
     {
         ScriptFindings.Clear();
+        if (ScriptFindingsSearchBox is not null) ScriptFindingsSearchBox.Clear(); // 否则清空后再刷新会立刻被旧关键字重新过滤掉
         UpdateScriptFindingsCount();
     }
 

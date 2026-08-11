@@ -446,24 +446,38 @@
                                 <!-- 列表与详情左右并排：详情框此前固定在底部 170px，装不下稍长的参数；改为并排后详情拿到整列高度。 -->
                                 <Grid Grid.Row="1" Margin="0,8,0,0">
                                     <Grid.ColumnDefinitions><ColumnDefinition Width="1.1*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                                    <ListBox x:Name="PageHookList" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" MouseDoubleClick="页内Hook_双击" SelectionChanged="页内Hook_选择变化" Margin="0,0,10,0" ToolTip="双击或选中条目在右侧详情区查看完整参数">
-                                        <ListBox.ItemTemplate>
-                                            <DataTemplate>
-                                                <StackPanel Margin="0,2">
-                                                    <Grid>
-                                                        <Grid.ColumnDefinitions><ColumnDefinition Width="72" /><ColumnDefinition Width="56" /><ColumnDefinition Width="130" /><ColumnDefinition Width="120" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                                                        <TextBlock Grid.Column="0" Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="11" />
-                                                        <TextBlock Grid.Column="1" Text="{Binding Type}" Foreground="{StaticResource AmberBrush}" FontSize="11" />
-                                                        <TextBlock Grid.Column="2" Text="{Binding Function}" Foreground="{StaticResource AccentBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" />
-                                                        <TextBlock Grid.Column="3" Text="{Binding Host}" Foreground="{StaticResource BlueBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" ToolTip="{Binding Host}" />
-                                                        <TextBlock Grid.Column="4" Text="{Binding Path}" Foreground="{StaticResource TextBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" ToolTip="{Binding Path}" />
-                                                    </Grid>
-                                                    <TextBlock Text="{Binding ArgsSummary}" Foreground="{StaticResource MutedBrush}" FontSize="10.5" TextTrimming="CharacterEllipsis" Margin="72,1,0,0" />
-                                                </StackPanel>
-                                            </DataTemplate>
-                                        </ListBox.ItemTemplate>
-                                    </ListBox>
-                                    <TextBlock x:Name="PageHookEmptyHint" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" HorizontalAlignment="Center" TextWrapping="Wrap" TextAlignment="Center" Margin="0,0,10,0" Text="暂无页内 Hook 事件。&#10;请打开采集浏览器并访问目标页面：注入脚本包裹的调用（XHR/fetch/加密/编码/存储）会自动出现在这里。" />
+                                    <Grid Margin="0,0,10,0">
+                                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                                        <!-- 表头：只有极少数事件类型（xhr/fetch）带主机/路径，其余（crypto/encode/storage/lifecycle）
+                                             这两列天然是空的——不是没做，是没有 URL 可拆。加表头是为了让这一点一眼可辨，而不是让人
+                                             以为列丢了。 -->
+                                        <Grid Margin="6,0,0,4">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="72" /><ColumnDefinition Width="56" /><ColumnDefinition Width="130" /><ColumnDefinition Width="120" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="时间" Foreground="{StaticResource MutedBrush}" FontSize="10" />
+                                            <TextBlock Grid.Column="1" Text="类型" Foreground="{StaticResource MutedBrush}" FontSize="10" />
+                                            <TextBlock Grid.Column="2" Text="函数" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="6,0,0,0" />
+                                            <TextBlock Grid.Column="3" Text="主机" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="6,0,0,0" ToolTip="仅 xhr/fetch 调用有主机与路径；其余类型不是网络调用，天然为空" />
+                                            <TextBlock Grid.Column="4" Text="路径" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="6,0,0,0" />
+                                        </Grid>
+                                        <ListBox x:Name="PageHookList" Grid.Row="1" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" MouseDoubleClick="页内Hook_双击" SelectionChanged="页内Hook_选择变化" ToolTip="双击或选中条目在右侧详情区查看完整参数">
+                                            <ListBox.ItemTemplate>
+                                                <DataTemplate>
+                                                    <StackPanel Margin="0,2">
+                                                        <Grid>
+                                                            <Grid.ColumnDefinitions><ColumnDefinition Width="72" /><ColumnDefinition Width="56" /><ColumnDefinition Width="130" /><ColumnDefinition Width="120" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                                            <TextBlock Grid.Column="0" Text="{Binding Time}" Foreground="{StaticResource MutedBrush}" FontSize="11" />
+                                                            <TextBlock Grid.Column="1" Text="{Binding Type}" Foreground="{StaticResource AmberBrush}" FontSize="11" />
+                                                            <TextBlock Grid.Column="2" Text="{Binding Function}" Foreground="{StaticResource AccentBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" />
+                                                            <TextBlock Grid.Column="3" Text="{Binding HostDisplay}" Foreground="{StaticResource BlueBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" ToolTip="{Binding Host}" />
+                                                            <TextBlock Grid.Column="4" Text="{Binding PathDisplay}" Foreground="{StaticResource TextBrush}" FontSize="11" TextTrimming="CharacterEllipsis" Margin="6,0,0,0" ToolTip="{Binding Path}" />
+                                                        </Grid>
+                                                        <TextBlock Text="{Binding ArgsSummary}" Foreground="{StaticResource MutedBrush}" FontSize="10.5" TextTrimming="CharacterEllipsis" Margin="72,1,0,0" />
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </ListBox.ItemTemplate>
+                                        </ListBox>
+                                        <TextBlock x:Name="PageHookEmptyHint" Grid.Row="1" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" HorizontalAlignment="Center" TextWrapping="Wrap" TextAlignment="Center" Text="暂无页内 Hook 事件。&#10;请打开采集浏览器并访问目标页面：注入脚本包裹的调用（XHR/fetch/加密/编码/存储）会自动出现在这里。" />
+                                    </Grid>
                                     <Border Grid.Column="1" Background="{StaticResource RaisedBrush}" CornerRadius="5" Padding="12">
                                         <ScrollViewer VerticalScrollBarVisibility="Auto">
                                             <StackPanel>
@@ -860,7 +874,7 @@
                                              在 CoreHost 里实际命中、经审计日志读回来的——这才是「有没有拦到指定 URL」的真实结果。
                                              点条目可在上方查看完整 JSON。 -->
                                         <Grid Grid.Row="2" Margin="0,12,0,0">
-                                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
                                             <Grid>
                                                 <TextBlock Text="返回数据" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
                                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -869,7 +883,10 @@
                                                     <Button Content="清空" Style="{StaticResource CompactActionButton}" Padding="8,3" MinHeight="0" FontSize="10" Margin="6,0,0,0" Click="清空脚本结果列表_Click" />
                                                 </StackPanel>
                                             </Grid>
-                                            <ListBox x:Name="ScriptFindingsList" Grid.Row="1" Margin="0,6,0,0" ItemsSource="{Binding ScriptFindings}" SelectionChanged="脚本结果_选择变化" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" AutomationProperties.Name="脚本返回数据列表">
+                                            <!-- 结论会越攒越多（观察型脚本对每个响应都可能产出一条），没有搜索框根本没法在里面找到
+                                                 特定 URL 的那一条。按事件名、来源标签和完整 JSON 内容过滤。 -->
+                                            <TextBox x:Name="ScriptFindingsSearchBox" Grid.Row="1" Margin="0,6,0,0" Padding="7,4" FontSize="10.5" TextChanged="脚本结果搜索_Changed" AutomationProperties.Name="返回数据搜索" ToolTip="按 URL、txnId 或结论内容过滤，例如 cap_union_new_verify" />
+                                            <ListBox x:Name="ScriptFindingsList" Grid.Row="2" Margin="0,6,0,0" ItemsSource="{Binding ScriptFindings}" SelectionChanged="脚本结果_选择变化" Style="{StaticResource DarkListBox}" ItemContainerStyle="{StaticResource DarkListItem}" AutomationProperties.Name="脚本返回数据列表">
                                                 <ListBox.ItemTemplate>
                                                     <DataTemplate>
                                                         <StackPanel Margin="0,2">
