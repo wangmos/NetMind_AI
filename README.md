@@ -147,13 +147,19 @@ def on_before_send(event):
 
 `OBSERVE` 与 `INTERCEPT` 规则字段形状相同、全是正则（`url` / `method` / `host` / `endpoint` / `body` / `status` / `headers`），条件之间是 AND，两者相互独立可同时使用。**裁决超时、脚本崩溃、改写超限一律按原样放行**，绝不阻塞浏览器。
 
+页面上勾选的挂载点是总开关：没勾的挂载点上，观察与拦截都不会触发。
+
+### 改完即生效，不用重开采集
+
+采集进行中点「保存」，新脚本会**热重载**到正在跑的采集里——不重启监听、不断开会话、不丢已抓到的事务。调一条正则不必再走「停止采集 → 改脚本 → 重新开始」整套流程。（静默抓包模式不支持，需停止后重开。）
+
 ### 编辑器
 
-内置钩子与 fixture 两套 API 智能提示，**词表反射自运行时契约**，不会出现"照提示写、运行时取不到值"。
+内置钩子与 fixture 两套 API 智能提示，**词表反射自运行时契约**，不会出现"照提示写、运行时取不到值"。左侧带行号，可折叠的行显示 `-`、已折叠的显示 `+`，点一下即可折叠/展开。
 
 | 快捷键 | 作用 |
 | --- | --- |
-| `Ctrl+S` | 保存 |
+| `Ctrl+S` | 保存（采集中即热重载） |
 | `Ctrl+J` | 智能提示（`Ctrl+空格` 常被中文输入法拦截） |
 | `Ctrl+/` | 切换注释，支持多行 |
 | `Ctrl+[` | 折叠当前代码块 |
@@ -217,14 +223,14 @@ dotnet build NetMind.slnx --configuration Release
 dotnet run --project src/NetMind.SmokeTests/NetMind.SmokeTests.csproj --configuration Release
 ```
 
-冒烟测试是普通控制台程序（不引入测试框架，保持离线可构建），当前 32 个套件覆盖存储、协议解析、代理、TLS 解密、钩子拦截、AI 编排等。`--list` 可列出全部套件并定向运行。
+冒烟测试是普通控制台程序（不引入测试框架，保持离线可构建），当前 35 个套件覆盖存储、协议解析、代理、TLS 解密、钩子拦截与热重载、AI 编排等。`--list` 可列出全部套件并定向运行。
 
 打包：
 
 ```powershell
-./packaging/publish-win-x64.ps1 -Version 0.9.0                      # 自包含
-./packaging/publish-win-x64.ps1 -Version 0.9.0 -SelfContained:$false # 不含运行时
-./packaging/verify-release.ps1  -Version 0.9.0                      # 校验哈希与清单
+./packaging/publish-win-x64.ps1 -Version 0.10.0                      # 自包含
+./packaging/publish-win-x64.ps1 -Version 0.10.0 -SelfContained:$false # 不含运行时
+./packaging/verify-release.ps1  -Version 0.10.0                      # 校验哈希与清单
 ```
 
 ---
