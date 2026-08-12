@@ -267,6 +267,19 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     /// </summary>
     internal void SetObserveRulesForTest(IReadOnlyList<HookObserveRule> rules) => Volatile.Write(ref _observeRules, rules);
 
+    /// <summary>定向测试专用：直接注入拦截规则，绕过需要真实工作进程上报 ready 的正常路径。</summary>
+    internal void SetInterceptRulesForTest(IReadOnlyList<HookInterceptRule> rules) => Volatile.Write(ref _interceptRules, rules);
+
+    /// <summary>
+    /// 定向测试专用：改写已启用的挂载点集合，用来验证挂载点开关对两条转发路径都生效。
+    /// 生产路径只在构造时确定一次（来自工作区配置），不提供公开 setter。
+    /// </summary>
+    internal void SetEnabledEventsForTest(IEnumerable<string> events)
+    {
+        _enabledEvents.Clear();
+        foreach (var item in events) _enabledEvents.Add(item);
+    }
+
     /// <summary>返回线程安全的轻量运行指标，不读取或复制任何事务正文。</summary>
     public ScriptHookMetricsSnapshot GetMetricsSnapshot()
     {
@@ -918,6 +931,11 @@ public sealed class ScriptHookEngine : IAsyncDisposable
     public bool ShouldIntercept(string hookEvent, HookTransactionSnapshot? snapshot)
     {
         if (snapshot is null || _stopping || _disabled || !HookInterceptRule.IsMutable(hookEvent)) return false;
+        // 挂载点开关是用户手里的总闸，两条转发路径都要认它：此前只有 Emit（观察）检查了
+        // _enabledEvents，拦截路径直接跳过，导致把某个挂载点的勾去掉之后，脚本声明的 INTERCEPT
+        // 仍会在该点上阻塞并改写流量——勾选框看着像关掉了，实际没关掉。同时也让「试跑」与真实采集
+        // 的行为一致（试跑本来就只遍历已勾选的挂载点）。
+        if (!_enabledEvents.Contains(hookEvent)) return false;
         var rules = Volatile.Read(ref _interceptRules);
         if (rules.Count == 0) return false;
         for (var index = 0; index < rules.Count; index++)

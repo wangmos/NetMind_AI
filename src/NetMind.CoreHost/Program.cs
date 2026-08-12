@@ -4,6 +4,11 @@ using System.Text.Json;
 using NetMind.Core;
 
 Console.OutputEncoding = Encoding.UTF8;
+// 工作台以 UTF-8 写 stdin，这里把读端也对齐到 UTF-8。设不上不是致命问题（stdin 上的控制词已经
+// 全部改成 ASCII，任何码页下都是同一串字节），所以吞掉异常继续跑：无控制台宿主里这个 setter 会抛
+// IOException，让它冒出去等于整个采集后台起不来，代价远大于收益。
+try { Console.InputEncoding = Encoding.UTF8; }
+catch (IOException) { /* 无控制台或句柄不可用：控制词是 ASCII，不依赖这一步 */ }
 
 // 全局异常陷阱：runas 提升后 stdout 无法重定向，未处理异常的完整堆栈落到信号目录崩溃日志，
 // 便于定位静默抓包等后台场景的进程级崩溃。
@@ -115,7 +120,9 @@ static async Task<int> RunProxyAsync(string[] arguments, string workspacePath)
     Task? hookStartTask = null;
     Task? hookDrainTask = null;
     Task? hookStatusTask = null;
-    using var hookDrainCancellation = new CancellationTokenSource();
+    // 热重载会整体替换这个令牌源（旧的取消并 Dispose、换一个新的），不能用 using var 绑定单个实例，
+    // 否则重载后旧实例永远不会被 Dispose；最终仍在下面的 finally 里手动 Dispose 收尾时那一个。
+    var hookDrainCancellation = new CancellationTokenSource();
     if (hookEngine is not null)
     {
         Console.WriteLine($"钩子：正在后台启动（{hookEngine.EnabledHookCount} 个钩子点，不阻塞代理就绪）");
@@ -145,10 +152,87 @@ static async Task<int> RunProxyAsync(string[] arguments, string workspacePath)
         var bypassCount = new TlsInspectionPolicyStore(workspacePath).Load().BypassHosts.Count;
         Console.WriteLine($"HTTPS 直通规则：{bypassCount} 条（匹配域名保持端到端加密）");
     }
-    Console.WriteLine("按 Ctrl+C 停止。\n");
-    var inputTask = Task.Run(Console.ReadLine);
-    var completed = await Task.WhenAny(runTask, inputTask);
-    if (completed == inputTask) cancellation.Cancel();
+
+    // 保存脚本页点「保存」时，若正在采集会经 stdin 发这条指令：按工作区当前的脚本与配置重建
+    // 钩子引擎，热切换到 proxy.HookEngine 上，不重启监听、不断开采集会话、不丢失已捕获的事务。
+    // 调试一个正则/一行逻辑不必再走"停止采集→改脚本→重新开始采集"整套重建流程。
+    async Task ReloadHookEngineAsync()
+    {
+        Console.WriteLine("钩子：收到热重载指令，正在按当前脚本与配置重建…");
+
+        // 必须先等开机那次后台启动落定再动手：那个任务成功后会执行 proxy.HookEngine = engine，
+        // 如果它在本次热重载切换之后才跑完，就会把刚换上的新引擎覆盖回那个即将被 Dispose 的旧引擎，
+        // 钩子从此静默失效（fail-open 不报错，用户只会觉得"保存了但没生效"）。采集刚开始就立刻
+        // 保存脚本是完全正常的操作，这个竞态不是理论上的。
+        if (hookStartTask is not null)
+        {
+            try { await hookStartTask.WaitAsync(TimeSpan.FromSeconds(30)); }
+            catch { /* 开机启动任务超时或失败：它自己已经审计过，这里照常继续重建 */ }
+        }
+
+        var newEngine = await TryCreateHookEngineAsync(workspacePath);
+        if (newEngine is not null && !await newEngine.StartAsync())
+            newEngine = null; // 启动失败时引擎已自行审计 hooks.disabled；按未启用处理，代理继续采集。
+
+        // 先切新、再收旧：新引擎已就绪才切换代理引用，中间不会出现"两边都没有"的空档；
+        // 旧引擎切下来之后已经收不到新事件，此时关停不会漏掉正在处理中的事件。
+        proxy.HookEngine = newEngine;
+
+        var oldEngine = hookEngine;
+        var oldDrainTask = hookDrainTask;
+        var oldStatusTask = hookStatusTask;
+        var oldDrainCancellation = hookDrainCancellation;
+        oldDrainCancellation.Cancel();
+        if (oldDrainTask is not null)
+        {
+            try { await oldDrainTask.WaitAsync(TimeSpan.FromMilliseconds(NetMindDefaults.HookFindingDrainIntervalMilliseconds * 2)); } catch { /* 旧消费循环收尾不阻塞热重载 */ }
+        }
+        if (oldStatusTask is not null)
+        {
+            try { await oldStatusTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { /* 旧状态发布收尾不阻塞热重载 */ }
+        }
+        if (oldEngine is not null) await oldEngine.DisposeAsync();
+        oldDrainCancellation.Dispose();
+
+        hookEngine = newEngine;
+        hookDrainCancellation = new CancellationTokenSource();
+        if (newEngine is not null)
+        {
+            var auditStore = new WorkspaceStore(workspacePath);
+            hookDrainTask = DrainHookFindingsAsync(newEngine, auditStore, hookDrainCancellation.Token);
+            hookStatusTask = PublishHookStatusAsync(newEngine, workspacePath, hookDrainCancellation.Token);
+            Console.WriteLine($"钩子：热重载完成（{newEngine.EnabledHookCount} 个钩子点 · 隔离工作进程已就绪）。");
+        }
+        else
+        {
+            hookDrainTask = null;
+            hookStatusTask = null;
+            await TrafficHookStatusStore.SaveAsync(workspacePath, new ScriptHookMetricsSnapshot(
+                "disabled", 0, 0, 0, 0, 0, 0, 0, 0, null, null, null,
+                "热重载后配置未启用、脚本不可用或沙箱宿主缺失；请检查请求钩子配置。"));
+            Console.WriteLine("钩子：热重载后保持未启用（开关关闭、配置未启用或脚本不可用）。");
+        }
+    }
+
+    Console.WriteLine("按 Ctrl+C 停止；工作台保存钩子脚本时会经 stdin 发送热重载指令。\n");
+    while (true)
+    {
+        var inputTask = Task.Run(Console.ReadLine);
+        var completed = await Task.WhenAny(runTask, inputTask);
+        if (completed == runTask) break; // 代理自身先结束（异常等），不再等待输入
+        // 去掉 BOM 与首尾空白再比对：某些 UTF-8 写端（Encoding.UTF8 静态实例就是一个）会在本次连接的
+        // 第一行前面塞一个 U+FEFF，精确比对会失配，然后这条命令就被当成"停止"把采集关掉。
+        var command = inputTask.Result?.Trim().Trim('﻿').Trim();
+        if (string.Equals(command, NetMindDefaults.CoreHostReloadHooksCommand, StringComparison.OrdinalIgnoreCase))
+        {
+            try { await ReloadHookEngineAsync(); }
+            catch (Exception exception) { Console.Error.WriteLine($"钩子：热重载失败，钩子保持原状态（{exception.Message}）。"); }
+            continue;
+        }
+        // 其余任意输入（含既有的"停止"，以及 stdin 被关闭时的 null）一律按停止请求处理，向后兼容旧工作台。
+        cancellation.Cancel();
+        break;
+    }
     try
     {
         await runTask;
@@ -165,6 +249,7 @@ static async Task<int> RunProxyAsync(string[] arguments, string workspacePath)
         {
             try { await hookStatusTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { /* 状态发布收尾不阻塞停机。 */ }
         }
+        hookDrainCancellation.Dispose();
         if (hookEngine is not null) await hookEngine.DisposeAsync();
         if (hookEngine is not null)
         {

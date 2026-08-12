@@ -1,5 +1,54 @@
 # Implementation status
 
+## 2026-08-12 审计日志尾读改为从文件尾倒着读，代价与文件大小脱钩
+
+- **问题**：`AuditLogReader.ReadRecentAsync` 顺读整个 `audit.jsonl`，用环形缓冲留下最后 N 条。可每条事务都会追加一行 `traffic.recorded`，长期高强度采集能攒到几百 MB，而调用方（脚本页"返回数据"列表）每次只要末尾几十条——等于用户每打开一次脚本页就把整个文件过一遍。
+- **修法**：从文件尾按 64 KB 块往前读，凑够 N 条就停，代价只与 N 相关。关键约束是**只解析完整行**：按字节切块必然切中中文这类多字节 UTF-8 序列，块首那段不完整的行留到下一轮拼上再解码，绝不对半截字节做 `Encoding.UTF8.GetString`。另加半行累积上限（8 MB），防止一份被写坏成"整块无换行"的文件把缓冲无限撑大。返回顺序仍是最旧在前，与调用方既有假设一致。
+- **验证特意做了三层，因为这类倒读实现"看起来对"很容易**：
+  1. 新增跨块断言：900 条、超过两个读块的日志，逐条比对末尾 25 条的内容与顺序（期望值在测试侧独立算一遍，不复用被测实现的中间结果），并断言中文完整还原、不出现 U+FFFD 替换字符。
+  2. **第一版断言是假的**：`System.Text.Json` 默认把中文转义成 `\uXXXX`，压测文件其实是纯 ASCII，多字节边界根本没被覆盖到。改用 `UnsafeRelaxedJsonEscaping` 写入真实 UTF-8 字节后才算数。
+  3. 把块大小临时改成 97 字节（质数，保证每行都横跨多块、中文必然被切断）重跑，结果完全一致；再反向把跨块拼接那行删掉，测试立刻报错——证明断言确实能抓到破绽，不是恒真。
+- 默认全量 35 个套件通过。
+
+## 2026-08-12 挂载点开关对拦截路径同样生效（此前只管观察路径）
+
+- **契约与实现不一致**：`ScriptHookEngine.ShouldIntercept` 从不检查 `_enabledEvents`，只有 `Emit`（观察路径）检查。也就是说把「响应写回前」的勾去掉之后，脚本里声明的 `INTERCEPT` 仍会在该挂载点上阻塞并改写流量——用户以为关掉了，其实没关掉。而工作区文档与脚本页提示都写明"勾选的挂载点是总开关，决定这个挂载点在这次采集里存不存在"。
+- 这条不是这几个提交引入的（`ShouldIntercept` 出自更早的 9e7ce74），但默认拒绝转发那轮把"挂载点是总闸"写进了文档与界面提示，等于让文档开始断言一件代码并不成立的事；同时新写的「试跑」只遍历已勾选的挂载点，于是试跑与真实采集对同一个脚本会给出不同结果——调试手段和被调试对象行为不一致，是最难排查的一类问题。
+- 修法：`ShouldIntercept` 补上 `_enabledEvents.Contains(hookEvent)`。改写能力受用户手里那个开关约束，属于安全边界方向的收紧，不是放宽。
+- 定向验证：`--intercept-only` 新增正反断言（未勾选挂载点即便有命中规则也不得拦截；勾上之后必须能拦截），为此给引擎加了 `SetInterceptRulesForTest` / `SetEnabledEventsForTest` 两个 internal 测试缝，与既有的 `SetObserveRulesForTest` 同一模式。默认全量 35 个套件通过。
+
+## 2026-08-12 复查最近改动，修掉三个自查发现的真实缺陷
+
+对 OBSERVE 默认拒绝转发（8f40522）、结论契约与会话过滤（be66a43）以及本轮未提交的热重载/着色/行号槽改动做了一次通读复查，发现并修掉：
+
+- **试跑对纯 INTERCEPT 脚本完全失效（最严重，是 OBSERVE 改造引入的回归）**：`RunHookDryRunAsync` 只调 `Emit`（观察路径），从不走 `ShouldIntercept`/`InterceptAsync`（阻塞裁决路径）。默认拒绝转发生效后，只声明 `INTERCEPT` 的脚本在试跑里一条事件都收不到，界面显示"未转发任何事件"——随包五个示例里有三个是纯 INTERCEPT，用户自己那份抓验证码的脚本也是，等于"试跑"这个主要调试入口对这类脚本整体失灵，而且提示语还在说"没有被 OBSERVE 或 INTERCEPT 规则命中"，把人往错误方向引。改为按 `ExplicitHttpProxy` 的真实顺序两条路径都走一遍（先 `ShouldIntercept` 决定要不要阻塞裁决，再 `Emit` 走观察），试跑不把改写应用到快照上（试跑不产生任何对外字节），只统计裁决结果；结果行改成"处理 x/y · 观察 n · 拦截 m · 改写裁决 k"，"未转发"的判定也改成两条路径都为空才成立。
+- **热重载与开机启动存在竞态，可让钩子静默失效**：开机那次 `hookStartTask` 在后台启动引擎，成功后执行 `proxy.HookEngine = engine`。若用户在采集刚开始就保存脚本触发热重载，热重载可能先完成切换并 `Dispose` 旧引擎，随后那个后台任务才跑完，把已经 Dispose 的旧引擎覆盖回去——fail-open 不报错，用户只会觉得"保存了但没生效"。热重载开头改为先限时 `await hookStartTask` 等开机启动落定再动手。
+- **stdin 控制词用中文有解码风险**：`Console.InputEncoding` 在无控制台的宿主里会抛 `IOException`（我原来还把它放在全局异常处理注册之前，抛了就是启动即崩），而 stdin 的解码码页不像 stdout 那样由本进程说了算；中文控制词一旦解码有偏差就会落进"其余输入按停止处理"分支，表现成"保存脚本把采集搞停了"。控制词改成 ASCII 的 `reload-hooks`，`Console.InputEncoding` 的设置吞掉 `IOException`，比对前再去掉 BOM 与首尾空白。
+- **顺带修掉自己引入的一个 UI 回归**：为了让"每段正好一行"成立而把 `FlowDocument.PageWidth` 定死成 4000，副作用是横向滚动条恒常显示。行号槽改成实测坐标定位后这个前提不再需要（长行折行时行号对齐到该逻辑行的首个视觉行，本就是正确行为），已还原。
+- 定向验证：`--hook-reload-only --mountpoint-only --intercept-only --observe-only --hooks-only --baidu-intercept-only --audit-reader-only --script-text-only` 全部通过。
+
+## 2026-08-11 脚本编辑器：修正跨段落着色错位，新增行号 + 折叠状态槽
+
+- **用户报告的症状**：脚本编辑器里注释行颜色"乱七八糟"，同一个单词能显示两种颜色。
+- **根因**：`HighlightRange` 此前把整篇文档一次性拍扁成一个 `TextRange.Text` 字符串跑正则，再把命中的字符偏移映射回 `TextPointer`。问题在于两套计数口径不一致：`TextRange.Text` 在段落（每段即一行）之间会插入两个字符的 `"\r\n"`，但映射用的 `GetTextPointersAtCharacterOffsets` 靠 `GetNextContextPosition` 结构化逐段走位，跨段落边界那一步不产生任何文本字符——每跨一个段落就少算 2，行数一多，后面整段颜色全部错位，"OBSERVE"/`return`/`None` 这类恰好会被关键字规则命中的词，落到打偏的旧着色和新着色区间交界处，就会一半对一半错。
+- **修法**：`ApplyPythonSyntaxHighlighting` 改成逐段落调用 `HighlightRange`，而不是整篇一次性处理。单个段落内部没有内嵌的段落分隔符，两套计数口径必然一致，问题从根上不存在，不需要给旧的偏移映射打补丁。
+- **顺带实现的行号 + 折叠状态槽**：左侧新增一列，显示行号；可折叠的行（以冒号结尾且有缩进体）显示 `-`，点击即折叠；已折叠的占位行显示 `+`，点击展开——复用既有的折叠子系统（`ScriptTextTools.FindFoldRegions`/`_folds`），不是另起一套。关掉了 `RichTextBox` 的自动换行（本身没有 `TextWrapping` 属性可设，编译期报错；标准做法是把 `FlowDocument.PageWidth` 定死成远超实际代码行宽度的值，逼着排版不需要折行，横向溢出交给一直形同虚设的 `HorizontalScrollBarVisibility="Auto"`），让每个段落固定占一行，同时给 `FlowDocument` 加了一条隐式 `Style TargetType="Paragraph"` 把 `Margin` 摁死成 0（`TextRange.Text` 整段赋值拆出来的段落带着 WPF 默认的非零外边距，不摁平会导致行越靠后间距累计误差越大）。行号按**当前可见行**（含折叠占位行）顺序编号，不是原始文本的真实行号——折叠会让真实行号跳跃，配合占位行自身"已折叠 N 行"的提示文字不会引起混淆，但严格意义上对不上原始文件行号，这是刻意的简化取舍。
+- **三轮真实 bug，全部是用户实际跑起来才发现的，我自己没有一次是靠推理提前抓到的**：
+  1. **启动即崩溃**：`ApplyPythonSyntaxHighlighting` 改成逐段落 `foreach (var block in editor.Document.Blocks)` 直接遍历"活的"段落集合，循环体里又调用 `HighlightRange` 改字符颜色（`TextRange.ApplyPropertyValue`）——RichTextBox 把这类格式改动也算进变更通知，正在进行的枚举器发现集合"变了"直接抛 `InvalidOperationException: 集合被修改`，程序一启动、构造函数里第一次调用高亮就必现。用户报的崩溃日志（`workbench-crash.log`）精确定位到这一行。修法：遍历前 `.ToArray()` 拍成快照，不再对活集合边遍历边改格式。
+  2. **行号与代码错位、越往下偏得越多**：最初实现假定"每个段落固定 21px 高"（对齐 `FlowDocument.LineHeight="21"`），把行号槽按这个固定值堆叠。真实原因是 `TextRange.Text` 整段赋值创建的段落带着 WPF 默认的非零 `Margin`，实际每行占用的是 `21px + 默认外边距`，累积误差让行号和代码渐行渐远。
+  3. **改成实测后行号全挤在顶部一小条里**：只把高度换成 `GetCharacterRect` 的实测值，却没管测量时机——构造函数里首次调用时控件从未布局过，量出来全是 0，被 `Math.Max(1.0, …)` 兜成 1px。**这一条是在用户第二次指出"要按实际行高设置行号的高度"之后才修对的，第一次改动只做对了一半。**
+- **最终定位模型**：放弃"固定行高依次堆叠 + 补偿平移"，改为"按实测坐标绝对定位"——每行放到 `Canvas` 上，纵坐标直接取 `GetCharacterRect(...).Top`（该坐标相对编辑器控件、本身已含滚动偏移，与补全弹层用的是同一套，可对照 `UpdateScriptCompletion`），滚动时重摆一次即可，不做任何补偿。布局未就绪时直接返回、**不轮询重试**（脚本页启动时本就不可见，自我重排的 Dispatcher 回调会一直空转），改由 `SizeChanged`/`IsVisibleChanged` 在真正显示出来时叫起来。展示模型（行号与折叠标记）单独缓存：算它要读全文并解析折叠区域，这个代价只能由内容变化触发，绝不能挂在滚动上；滚动只重新摆放。只渲染落在视口内的行，几千行脚本也只产生几十个可视元素。
+- **验证方式与其局限**：给 `RefreshScriptGutter` 加过一次性诊断日志（验证完已移除），实际启动加载 74 行与 71 行两个脚本，确认行号数量与实际段落数一致——排除了"行号少画了"这个猜测，问题始终是单行高度/位置算错。**渲染效果本身没能自行验证**：中途用 PowerShell 全屏截图核对，先后误连带了用户当时开着的其他窗口内容（其中一次抓到了带密码框的数据库配置界面），截图已全部删除，这个做法已停止。Release 编译 0 警告 0 错误。
+
+## 2026-08-11 钩子脚本采集中保存即热重载，免去"停止采集→改脚本→重新开始"整套流程
+
+- **用户诉求**：调试一条正则/一行改写逻辑，此前每次都要停止采集、改脚本、重新开始，"太浪费时间和成本"。CoreHost 只在 `proxy` 命令启动那一刻读一次工作区配置与脚本文本，交给长驻的 SandboxHost `hook-worker` 子进程；工作台的"保存"只写盘、不通知正在运行的 CoreHost，改动只能在下次开始采集时生效。
+- **可行性来自既有设计**：`ExplicitHttpProxy` 的 `_hookEngine` 本来就是 `volatile` 字段带公开 setter（`proxy.HookEngine`），CoreHost 启动流程里也已经有"先输出就绪标记、钩子引擎后台异步启动、就绪后再注入"的模式（注释原文："后置注入：就绪前事件自然空转，就绪后即生效"）——热重载只是把这套"另起一个引擎、就绪后切换引用"的模式，从"仅开机跑一次"变成"可以被 stdin 指令重复触发"。
+- **实现**：新增 `NetMindDefaults.CoreHostReloadHooksCommand`（stdin 指令哨兵，取 ASCII 的 `reload-hooks`——纯机器协议词，用户看不到，而 stdin 的解码码页不像 stdout 那样由本进程说了算，用中文一旦解码有偏差就会落进"其余输入按停止处理"，表现成"保存脚本把采集搞停了"）。`RunProxyAsync` 的单次 `Console.ReadLine` 等待改成循环，收到重载指令时重建 `ScriptHookEngine`（复用既有的 `TryCreateHookEngineAsync`，天然按磁盘上最新的脚本内容与挂载点勾选重建）、新引擎就绪后才切换 `proxy.HookEngine`，再收尾旧引擎（取消旧的结论消费/状态发布循环、限时清队 flush、`DisposeAsync`）；其余任意 stdin 输入仍按既有的"停止"处理，向后兼容旧协议。工作台保存钩子脚本成功后，若正在采集（显式代理模式），自动经 stdin 发送这条指令；静默抓包提权后无法重定向 stdin，走独立文件信号机制，不支持这条路径。
+- **踩到的一个真实 bug，不是这次功能本身的逻辑错误**：`StandardInputEncoding` 用的是 `Encoding.UTF8` 静态实例，这个实例的 `StreamWriter` 会在第一次写入时带一个 UTF-8 BOM 前导字节——对逐行文本协议是个陷阱，BOM 会原样解码成 U+FEFF 粘在这次进程生命周期第一条 stdin 指令的开头，导致 CoreHost 那边精确字符串比对失配，误落进"其余任意输入按停止处理"分支。**旧代码从未受影响**（此前 stdin 上任意一行都表示"停止"，内容根本不需要比对，BOM 混进去也无所谓）；这次新增了需要精确匹配的第二种指令，才第一次暴露这个问题——具体表现是"采集中第一次保存脚本，代理却直接被关掉"。改用 `new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)`，工作台与冒烟测试的两处调用点一并修正。
+- **新增定向端到端套件 `--hook-reload-only`**：真实拉起 `NetMind.CoreHost.exe proxy` 子进程（不是在测试进程内直接构造 `ExplicitHttpProxy`）+ 真实 SandboxHost hook-worker + 真实 Python + 真实 TCP 上游。流程：v1 脚本生效（真实发请求看响应头，不解析控制台文本）→ 改脚本到 v2 → 经 stdin 发热重载指令 → 断言响应头变成 v2 且不再出现 v1、全程只有一个 CoreHost 进程/同一个监听端点（证明是热切换不是重开一轮采集）→ 停止指令仍能优雅退出。这个套件第一次跑就抓到了上面那个 BOM bug——如果只在 `NetMind.Core` 内单测 `ScriptHookEngine` 的重建逻辑，是测不出这类跨进程协议编码问题的。
+- 定向验证：`--hook-reload-only --mountpoint-only --intercept-only --observe-only --audit-reader-only --baidu-intercept-only --hooks-only` 全部通过；`NetMind.Core`/`CoreHost`/`Workbench`/`SmokeTests` Release 编译无警告无错误。
+
 ## 2026-08-11 脚本结果按当前抓包会话过滤，避免跨会话累积到无法查找
 
 - **症状**：脚本页「返回数据」列表随着反复采集越攒越多（截图里已有 125 条，跨了 08-11 20:13 到 23:15 好几个小时），用户明确担心"以后成千上万条了，怎么看得了"。

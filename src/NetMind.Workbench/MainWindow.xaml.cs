@@ -380,6 +380,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _pendingHighlightEditor = null;
             if (editor is not null) ApplyPythonSyntaxHighlighting(editor);
         };
+        // 行号槽靠实测坐标定位，而脚本页在启动时并不可见（默认停在实时概览），此刻编辑器还没有
+        // 任何几何可量。所以不在这里死等，改为等它真正拿到尺寸/被显示出来时再摆一次：
+        // 切到脚本页会触发 SizeChanged（首次布局）或 IsVisibleChanged（再次切回时尺寸已定）。
+        ScriptEditor.SizeChanged += (_, _) => PlaceScriptGutterRows();
+        ScriptEditor.IsVisibleChanged += (_, args) => { if (args.NewValue is true) PlaceScriptGutterRows(); };
         // 工作区载入前先摆一份默认钩子脚本模板；LoadScriptWorkspaceAsync 会用真实脚本库覆盖它。
         ApplyScriptPurposeCombo(ScriptPurpose.Hook);
         SetScriptText(DefaultHookScriptTemplate);
@@ -637,7 +642,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             RedirectStandardInput = true,
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8,
-            StandardInputEncoding = Encoding.UTF8
+            // Encoding.UTF8（静态实例）会在 StreamWriter 第一次写入时带一个 UTF-8 BOM 前导字节——
+            // 逐行文本控制协议不该出现这个：BOM 会原样解码成 U+FEFF 粘在本次进程生命周期第一条
+            // stdin 指令的开头，让 CoreHost 那边的精确字符串比对失配，误判成"其余任意
+            // 输入按停止处理"，表现为"采集中第一次保存脚本，代理却直接被关掉"。用不写 BOM 的实例。
+            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
         };
         if (!File.Exists(coreHostExecutable)) startInfo.ArgumentList.Add(coreHostAssembly);
         // 监听地址固定本机回环（代理无鉴权，绝不对外监听），仅端口可配置。
@@ -7138,8 +7147,218 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_highlightingScript || editor is null) return;
         _highlightingScript = true;
-        try { HighlightRange(editor.Document.ContentStart, editor.Document.ContentEnd); }
+        try
+        {
+            // 按段落（每段即一行——见 SetEditorText 用 '\n' 拆行）逐个高亮，不能把整篇文档一次性拍扁成
+            // 一个 TextRange.Text 再统一按字符偏移映射回 TextPointer：TextRange.Text 在段落之间会
+            // 插入两个字符的 "\r\n"，但 GetTextPointersAtCharacterOffsets 用 GetNextContextPosition
+            // 结构化逐段走位时，跨段落边界那一步不产生任何文本字符——两边计数口径不一致，
+            // 每跨一个段落偏移就少算 2，行数一多，后面整段颜色全部错位（同一个词一半对一半错）。
+            // 逐段调用天然避免了这个问题：单个段落内部没有内嵌的段落分隔符，偏移口径必然一致。
+            // 必须先拍成数组再遍历，不能直接 foreach 活的 Blocks 集合：HighlightRange 内部靠
+            // TextRange.ApplyPropertyValue 改字符格式，RichTextBox 把这类改动也算进变更通知里，
+            // 循环体一跑就让外层枚举器判定"集合已被修改"而直接抛异常——这不是假设的边界情况，
+            // 是应用启动时必然触发的真实崩溃（构造函数里第一次调用高亮就会炸）。
+            foreach (var paragraph in editor.Document.Blocks.OfType<Paragraph>().ToArray())
+                HighlightRange(paragraph.ContentStart, paragraph.ContentEnd);
+        }
         finally { _highlightingScript = false; }
+        // 行号/折叠槽只服务脚本页那一个编辑器；着色触发点已经覆盖了内容变化的全部入口
+        // （加载脚本、插入示例、折叠/展开、整理格式……），行号槽跟着同一个入口刷新，不用另找触发点。
+        if (ReferenceEquals(editor, ScriptEditor)) RefreshScriptGutter();
+    }
+
+    /// <summary>行号槽一行的展示模型：显示的序号、折叠标记（"-"/"+"/空）、点击标记时的动作。</summary>
+    private sealed record ScriptGutterLine(int DisplayNumber, string Marker, Action? OnClick);
+
+    /// <summary>
+    /// 行号槽的展示模型，与 <see cref="ScriptEditor"/> 当前的可见段落一一对应。
+    /// 单独缓存是因为算它要读全文并解析折叠区域，这个代价只能由内容变化触发，绝不能挂在滚动上。
+    /// </summary>
+    private ScriptGutterLine[] _gutterLines = [];
+
+    /// <summary>正在强制布局摆放行号槽；防止 UpdateLayout 触发的 ScrollChanged 递归调回来。</summary>
+    private bool _placingGutter;
+
+    /// <summary>行号槽宽度；Canvas 尚未完成布局时作为行宽兜底值，与 XAML 里的 Width 保持一致。</summary>
+    private const double ScriptGutterWidth = 52;
+
+    /// <summary>
+    /// 内容变化后重建行号槽：先算展示模型（要读全文、解析折叠区域），再摆放。
+    /// 滚动只需要重新摆放，不要调这个方法，见 <see cref="PlaceScriptGutterRows"/>。
+    /// </summary>
+    private void RefreshScriptGutter()
+    {
+        BuildScriptGutterModel();
+        PlaceScriptGutterRows();
+    }
+
+    /// <summary>
+    /// 算出每个可见段落对应的行号与折叠标记。
+    ///
+    /// 行号按当前可见行（含折叠占位行）顺序编号，不是原始文本的真实行号——折叠会让真实行号跳跃，
+    /// 与占位行本身显示"已折叠 N 行"的提示合起来看不会引起混淆，但严格对不上原始文件的行号。
+    /// </summary>
+    private void BuildScriptGutterModel()
+    {
+        if (ScriptEditor is null) { _gutterLines = []; return; }
+        var paragraphs = ScriptEditor.Document.Blocks.OfType<Paragraph>().ToArray();
+        if (paragraphs.Length == 0) { _gutterLines = []; return; }
+
+        // 折叠区域按原始（未折叠）文本的行号定位；逐个可见段落走一遍，用 originalLine 把
+        // 「可见段落序号」换算回「原始行号」，才能知道某一可见段落是不是某个折叠区域的起始行。
+        var foldHeaders = new HashSet<int>(ScriptTextTools.FindFoldRegions(GetScriptText()).Select(region => region.Header));
+        var lines = new ScriptGutterLine[paragraphs.Length];
+        var originalLine = 0;
+        for (var visibleIndex = 0; visibleIndex < paragraphs.Length; visibleIndex++)
+        {
+            var fold = _folds.FirstOrDefault(item => ReferenceEquals(item.Placeholder, paragraphs[visibleIndex]));
+            string marker;
+            Action? onClick;
+            if (fold is not null)
+            {
+                // 占位行本身代表被折叠的整段：点它展开，原始行号按隐藏的行数往前推进。
+                marker = "+";
+                var capturedFold = fold;
+                onClick = () => ExpandFold(capturedFold);
+                originalLine += fold.HiddenText.Length == 0 ? 0 : fold.HiddenText.Count(character => character == '\n') + 1;
+            }
+            else
+            {
+                // 紧接着的下一段如果是本行的折叠占位，说明这一行已经处于折叠状态——
+                // 折叠提示已经在占位行上显示了「+」，标题行不必再重复显示「-」。
+                var alreadyFolded = visibleIndex + 1 < paragraphs.Length &&
+                    _folds.Any(item => ReferenceEquals(item.Placeholder, paragraphs[visibleIndex + 1]));
+                if (!alreadyFolded && foldHeaders.Contains(originalLine))
+                {
+                    marker = "-";
+                    var headerLine = originalLine;
+                    onClick = () => FoldLineAtIndex(headerLine);
+                }
+                else
+                {
+                    marker = string.Empty;
+                    onClick = null;
+                }
+                originalLine++;
+            }
+            lines[visibleIndex] = new ScriptGutterLine(visibleIndex + 1, marker, onClick);
+        }
+        _gutterLines = lines;
+    }
+
+    /// <summary>
+    /// 按实测坐标把行号摆到 Canvas 上。
+    ///
+    /// 定位模型是「按实测坐标绝对定位」，不是「按固定行高依次堆叠」：每个段落的纵坐标一律取
+    /// <see cref="TextPointer.GetCharacterRect"/> 的实测值，行高、字体度量、DPI 缩放怎么变都不必假设。
+    /// 之前两版都栽在假设上——先是假设"每行恒为 LineHeight 的 21px"（段落默认外边距让实际行高更大，
+    /// 越往下偏得越多），后是"改成实测但没保证测量时机"（构造阶段控件还没布局过，量出来全是 0，
+    /// 行号被压成 1px 挤在顶部）。
+    ///
+    /// <c>GetCharacterRect</c> 返回的是相对 <see cref="ScriptEditor"/> 控件自身的坐标，已经含滚动偏移
+    /// （补全弹层用的是同一套坐标，可对照 <c>UpdateScriptCompletion</c>），所以这里不做任何补偿平移；
+    /// 也因此只渲染落在视口内的行，几千行的脚本也只会产生几十个可视元素。
+    ///
+    /// 布局未就绪（控件尚未获得尺寸，例如脚本页还没被切到过）时直接返回、不画也不轮询重试：
+    /// 等真正显示出来时 SizeChanged / IsVisibleChanged 会把这里重新叫起来。轮询重试在这里是有害的——
+    /// 脚本页在启动时本就不可见，自我重排的 Dispatcher 回调会一直空转下去。
+    /// </summary>
+    private void PlaceScriptGutterRows()
+    {
+        if (ScriptGutterCanvas is null || ScriptEditor is null || _placingGutter) return;
+        ScriptGutterCanvas.Children.Clear();
+        if (_gutterLines.Length == 0 || ScriptEditor.ActualHeight <= 0) return;
+
+        _placingGutter = true;
+        try
+        {
+            // 内容刚变过时排版可能还没跑，GetCharacterRect 会返回空矩形——那样这里一行都画不出来，
+            // 换个脚本行号槽就整个空掉。强制先走一次布局，量到的才是当前内容的几何。
+            // UpdateLayout 可能顺带触发 ScrollChanged（内容高度变了），而那个处理器又会调回本方法，
+            // 所以要有 _placingGutter 这道重入防线。
+            ScriptEditor.UpdateLayout();
+        }
+        finally { _placingGutter = false; }
+
+        var paragraphs = ScriptEditor.Document.Blocks.OfType<Paragraph>().ToArray();
+        var viewportHeight = ScriptEditor.ActualHeight;
+        var rowWidth = ScriptGutterCanvas.ActualWidth > 0 ? ScriptGutterCanvas.ActualWidth : ScriptGutterWidth;
+        // 模型与段落数对不上说明内容在两者之间又变过，按当前实际段落数取交集，宁可少画不越界。
+        var count = Math.Min(paragraphs.Length, _gutterLines.Length);
+        for (var index = 0; index < count; index++)
+        {
+            var rect = paragraphs[index].ContentStart.GetCharacterRect(LogicalDirection.Forward);
+            if (rect.IsEmpty) continue;                 // 该行未参与本次排版
+            if (rect.Top > viewportHeight) break;        // 段落自上而下排布，越过视口底部后面都不用看了
+            if (rect.Bottom < 0) continue;               // 滚动到视口上方
+            var line = _gutterLines[index];
+            var row = BuildScriptGutterRow(line.DisplayNumber, line.Marker, line.OnClick, Math.Max(1.0, rect.Height));
+            row.Width = rowWidth;
+            Canvas.SetTop(row, rect.Top);
+            Canvas.SetLeft(row, 0);
+            ScriptGutterCanvas.Children.Add(row);
+        }
+    }
+
+    private static FrameworkElement BuildScriptGutterRow(int displayNumber, string marker, Action? onMarkerClick, double height)
+    {
+        var row = new Grid { Height = height };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(15) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        var markerBlock = new TextBlock
+        {
+            Text = marker,
+            FontFamily = new FontFamily("Cascadia Code, Consolas, Courier New"),
+            FontSize = 12,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = marker.Length == 0 ? Muted : Accent,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            Cursor = onMarkerClick is null ? Cursors.Arrow : Cursors.Hand
+        };
+        if (onMarkerClick is not null)
+        {
+            // 命中区域只有一个字符太难点：给标记块铺一层透明背景把整个标记列都变成可点区域。
+            markerBlock.Background = Brushes.Transparent;
+            markerBlock.MouseLeftButtonDown += (_, e) => { onMarkerClick(); e.Handled = true; };
+        }
+        Grid.SetColumn(markerBlock, 0);
+        row.Children.Add(markerBlock);
+
+        var numberBlock = new TextBlock
+        {
+            Text = displayNumber.ToString(),
+            FontFamily = new FontFamily("Cascadia Code, Consolas, Courier New"),
+            FontSize = 12,
+            Foreground = Muted,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 6, 0)
+        };
+        Grid.SetColumn(numberBlock, 1);
+        row.Children.Add(numberBlock);
+        return row;
+    }
+
+    /// <summary>行号槽点「-」触发：按原始行号定位折叠区域并折叠，与右键菜单「折叠当前块」走同一套逻辑。</summary>
+    private void FoldLineAtIndex(int lineIndex)
+    {
+        var region = ScriptTextTools.FindFoldRegionAt(GetScriptText(), lineIndex);
+        if (region is not null) ApplyFolds([region.Value]);
+    }
+
+    /// <summary>
+    /// 行号槽跟随编辑器滚动重新摆放。只调 <see cref="PlaceScriptGutterRows"/> 而不是整个
+    /// <see cref="RefreshScriptGutter"/>：后者要读全文并解析折叠区域，挂在滚动上会让长脚本每滚一格
+    /// 都做一次全文解析。滚动不改变内容，展示模型直接沿用即可。
+    /// 纯横向滚动（纵向偏移与视口高度都没变）直接跳过。
+    /// </summary>
+    private void 脚本编辑器_滚动(object sender, ScrollChangedEventArgs e)
+    {
+        if (e.VerticalChange == 0 && e.ViewportHeightChange == 0 && e.ExtentHeightChange == 0) return;
+        PlaceScriptGutterRows();
     }
 
     /// <summary>只给一个段落重新着色。改动局限在几行时不必整篇重来（整篇重来会让滚动位置和撤销栈受牵连）。</summary>
@@ -7695,10 +7914,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 await ScriptLibraryStore.SetPurposeAsync(_workspacePath, fileName, purpose);
             }
             var configurationNotice = await SaveHookConfigurationAsync();
+            var reloadNotice = purpose == ScriptPurpose.Hook ? await ReloadRunningHookEngineIfCapturingAsync() : string.Empty;
             _loadedScriptText = scriptText;
             _scriptDirty = false;
             RefreshScriptLibrary(fileName);
-            UpdateHookStatusLine($"已保存 {fileName}。{configurationNotice}");
+            UpdateHookStatusLine($"已保存 {fileName}。{configurationNotice}{(string.IsNullOrEmpty(reloadNotice) ? "" : " " + reloadNotice)}");
         }
         catch (Exception exception)
         {
@@ -7707,6 +7927,31 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         finally
         {
             SaveScriptButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>
+    /// 保存钩子脚本时，若正在采集（显式代理模式，有 stdin 通道）顺带把这次改动热推给正在跑的
+    /// CoreHost——不这样做的话，调试一个正则也要走"停止采集→改脚本→重新开始采集"一整套流程，
+    /// 成本太高。CoreHost 收到指令后按工作区当前脚本与 hook-config.json 重建钩子引擎并热切换，
+    /// 不重启监听、不断开采集会话。静默抓包模式提权后无法重定向 stdin，走独立的文件信号机制，
+    /// 不支持这条路径，只能停止后重新开始才能应用新脚本。
+    /// </summary>
+    private async Task<string> ReloadRunningHookEngineIfCapturingAsync()
+    {
+        if (!_capturing) return string.Empty;
+        if (_silentCaptureActive) return "当前是静默抓包模式，暂不支持热重载，需停止后重新开始采集才能生效。";
+        var process = _coreHostProcess;
+        if (process is null || process.HasExited) return string.Empty;
+        try
+        {
+            await process.StandardInput.WriteLineAsync(NetMindDefaults.CoreHostReloadHooksCommand);
+            await process.StandardInput.FlushAsync();
+            return "本次采集已热重载生效，无需停止重开。";
+        }
+        catch (Exception exception)
+        {
+            return "热重载指令发送失败（" + exception.Message + "），需停止后重新开始采集才能生效。";
         }
     }
 
@@ -7875,14 +8120,31 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var body = Encoding.UTF8.GetBytes(traffic.RequestSummary ?? string.Empty);
             var snapshot = new HookTransactionSnapshot(traffic.Id, Guid.Empty, traffic.Method, traffic.Url,
                 TrafficRow.ResolveHost(traffic), traffic.Endpoint, null, body);
+
+            // 试跑必须把两条转发路径都走一遍，跟真实采集一致（对照 ExplicitHttpProxy：先 ShouldIntercept
+            // 决定要不要阻塞裁决，Emit 另走观察路径）。只走 Emit 的话，纯 INTERCEPT 脚本——随包五个示例
+            // 里有三个都是——在试跑里永远显示"未转发任何事件"，用户会以为自己的脚本坏了。
+            var interceptedCount = 0;
+            var mutatedCount = 0;
             foreach (var hookEvent in enabledEvents)
-                engine.Emit(hookEvent, snapshot, hookEvent.StartsWith("response.", StringComparison.Ordinal) ? traffic.StatusCode : null);
+            {
+                int? statusCode = hookEvent.StartsWith("response.", StringComparison.Ordinal) ? traffic.StatusCode : null;
+                if (engine.ShouldIntercept(hookEvent, snapshot))
+                {
+                    interceptedCount++;
+                    // 试跑只看脚本给出什么裁决，不把改写真的应用到快照上：试跑不产生任何对外字节。
+                    if (await engine.InterceptAsync(hookEvent, snapshot, statusCode) is { HasChanges: true }) mutatedCount++;
+                }
+                engine.Emit(hookEvent, snapshot, statusCode);
+            }
 
             // 默认拒绝转发下，勾选的挂载点里可能有一部分（甚至全部）根本没被送去给脚本——
             // 那部分永远等不到 worker 的 processed 回执。用 Emit 后立刻可读的 NotObservedEvents
             // 算出真正指望它被处理的条数，只等这些，而不是傻等全部挂载点直到 5 秒超时。
             var notObserved = (int)engine.GetMetricsSnapshot().NotObservedEvents;
-            var expectedProcessed = Math.Max(0, enabledEvents.Count - notObserved);
+            var observedCount = Math.Max(0, enabledEvents.Count - notObserved);
+            var expectedProcessed = observedCount + interceptedCount;
+            var forwardedNothing = expectedProcessed == 0;
             var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
             while (engine.ProcessedEventCount < expectedProcessed && DateTimeOffset.UtcNow < deadline)
                 await Task.Delay(50);
@@ -7894,14 +8156,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (notices.Count > 0) builder.Append('\n');
             builder.Append($"试跑事务：{traffic.Method} {traffic.Url}\n")
                    .Append($"挂载点：{string.Join('、', enabledEvents)}\n\n")
-                   .Append($"投递 {metrics.DeliveredEvents}/{expectedProcessed} · 处理 {metrics.ProcessedEvents} · ")
+                   .Append($"处理 {metrics.ProcessedEvents}/{expectedProcessed} · 观察 {observedCount} · 拦截 {interceptedCount} · ")
                    .Append($"结论 {metrics.Findings} · 错误 {metrics.WorkerErrors}");
-            if (notObserved > 0)
-                builder.Append($" · 未转发 {notObserved}");
+            if (mutatedCount > 0) builder.Append($" · 改写裁决 {mutatedCount}");
+            if (notObserved > 0 && !forwardedNothing) builder.Append($" · 未观察 {notObserved}");
             var failedRun = metrics.WorkerErrors > 0 || metrics.ProcessedEvents < expectedProcessed;
             if (metrics.ProcessedEvents < expectedProcessed) builder.Append("\n\n等待处理完成超时，请检查脚本是否阻塞。");
             if (!string.IsNullOrWhiteSpace(metrics.LastError)) builder.Append("\n\n最近错误：").Append(metrics.LastError);
-            if (notObserved == enabledEvents.Count)
+            if (forwardedNothing)
             {
                 // 一条都没转发：多半是压根没写 OBSERVE/INTERCEPT，或者写了但条件没命中这条试跑事务。
                 builder.Append("\n\n未转发任何事件：勾选的挂载点没有被 OBSERVE 或 INTERCEPT 规则命中，")
@@ -7910,17 +8172,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                        .Append("以及规则的 url/host 等条件是否会命中试跑用的这条事务：")
                        .Append(traffic.Url);
             }
-            else if (notObserved > 0)
+            else if (notObserved > 0 && interceptedCount == 0)
             {
-                builder.Append($"\n\n{notObserved} 个挂载点没有被 OBSERVE/INTERCEPT 规则命中，函数未被调用（默认拒绝转发）。");
+                builder.Append($"\n\n{notObserved} 个挂载点没有被 OBSERVE 规则命中，观察路径未调用函数（默认拒绝转发）。");
             }
             if (findings.Count > 0)
                 builder.Append($"\n\n本次新增 {findings.Count} 条结论，已加入下方「返回数据」列表（点击查看完整内容）。");
-            else if (metrics.WorkerErrors == 0 && notObserved < enabledEvents.Count)
-                builder.Append("\n\n脚本返回 None，因此没有生成结论。");
+            else if (metrics.WorkerErrors == 0 && !forwardedNothing)
+                builder.Append(interceptedCount > 0 && mutatedCount == 0
+                    ? "\n\n脚本对拦截事件返回 None（原样放行），也没有产出结论。"
+                    : "\n\n脚本返回 None，因此没有生成结论。");
             WriteRunOutput(builder.ToString(),
-                notObserved == enabledEvents.Count ? Amber : failedRun ? Red : Green,
-                notObserved == enabledEvents.Count ? "未转发" : failedRun ? "试跑异常" : "试跑完成");
+                forwardedNothing ? Amber : failedRun ? Red : Green,
+                forwardedNothing ? "未转发" : failedRun ? "试跑异常" : "试跑完成");
         }
         catch (Exception exception)
         {

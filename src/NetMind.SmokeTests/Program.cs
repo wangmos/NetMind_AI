@@ -77,6 +77,7 @@ var suites = new SmokeSuite[]
     new("拦截规则正则匹配（URL/方法/主机/路径/头/正文/状态码）与 fail-open", "intercept-only", VerifyHookInterceptRulesAsync),
     new("观察规则（四挂载点、默认拒绝转发、词表与 AI 提示词同源）", "observe-only", Sync(VerifyHookObserveRules)),
     new("示例脚本端到端：百度搜索关键字固定为 888（真实 worker + 真实代理）", "baidu-intercept-only", VerifyBaiduSearchInterceptAsync),
+    new("钩子脚本热重载：真实 CoreHost 进程 + stdin 指令，验证不重启监听即可切换脚本", "hook-reload-only", VerifyHookHotReloadAsync),
     new("采集链路一键自检", "capture-health-only", VerifyCaptureHealthAsync),
     new("HTTPS CONNECT、TLS 解密、正文持久化与 AI 脱敏", "tls-only", VerifyTlsInspectionAsync),
     new("Windows Job Object 沙箱资源限制与真实 Python", "sandbox-only", VerifyWindowsSandboxAsync),
@@ -1366,6 +1367,71 @@ static async Task VerifyAuditLogReaderAsync()
         Require(afterCorruption.Count == 4, "损坏行必须被跳过，其余包括损坏行之后写入的条目都必须能读到");
         Require(afterCorruption[^1].PayloadJson.Contains("txn-after-corruption", StringComparison.Ordinal),
             "损坏行之后的条目必须能正常读到，不能被前面的坏行拖累整体失败");
+
+        // ── 倒读实现的关键边界：跨块与多字节字符 ──────────────────────────────
+        // 尾读改成了"从文件尾按 64 KB 块往前读"，代价只与要取的条数相关、与文件总大小无关。
+        // 按字节切块必然会切中中文这类多字节 UTF-8 序列，只有"整行凑齐再解码"才不会乱码；
+        // 这里刻意把日志写到远超一个块，并让中文散布全程，专门压这条边界。
+        var bulkRoot = Path.Combine(Path.GetTempPath(), "netmind-auditreader-bulk-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var bulkStore = new WorkspaceStore(bulkRoot);
+            await bulkStore.InitializeAsync("审计尾读大文件测试工作区");
+            var bulkPath = Path.Combine(bulkRoot, "logs", "audit.jsonl");
+            const int total = 900;
+            // 必须用不转义的编码器：System.Text.Json 默认把中文写成 \uXXXX，那样落盘的是纯 ASCII，
+            // 根本压不到多字节边界（本断言第一版就是这么写的，测了个寂寞）。这里强制写入真实 UTF-8 字节。
+            var rawUnicode = new JsonSerializerOptions
+            {
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+            };
+            var builder = new StringBuilder();
+            for (var index = 0; index < total; index++)
+            {
+                // 直接拼行而不走 AppendAuditAsync：那条路径每条都要抢互斥锁+开关文件句柄，900 条太慢。
+                // 载荷里塞入中文与填充，保证整份文件跨多个 64 KB 块，且块边界大概率落在中文字节中间。
+                var payload = JsonSerializer.Serialize(new
+                {
+                    @event = "response.before_write",
+                    txnId = $"bulk-{index:D4}",
+                    note = "中文载荷用于压测多字节边界——" + new string('填', 40)
+                }, rawUnicode);
+                var eventName = index % 3 == 0 ? "traffic.recorded" : NetMindDefaults.AuditEventHooksFinding;
+                builder.Append(JsonSerializer.Serialize(new
+                {
+                    timestamp = DateTimeOffset.UtcNow,
+                    eventName,
+                    payload
+                }, rawUnicode)).Append(Environment.NewLine);
+            }
+            await File.WriteAllTextAsync(bulkPath, builder.ToString(), new UTF8Encoding(false));
+            Require(new FileInfo(bulkPath).Length > 64 * 1024 * 2,
+                $"压测日志必须跨多个读块才有意义，实际 {new FileInfo(bulkPath).Length} 字节");
+
+            // 期望值按同一规则在测试侧独立算一遍，不复用被测实现的中间结果。
+            var expectedTail = Enumerable.Range(0, total).Where(index => index % 3 != 0)
+                .Select(index => $"bulk-{index:D4}").TakeLast(25).ToArray();
+            var bulk = await AuditLogReader.ReadRecentAsync(bulkRoot, NetMindDefaults.AuditEventHooksFinding, 25);
+            Require(bulk.Count == 25, $"跨块倒读必须精确返回 25 条，实际 {bulk.Count}");
+            for (var index = 0; index < expectedTail.Length; index++)
+                Require(bulk[index].PayloadJson.Contains(expectedTail[index], StringComparison.Ordinal),
+                    $"跨块倒读的第 {index} 条应为 {expectedTail[index]}，实际 {bulk[index].PayloadJson}");
+            Require(bulk.All(entry => entry.PayloadJson.Contains("中文载荷用于压测多字节边界——", StringComparison.Ordinal)),
+                "跨块倒读不得把多字节字符从块边界劈开：中文必须完整还原，出现替换字符即为失败");
+            Require(bulk.All(entry => !entry.PayloadJson.Contains('�')),
+                "解码结果中不得出现 U+FFFD 替换字符（那是多字节序列被切断的典型症状）");
+
+            // 请求条数超过文件里实际拥有的条数：必须给出全部命中条目，且顺序仍是最旧在前。
+            var everything = await AuditLogReader.ReadRecentAsync(bulkRoot, NetMindDefaults.AuditEventHooksFinding, 10_000);
+            Require(everything.Count == total - (total + 2) / 3,
+                $"请求量超过实际条数时必须返回全部命中条目，实际 {everything.Count}");
+            Require(everything[0].PayloadJson.Contains("bulk-0001", StringComparison.Ordinal),
+                "读到文件头时，最早那条必须排在最前（倒读完成后要翻转回升序）");
+        }
+        finally
+        {
+            if (Directory.Exists(bulkRoot)) Directory.Delete(bulkRoot, recursive: true);
+        }
     }
     finally
     {
@@ -1650,6 +1716,20 @@ static async Task VerifyHookInterceptRulesAsync()
         Require(engine.InterceptRuleCount == 0, "未上报规则时拦截规则数必须为 0");
         Require(!engine.ShouldIntercept(HookEventNames.RequestBeforeSend, login), "未声明规则时不得拦截任何请求");
         Require(!engine.ShouldIntercept(HookEventNames.RequestAfterSend, login), "不可改写的挂载点永远不得拦截");
+
+        // 挂载点开关是用户手里的总闸，拦截路径必须认它。此前只有观察路径检查了已启用挂载点，
+        // 拦截路径直接跳过——把「响应写回前」的勾去掉，脚本声明的 INTERCEPT 仍会在该点阻塞并改写，
+        // 勾选框看着像关掉了、其实没关掉，而且与只遍历已勾选挂载点的「试跑」行为不一致。
+        var responseIntercept = HookInterceptRule.TryCreate(HookEventNames.ResponseBeforeWrite,
+            null, null, null, null, null, null, null);
+        Require(responseIntercept is not null, "响应侧无条件拦截规则必须能编译");
+        engine.SetInterceptRulesForTest([responseIntercept!]);
+        var response = Snapshot("GET", "https://api.test.local/x", "", 200);
+        Require(!engine.ShouldIntercept(HookEventNames.ResponseBeforeWrite, response),
+            "未勾选的挂载点即便有命中的 INTERCEPT 规则也不得拦截（挂载点开关是总闸）");
+        engine.SetEnabledEventsForTest([HookEventNames.RequestBeforeSend, HookEventNames.ResponseBeforeWrite]);
+        Require(engine.ShouldIntercept(HookEventNames.ResponseBeforeWrite, response),
+            "勾选该挂载点后，命中的 INTERCEPT 规则必须能正常拦截");
         // 工作进程未启动：必须立刻返回放行，而不是等满超时。
         var failOpenTimer = Stopwatch.StartNew();
         var verdict = await engine.InterceptAsync(HookEventNames.RequestBeforeSend, login);
@@ -4206,6 +4286,239 @@ static string? ResolveSandboxHostForTest()
         if (File.Exists(candidate)) return candidate;
     }
     return null;
+}
+
+/// <summary>与 <see cref="ResolveSandboxHostForTest"/> 同一套相对布局假设，定位同批构建的 NetMind.CoreHost.exe。</summary>
+static string? ResolveCoreHostForTest()
+{
+    foreach (var configuration in new[] { "Release", "Debug" })
+    {
+        var candidate = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+            "..", "..", "..", "..", "NetMind.CoreHost", "bin", configuration, "net10.0", "NetMind.CoreHost.exe"));
+        if (File.Exists(candidate)) return candidate;
+    }
+    return null;
+}
+
+/// <summary>
+/// 钩子脚本热重载端到端：真实 NetMind.CoreHost.exe 子进程（不是 ExplicitHttpProxy 直接在测试进程内构造）+
+/// 真实 SandboxHost hook-worker + 真实 Python + 真实 TCP 上游。重载逻辑本身住在 CoreHost 的 Program.cs
+/// 顶层语句里、不属于 NetMind.Core，也没有反射/InternalsVisibleTo 能绕开进程边界去单测——唯一有说服力
+/// 的断言方式就是真的拉起这个进程、真的从 stdin 发指令、真的发 HTTP 请求看响应头变没变。
+///
+/// 流程：用 v1 脚本发一个请求确认钩子已生效 → 改脚本文件到 v2 → 经 stdin 发热重载指令 → 再发一个请求，
+/// 断言响应头从 v1 变成 v2，且全程只有一个 CoreHost 进程、监听端点从未变化（证明是热切换不是重开一轮采集）。
+/// </summary>
+static async Task VerifyHookHotReloadAsync()
+{
+    var probe = await new PythonSandboxRunner().RunAsync(new SandboxJob(
+        "print('python-ok')", JsonSerializer.SerializeToElement(new { }), TimeoutMilliseconds: 10000));
+    if (!probe.Succeeded && probe.State == "运行时不可用")
+    {
+        Console.WriteLine("钩子热重载端到端断言跳过（未找到 Python）。");
+        return;
+    }
+
+    var coreHostPath = ResolveCoreHostForTest();
+    Require(coreHostPath is not null, "热重载端到端断言必须能找到同批构建的 NetMind.CoreHost 可执行文件");
+    var sandboxHostPath = ResolveSandboxHostForTest();
+    Require(sandboxHostPath is not null, "热重载端到端断言必须能找到同批构建的 NetMind.SandboxHost 可执行文件");
+
+    // CoreHost 解析钩子沙箱宿主时按生产布局找同级 SandboxHost/ 子目录（Workbench 构建时的 CopySandboxHost
+    // 目标产出）；两个项目各自的原始 bin 输出里都没有这个子目录。这里在临时目录里拼出同样的相对布局，
+    // 而不是直接拿原始 bin 输出跑——避免测试期间往真实构建目录里写文件，也避免和并行的 dotnet build 打架。
+    var hostRoot = Path.Combine(Path.GetTempPath(), "netmind-hook-reload-host-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(hostRoot);
+    foreach (var file in Directory.GetFiles(Path.GetDirectoryName(coreHostPath!)!))
+        File.Copy(file, Path.Combine(hostRoot, Path.GetFileName(file)), overwrite: true);
+    var sandboxHostStageDir = Path.Combine(hostRoot, NetMindDefaults.SandboxHostDirectoryName);
+    Directory.CreateDirectory(sandboxHostStageDir);
+    foreach (var file in Directory.GetFiles(Path.GetDirectoryName(sandboxHostPath!)!))
+        File.Copy(file, Path.Combine(sandboxHostStageDir, Path.GetFileName(file)), overwrite: true);
+    var stagedCoreHostPath = Path.Combine(hostRoot, Path.GetFileName(coreHostPath!));
+
+    var workspaceRoot = Path.Combine(Path.GetTempPath(), "netmind-hook-reload-" + Guid.NewGuid().ToString("N"));
+    var upstream = new TcpListener(IPAddress.Loopback, 0);
+    upstream.Start();
+    var upstreamPort = ((IPEndPoint)upstream.LocalEndpoint).Port;
+    using var upstreamCancellation = new CancellationTokenSource();
+
+    // 上游是个循环 echo：轮询等待钩子就绪/热重载生效期间会反复发请求，条数不固定，不能像
+    // 百度那个测试一样只接固定 2 次连接。
+    var upstreamTask = Task.Run(async () =>
+    {
+        try
+        {
+            while (!upstreamCancellation.IsCancellationRequested)
+            {
+                using var client = await upstream.AcceptTcpClientAsync(upstreamCancellation.Token);
+                using var stream = client.GetStream();
+                await ReadHeaderTextAsync(stream);
+                var body = Encoding.UTF8.GetBytes("{\"ok\":true}");
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                    $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n"),
+                    upstreamCancellation.Token);
+                await stream.WriteAsync(body, upstreamCancellation.Token);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+    });
+
+    Process? process = null;
+    try
+    {
+        await new WorkspaceStore(workspaceRoot).InitializeAsync("热重载测试工作区");
+        var scriptsDirectory = Path.Combine(workspaceRoot, NetMindDefaults.ScriptsDirectoryName);
+        Directory.CreateDirectory(scriptsDirectory);
+        const string scriptFileName = "reload-marker.py";
+        var scriptPath = Path.Combine(scriptsDirectory, scriptFileName);
+        await File.WriteAllTextAsync(scriptPath,
+            """
+            INTERCEPT = [{'event': 'response.before_write'}]
+            def on_before_write(event):
+                return {'headers': {'X-Reload-Marker': 'v1'}}
+            """, new UTF8Encoding(false));
+        await TrafficHookConfigStore.SaveConfigAsync(workspaceRoot,
+            new TrafficHookConfiguration(true, scriptFileName, new TrafficHookSwitches(BeforeWrite: true)));
+
+        var startInfo = new ProcessStartInfo(stagedCoreHostPath)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+            // 不能用 Encoding.UTF8 静态实例：它会在 StreamWriter 第一次写入时带 BOM 前导字节，
+            // 让 CoreHost 侧对本次进程生命周期第一条 stdin 指令的精确匹配失配（详见 Workbench 同款调用点）。
+            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
+        };
+        foreach (var argument in new[] { "proxy", "--listen", "127.0.0.1:0", "--workspace", workspaceRoot })
+            startInfo.ArgumentList.Add(argument);
+        process = new Process { StartInfo = startInfo };
+        Require(process.Start(), "热重载端到端断言必须能启动 CoreHost 代理进程");
+        var startedProcessId = process.Id;
+
+        var readyEndpoint = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var consoleLog = new List<string>();
+        var stdoutPump = Task.Run(async () =>
+        {
+            string? line;
+            while ((line = await process.StandardOutput.ReadLineAsync()) is not null)
+            {
+                lock (consoleLog) consoleLog.Add(line);
+                var markerIndex = line.IndexOf(NetMindDefaults.CoreHostReadyMarker, StringComparison.Ordinal);
+                if (markerIndex >= 0)
+                    readyEndpoint.TrySetResult(line[(markerIndex + NetMindDefaults.CoreHostReadyMarker.Length)..].Trim());
+            }
+        });
+        // 必须持续排空 stdout/stderr：CoreHost 每条事务都会打一行日志，没人读管道会写满阻塞，
+        // 进而卡住代理本身（不是测试旁支问题，是会直接拖死断言的真实风险）。
+        var stderrPump = Task.Run(async () =>
+        {
+            string? line;
+            while ((line = await process.StandardError.ReadLineAsync()) is not null)
+                lock (consoleLog) consoleLog.Add("[stderr] " + line);
+        });
+
+        string endpointText;
+        try { endpointText = await readyEndpoint.Task.WaitAsync(TimeSpan.FromSeconds(15)); }
+        catch (TimeoutException)
+        {
+            string log;
+            lock (consoleLog) log = string.Join('\n', consoleLog);
+            throw new InvalidOperationException("CoreHost 代理未在超时内就绪：\n" + log);
+        }
+        var colonIndex = endpointText.LastIndexOf(':');
+        var parsedAddress = colonIndex > 0 && IPAddress.TryParse(endpointText[..colonIndex], out var addressCandidate)
+            ? addressCandidate : null;
+        var parsedPort = colonIndex > 0 && int.TryParse(endpointText[(colonIndex + 1)..], out var portCandidate)
+            ? portCandidate : (int?)null;
+        Require(parsedAddress is not null && parsedPort is not null, $"无法从就绪行解析监听端点：{endpointText}");
+        var proxyEndpoint = new IPEndPoint(parsedAddress!, parsedPort!.Value);
+
+        static async Task<string> RequestMarkerHeaderAsync(IPEndPoint endpoint, int upstreamPortNumber)
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(endpoint.Address, endpoint.Port);
+            using var stream = client.GetStream();
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                $"GET http://127.0.0.1:{upstreamPortNumber}/reload-probe HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"));
+            var headerText = await ReadHeaderTextAsync(stream);
+            using var sink = new MemoryStream();
+            try { await stream.CopyToAsync(sink); } catch { /* 已按 Connection: close 拿到响应头，读尾部失败不影响断言 */ }
+            return headerText;
+        }
+
+        // 钩子工作进程在后台异步启动、不阻塞代理就绪标记，就绪前请求会原样透传（没有标记头）；
+        // 用真实请求轮询而不是解析控制台文本，断言的是用户能观察到的行为本身。
+        async Task<string> PollForHeaderAsync(string expectedMarker)
+        {
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(20);
+            var lastHeader = string.Empty;
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                try { lastHeader = await RequestMarkerHeaderAsync(proxyEndpoint, upstreamPort); }
+                catch (Exception exception)
+                {
+                    lastHeader = string.Empty;
+                    lock (consoleLog) consoleLog.Add("[probe] " + exception.GetType().Name + "：" + exception.Message);
+                }
+                if (lastHeader.Contains(expectedMarker, StringComparison.OrdinalIgnoreCase)) return lastHeader;
+                await Task.Delay(200);
+            }
+            return lastHeader;
+        }
+
+        string DumpLog() { lock (consoleLog) return string.Join('\n', consoleLog); }
+
+        var v1Header = await PollForHeaderAsync("X-Reload-Marker: v1");
+        Require(v1Header.Contains("X-Reload-Marker: v1", StringComparison.OrdinalIgnoreCase),
+            "热重载前置条件失败：钩子必须先在采集期间按 v1 脚本生效，实际最后一次响应头：\n" + v1Header + "\n\n控制台日志：\n" + DumpLog());
+
+        // 改脚本、发热重载指令——不停代理、不断连接，全程同一个进程、同一个监听端点。
+        await File.WriteAllTextAsync(scriptPath,
+            """
+            INTERCEPT = [{'event': 'response.before_write'}]
+            def on_before_write(event):
+                return {'headers': {'X-Reload-Marker': 'v2'}}
+            """, new UTF8Encoding(false));
+        await process.StandardInput.WriteLineAsync(NetMindDefaults.CoreHostReloadHooksCommand);
+        await process.StandardInput.FlushAsync();
+
+        var v2Header = await PollForHeaderAsync("X-Reload-Marker: v2");
+        Require(v2Header.Contains("X-Reload-Marker: v2", StringComparison.OrdinalIgnoreCase),
+            "热重载后必须生效为 v2 标记（无需停止采集），实际最后一次响应头：\n" + v2Header + "\n\n控制台日志：\n" + DumpLog());
+        Require(!v2Header.Contains("X-Reload-Marker: v1", StringComparison.OrdinalIgnoreCase),
+            "热重载后不应再出现旧版 v1 标记，说明旧钩子引擎没有被真正换下去");
+        Require(!process.HasExited && process.Id == startedProcessId,
+            "热重载不应导致 CoreHost 进程重启，进程标识必须与开始时一致");
+
+        await process.StandardInput.WriteLineAsync("停止");
+        await process.StandardInput.FlushAsync();
+        var exited = true;
+        try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10)); }
+        catch (TimeoutException) { exited = false; }
+        Require(exited && process.ExitCode == 0, "停止指令必须让 CoreHost 优雅退出（退出码 0），热重载不能破坏正常停机路径");
+
+        upstreamCancellation.Cancel();
+        try { await upstreamTask; } catch { /* 循环 accept 被取消属正常收尾 */ }
+        try { await stdoutPump.WaitAsync(TimeSpan.FromSeconds(2)); } catch { /* 进程已退出，读端自然结束 */ }
+        try { await stderrPump.WaitAsync(TimeSpan.FromSeconds(2)); } catch { /* 同上 */ }
+    }
+    finally
+    {
+        if (process is not null && !process.HasExited)
+        {
+            try { process.Kill(entireProcessTree: true); } catch { /* 进程可能已退出 */ }
+        }
+        process?.Dispose();
+        upstream.Stop();
+        try { if (Directory.Exists(workspaceRoot)) Directory.Delete(workspaceRoot, recursive: true); } catch { /* 临时目录清理失败不影响断言结果 */ }
+        try { if (Directory.Exists(hostRoot)) Directory.Delete(hostRoot, recursive: true); } catch { /* 同上 */ }
+    }
 }
 
 static async Task<JsonElement?> ReadHookWorkerMessageAsync(Process worker, string expectedType, TimeSpan timeout)

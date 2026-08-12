@@ -775,7 +775,16 @@
                                             </StackPanel>
                                         </Grid>
                                     </Border>
-                                    <RichTextBox x:Name="ScriptEditor" Grid.Row="1" Style="{StaticResource PythonCodeEditor}" BorderThickness="0" TextChanged="脚本编辑器_TextChanged" PreviewKeyDown="脚本编辑器_按键" LostKeyboardFocus="脚本编辑器_失焦" PreviewMouseLeftButtonDown="脚本编辑器_鼠标按下" AutomationProperties.Name="Python 脚本编辑器">
+                                    <Grid Grid.Row="1">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                        <!-- 行号 + 折叠状态槽：每一行按 GetCharacterRect 实测到的纵坐标绝对定位在 Canvas 上，
+                                             不按固定行高堆叠，也不做补偿平移（实测坐标本身已含滚动偏移）。
+                                             Border 不设纵向 Padding：纵向位置完全由实测坐标决定，这里加内边距会整体错开一截。
+                                             详见 RefreshScriptGutter 的实现说明。 -->
+                                        <Border Grid.Column="0" Background="{StaticResource SidebarBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0" Width="52" ClipToBounds="True">
+                                            <Canvas x:Name="ScriptGutterCanvas" />
+                                        </Border>
+                                        <RichTextBox x:Name="ScriptEditor" Grid.Column="1" Style="{StaticResource PythonCodeEditor}" BorderThickness="0" TextChanged="脚本编辑器_TextChanged" PreviewKeyDown="脚本编辑器_按键" LostKeyboardFocus="脚本编辑器_失焦" PreviewMouseLeftButtonDown="脚本编辑器_鼠标按下" ScrollViewer.ScrollChanged="脚本编辑器_滚动" AutomationProperties.Name="Python 脚本编辑器">
                                         <RichTextBox.ContextMenu>
                                             <ContextMenu Style="{StaticResource TrafficContextMenuStyle}">
                                                 <ContextMenu.Resources>
@@ -798,8 +807,22 @@
                                                 <MenuItem Header="展开全部" InputGestureText="Ctrl+Shift+]" Click="展开全部_Click" />
                                             </ContextMenu>
                                         </RichTextBox.ContextMenu>
-                                        <FlowDocument PagePadding="0" LineHeight="21" LineStackingStrategy="BlockLineHeight"><Paragraph Margin="0" /></FlowDocument>
-                                    </RichTextBox>
+                                        <!-- 段落外边距统一摁成 0：LineHeight 只管单行文字本身的高度，段落之间还有一份
+                                             Paragraph.Margin，而 SetEditorText 靠 TextRange.Text 整段赋值拆出来的段落带的是
+                                             WPF 默认值、不是 0（折叠功能自己 new 出来的段落有手动置零，覆盖不到这条路径），
+                                             结果同一个文档里两种行距混着走。这里用 FlowDocument 级隐式样式统一摁死，
+                                             不管段落是哪条路径创建的都一致。
+                                             注意不要为了"保证每段只占一行"去定死 PageWidth：那会让横向滚动条恒常显示。
+                                             行号槽已经改成按 GetCharacterRect 实测坐标定位，长行折行也能对齐（行号对齐到
+                                             该逻辑行的首个视觉行），不需要靠禁用折行来成立。 -->
+                                        <FlowDocument PagePadding="0" LineHeight="21" LineStackingStrategy="BlockLineHeight">
+                                            <FlowDocument.Resources>
+                                                <Style TargetType="Paragraph"><Setter Property="Margin" Value="0" /></Style>
+                                            </FlowDocument.Resources>
+                                            <Paragraph Margin="0" />
+                                        </FlowDocument>
+                                        </RichTextBox>
+                                    </Grid>
                                     <!-- 补全弹层：词表来自 NetMind.Core 的 HookScriptApi，与运行时契约同源，不会和真实字段漂移 -->
                                     <Popup x:Name="ScriptCompletionPopup" Grid.Row="1" Placement="RelativePoint" PlacementTarget="{Binding ElementName=ScriptEditor}" AllowsTransparency="True" StaysOpen="True" PopupAnimation="None" Focusable="False">
                                         <Border Background="{StaticResource RaisedBrush}" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="4" MaxWidth="520">

@@ -27,6 +27,19 @@ public static class NetMindDefaults
     /// </summary>
     public const string CoreHostSessionMarker = "会话标识：";
 
+    /// <summary>
+    /// 工作台经 stdin 发给 CoreHost（显式代理模式）的钩子热重载指令：收到后 CoreHost 按工作区当前的
+    /// 脚本与 hook-config.json 重建 ScriptHookEngine 并热切换代理引用，不重启监听、不断开采集会话。
+    /// stdin 上除这一行外的其余任意输入仍按既有的「停止」处理，保持向后兼容。
+    /// 仅显式代理模式适用：静默抓包因提权后无法重定向 stdin，走独立的文件信号机制，不支持热重载。
+    ///
+    /// 刻意用 ASCII 而不是中文：这是纯机器协议词，用户永远看不到，而 stdin 的解码码页不像 stdout
+    /// 那样可以由本进程说了算（Console.InputEncoding 在无控制台的宿主里未必设得上）。一旦解码出偏差，
+    /// 命令就会落进「其余输入按停止处理」那条分支——用户看到的是"保存脚本把采集搞停了"。
+    /// ASCII 在任何单字节/UTF-8 码页下都是同一串字节，从根上消掉这个失败模式。
+    /// </summary>
+    public const string CoreHostReloadHooksCommand = "reload-hooks";
+
     // ── 哨兵字符串 ────────────────────────────────────────────────────────────
 
     /// <summary>HTTPS 加密隧道事务的协议标记（正文未解密）。</summary>
